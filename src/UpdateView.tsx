@@ -109,12 +109,13 @@ export default function UpdateView() {
             <button className="upd-btn" onClick={close}>
               稍后
             </button>
-            {/* 「立即下载」和「更新说明」现在是同一个落点（站点首页：上面既有下载入口
-                也有完整说明），所以只留一个按钮，免得两个按钮点出同一个页面。
-                程序不再记某个 .exe 的文件名 —— 换网盘 / 换镜像只改网页。 */}
+            {/* 「立即下载」和「更新说明」现在是同一个落点（清单里的 page =
+                Gitee 发行版列表页：最新版在最上面，说明和安装包在同一处），
+                所以只留一个按钮，免得两个按钮点出同一个页面。
+                程序不记某个 .exe 的文件名 —— Gitee 直链必须带版本号，记死会 404。 */}
             <button
               className="upd-btn primary"
-              title="在浏览器中打开更新网页，从那里下载"
+              title="在浏览器中打开 Gitee 发行版页，从那里下载"
               onClick={() => api.openUpdateSite().catch((e) => setErr(String(e)))}
             >
               立即下载

@@ -287,7 +287,8 @@ src-tauri/
   src/glass.rs       面板毛玻璃（自截自糊）
   src/pick.rs        取色器后端
   src/icons.rs       图标提取与缓存
-update-site/         更新清单 version.json（Gitee raw 直接读）+ 可选的落地页
+update-site/         更新清单 version.json（程序直接读 Gitee raw，不用自建站点）
+                     ⚠️ 目录名沿用旧称，路径已编译进 exe，不能改名或移动
 tools/               Gitee 一键发版脚本
 docs/                更新记录与截图
 ```

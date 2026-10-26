@@ -3663,18 +3663,19 @@ async fn open_update_window(app: AppHandle) -> Result<(), String> {
     open_update_window_inner(&app).await
 }
 
-/// 用系统浏览器打开「更新网页」（也就是软件站点首页）。
+/// 用系统浏览器打开版本清单里的 `page`（现在是 **Gitee 发行版列表页**）。
 ///
-/// **不再直接把 .exe 交给浏览器**：下载入口以后可能换成网盘、镜像或多个源，
-/// 甚至同名文件重新上传；入口留在网页上，程序只认站点首页，换下载方式时
-/// 不用重新编译发版，也不会因为文件名变了而 404。
+/// **不直接把 .exe 交给浏览器**：Gitee 没有 `releases/latest/download` 那种
+/// 重定向，直链必须带版本号，程序若记死某个文件名，换版本就 404。所以落点
+/// 始终是一个固定不变的页面，由它去展示最新版和下载入口 —— 网页怎么改都不用
+/// 重新编译发版。
 ///
 /// 清单是网络来的内容，链接只放行 http/https —— 否则远端文件里写个
 /// `file:///C:/...` 就能让程序替它执行本地东西。
 #[tauri::command]
 fn open_update_site() -> Result<(), String> {
     let m = updater::latest().ok_or("还没有拿到版本信息")?;
-    // 优先 page（更新说明网页 = 首页）；只有 download 的老清单也能用
+    // 优先 page（发行版列表页）；只有 download 的老清单也能用
     let url = if !m.page.is_empty() { m.page } else { m.download };
     if url.is_empty() {
         return Err("版本清单里没有站点地址".into());
