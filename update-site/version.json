@@ -12,6 +12,6 @@
     "修复：点击设置项后任务栏里的图标跳到设置窗口下方",
     "修复：从桌面拖进任务栏时会覆盖已有图标"
   ],
-  "download": "https://lightbox.while.cc.cd/index.html",
-  "page": "https://lightbox.while.cc.cd/index.html"
+  "download": "https://gitee.com/gathon/lightbox/releases",
+  "page": "https://gitee.com/gathon/lightbox/releases"
 }

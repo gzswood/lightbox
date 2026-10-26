@@ -82,7 +82,7 @@ LightBox 解决一个很小但很烦的问题：桌面图标越堆越多，又�
   自愈线程每 3 秒核对一遍，缺的按配置补建出来
 - **单实例** —— 重复双击不会叠出第二套盒子
 - **开机自启** —— 写一条 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，开关在设置里
-- **更新提醒不弹窗** —— 后台每天静默查一次；有新版本只在**设置页左下角的版本号**处显示红色提醒，
+- **更新提醒不弹窗** —— 后台每天静默去 Gitee 仓库读一次 `version.json`；有新版本只在**设置页左下角的版本号**处显示红色提醒，
   你看到了再点。绝不主动开窗、不抢焦点
 - **快捷方式正确启动** —— 先解析 `.lnk` 拿到「目标 + 参数 + 工作目录」再拉起程序，并滤掉
   `ELECTRON_*` / `NODE_OPTIONS` 这类会被子进程继承、导致 Electron 应用秒退的环境变量
@@ -287,7 +287,7 @@ src-tauri/
   src/glass.rs       面板毛玻璃（自截自糊）
   src/pick.rs        取色器后端
   src/icons.rs       图标提取与缓存
-update-site/         静态更新页（version.json + index.html）
+update-site/         更新清单 version.json（Gitee raw 直接读）+ 可选的落地页
 tools/               Gitee 一键发版脚本
 docs/                更新记录与截图
 ```

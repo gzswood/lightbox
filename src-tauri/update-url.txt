@@ -1,2 +1,1 @@
-https://lightbox.while.cc.cd/version.json
-https://light.hyperphp.com/version.json
+https://gitee.com/gathon/lightbox/raw/master/update-site/version.json
