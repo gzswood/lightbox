@@ -1,0 +1,17 @@
+# 文本文件统一按 LF 存储，避免 Windows/Linux 换行差异污染 diff
+* text=auto
+
+# 批处理/PowerShell 必须保持 CRLF，否则 cmd 执行会出问题
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary

@@ -1,0 +1,1526 @@
+/* 主题变量全部由 src/theme.ts 的 applyTheme() 在运行时重写（背景色可自定义、
+   文字色按背景亮度自动翻转）。这里的初始值 = 默认主题，也是「右键菜单」独立窗口用的那套。 */
+:root {
+  /* 默认底板 #5A606B（与 theme.ts 的 DEFAULT_THEME / store.rs 的默认值一致）。
+     文字色按背景亮度取浅色 —— 这里直接写成对应的白系，避免首帧闪一下深色字。 */
+  --tile-bg: #5a606b;
+  --tile-hover-bg: #6e737d;
+  --tile-drop-bg: #667286;
+  --tile-text: #ffffff;
+  --tile-dim: rgba(255, 255, 255, 0.7);
+  --tile-border: rgba(255, 255, 255, 0.18);
+  --tile-inset: rgba(255, 255, 255, 0.14);
+  --tile-accent: #9ec3ff;
+  --tile-badge-bg: rgba(158, 195, 255, 0.2);
+
+  --panel-bg: rgba(90, 96, 107, 1);
+  --panel-text: #ffffff;
+  --panel-dim: rgba(255, 255, 255, 0.7);
+  --panel-accent: #9ec3ff;
+  --panel-hover: rgba(255, 255, 255, 0.14);
+  --panel-hair: rgba(255, 255, 255, 0.18);
+  --panel-border: rgba(255, 255, 255, 0.18);
+  --card-bg: #5a606b;
+  --card-border: rgba(255, 255, 255, 0.18);
+  --scroll-thumb: rgba(255, 255, 255, 0.22);
+  --scroll-thumb-hover: rgba(255, 255, 255, 0.34);
+
+  /* 旧代码里的短名，统一映射到面板那一套 */
+  --text: var(--panel-text);
+  --text-dim: var(--panel-dim);
+  --accent: var(--panel-accent);
+  --hair: var(--panel-hair);
+  --hover: var(--panel-hover);
+  --danger: #e05252;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  /* 窗口形状由 Win32 的 SetWindowRgn 裁成圆角，这里必须不透明地铺满，
+     否则 WebView 宿主的默认白底和窗口标题会透出来。 */
+  background: #f9fafd;
+  overflow: hidden;
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui,
+    -apple-system, sans-serif;
+  color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* 面板 / 菜单 / 设置：这三种顶层窗口**不再用 SetWindowRgn 裁圆角**。
+   DWM 对它们的合成是逐像素 alpha 的（实测 50% 透明度时像素值 = 0.5×底色 + 0.5×桌面），
+   所以圆角可以放心交给 CSS 的 border-radius —— Chromium 会画抗锯齿，比
+   CreateRoundRectRgn 的 1 像素台阶细腻得多。代价是页面背景必须彻底透明，
+   否则圆角外面会露出一层底色。盒子（Progman 子窗口）没有 alpha，仍然靠窗口区域硬裁。 */
+html[data-mode="panel"],
+html[data-mode="panel"] body,
+html[data-mode="panel"] #root,
+html[data-mode="menu"],
+html[data-mode="menu"] body,
+html[data-mode="menu"] #root,
+html[data-mode="settings"],
+html[data-mode="settings"] body,
+html[data-mode="settings"] #root,
+html[data-mode="update"],
+html[data-mode="update"] body,
+html[data-mode="update"] #root,
+html[data-mode="pick"],
+html[data-mode="pick"] body,
+html[data-mode="pick"] #root {
+  background: transparent;
+}
+
+/* 收纳盒窗口：整窗铺底板色，圆角裁掉的那 1 像素台阶也不露白底 */
+html[data-mode="box"],
+html[data-mode="box"] body,
+html[data-mode="box"] #root {
+  background: var(--tile-bg);
+}
+
+/* ---------- 收纳盒 ----------
+ *
+ * 盒子是 Progman 的子窗口，**没有逐像素 alpha**，做不出真正的「透出壁纸」；
+ * 之前用「把背后屏幕截图贴回窗口」硬凑透明，结果截图把桌面图标也一起带了进来
+ * （图标画在 SHELLDLL_DefView 里），盒子里就出现一层「别的图片」，还和自己的名字叠在一起。
+ * 现在回到最简单也最稳的做法：**实色底板**，颜色由设置里的「收纳盒」取色格决定，
+ * 文字颜色按背景自动取深/浅（`--tile-text`，见 theme.ts）。
+ *
+ * 尺寸跟着窗口走（100%），窗口边长是后端的 `BOX_W`=72；
+ * 圆角 16 必须和 `BOX_RADIUS` 一致（窗口用 SetWindowRgn 硬裁，两个值对不上会露直角）。 */
+/* 盒子舞台：固定 80×80 逻辑像素，**不跟 viewport 走**。
+ *
+ * 盒子窗口的物理尺寸是 80 × 显示器缩放，而 WebView 的 DPR 在 tao 建窗口时就定死了、
+ * 换屏也不变 —— 用 100% 宽度排版等于让布局去猜 DPR，猜错就溢出被裁。
+ * 这里固定 80×80，再用 transform 把整体缩到 `缩放 / DPR`，物理像素精确等于 80 × 缩放。 */
+.box-stage {
+  position: fixed;
+  left: 0;
+  top: 0;
+  /* 默认 80×80（普通盒子）；任务栏胶囊由 BoxView 用内联样式改成「宽 × 任务栏厚度」 */
+  width: 80px;
+  height: 80px;
+  transform-origin: 0 0;
+}
+
+.box-tile {
+  position: relative;
+  /* 撑满舞台：盒子的实际尺寸由舞台决定，普通 80×80、任务栏胶囊更宽更矮 */
+  width: 100%;
+  height: 100%;
+  /* 80 高要装下「图标 46 + 一行名字」：内容 65.6 上下居中，余量约 7.2 */
+  padding: 3px 4px;
+  border-radius: 18px;
+  background: var(--tile-bg);
+  border: none;
+  box-shadow: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* 背景层和磨砂层都在内容下面：绝对定位元素默认画在静态内容之上，必须显式压下去 */
+.box-icon,
+.box-name {
+  position: relative;
+  z-index: 1;
+}
+
+/* 悬停 / 拖动 / 拖入：比底色稍亮或稍暗一点（`--tile-hover-bg` 按背景明暗自动算） */
+.box-tile:hover,
+.box-tile.dragging,
+.box-tile.drop {
+  background: var(--tile-hover-bg);
+}
+
+/* 名字颜色跟背景走（`--tile-text` 由 theme.ts 按对比度算），不用再区分悬停态 */
+.box-tile:hover .box-icon {
+  transform: scale(1.06);
+}
+
+.box-icon {
+  transition: transform 0.16s ease;
+}
+
+/* 拖入时：窗口本身被裁剪成圆角矩形，不能再用 outline/scale（会被裁掉） */
+.box-tile.drop {
+  box-shadow: inset 0 0 0 2px var(--tile-accent);
+}
+
+.box-tile.drop .box-icon {
+  transform: scale(1.1);
+}
+
+/* 嵌进任务栏的盒子：横向胶囊（高 = 任务栏厚度，约 40px）。
+   左边是盒子图标，右边两个汉字（名字的前两个字），像任务栏上的一个小按钮。 */
+.box-tile.bar {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 1px;
+  padding: 0 2px 0 0;
+  border-radius: 8px;
+}
+
+.box-tile.bar .box-name {
+  display: none;
+}
+
+/* 「嵌入任务栏时隐藏名称」：胶囊变正方形，只放图标 —— 图标居中，不留右侧空位 */
+.box-tile.bar.solo {
+  justify-content: center;
+  padding: 0;
+}
+
+/* 胶囊里的图标按高度缩放（尺寸由 BoxView 内联给出），转成 flex 居中 */
+.box-tile.bar .box-icon {
+  display: grid;
+  place-items: center;
+}
+
+/* 任务栏胶囊右侧的两个汉字 */
+.box-label {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  line-height: 1;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  font-weight: 600;
+  color: var(--tile-text);
+}
+
+/* 任务栏里空间太小，角标不画（会盖住图标） */
+.box-tile.bar .box-count {
+  display: none;
+}
+
+/* 盒子自己的图标 */
+.box-icon {
+  width: 46px;
+  height: 46px;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.box-icon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  /* 用户可能把背景调成蓝色系，内置图标也是蓝的 —— 加一点投影让轮廓始终分得出来 */
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.22));
+}
+
+.box-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.box-count {
+  position: absolute;
+  z-index: 1;
+  top: 3px;
+  right: 4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  /* 角标压在图标右上角，底色固定深色 + 白字，深浅底板都读得清 */
+  background: rgba(14, 18, 26, 0.62);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+}
+
+.cell-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: var(--scroll-thumb);
+}
+
+.box-name {
+  /* 盒子 80 宽、左右各留 4 → 一行最多 72px；字号固定 12px 不随盒子缩放 */
+  max-width: 72px;
+  font-size: 12px;
+  /* 中文名用微软雅黑，字形比 Segoe UI 更「方正」，小字号下也清楚 */
+  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  line-height: 1.22;
+  /* 有实色底板了：字色跟背景明暗走（theme.ts 算好的 --tile-text） */
+  color: var(--tile-text);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 盒子改名：复用「右键菜单」窗口，缩成 80×22 盖在名字那一行上。
+   为什么不在盒子里放 input：盒子是 Progman 的子窗口，永远不是前台，
+   敲键盘全被桌面吃掉（实测输入框出来了但一个字都进不去）。 */
+.menu-rename {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 0 6px;
+  background: #fff;
+  border: 1px solid rgba(47, 111, 235, 0.95);
+  /* 和 strip_chrome 传的 8 一致 */
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.menu-rename-input {
+  width: 100%;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  text-align: center;
+  font: inherit;
+  font-size: 12px;
+  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  line-height: 1.2;
+  color: #1b1b1f;
+  cursor: text;
+}
+
+/* ---------- 面板 ---------- */
+.panel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  /* 圆角由主题控制（设置里的「圆角窗口」开关）：--panel-radius 与后端
+     SetWindowRgn 用的是同一个半径，两边必须对得上 */
+  border-radius: var(--panel-radius, 0px);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* 单独成一层，毛玻璃底图才能稳稳待在最下面 */
+  isolation: isolate;
+}
+
+/* 毛玻璃底图：后端截的「背后那块屏幕」，1/7 降采样 + 箱式模糊，
+   这里放大铺满（双线性插值继续糊）+ 轻微提饱和，就是磨砂玻璃的观感。 */
+.panel-glass {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+  filter: blur(4px) saturate(125%);
+  /* 放大一点，糊掉的边缘不要露出直边 */
+  transform: scale(1.04);
+  pointer-events: none;
+}
+
+/* 色层：压在玻璃之上、内容之下。必须单独一层，不能直接当 .panel 的背景色 ——
+   背景色永远画在子元素下面，会被玻璃整块盖住，玻璃就变成「原色照片」而不是毛玻璃了。 */
+.panel-tint {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background: var(--panel-bg);
+  pointer-events: none;
+}
+
+.panel-head,
+.grid,
+.empty {
+  position: relative;
+  z-index: 1;
+}
+
+.panel.drop {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.panel-head {
+  height: 46px;
+  flex: 0 0 46px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--hair);
+}
+
+.panel-title {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+  padding: 2px 2px;
+  border-radius: 5px;
+}
+
+.panel-title:hover {
+  background: var(--hover);
+}
+
+.rename-input {
+  font: inherit;
+  font-size: 13px;
+  padding: 3px 7px;
+  width: 170px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  outline: none;
+  color: var(--text);
+  background: var(--card-bg);
+}
+
+.panel-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--hover);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: default;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.grid {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  align-content: start;
+  /* 框选矩形 .band 的定位参照（含滚动偏移） */
+  position: relative;
+}
+
+.grid::-webkit-scrollbar {
+  width: 8px;
+}
+
+.grid::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+
+.grid::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+/* 格子：图标**顶对齐**。
+   名称最多两行、一行还是两行不固定，如果整体垂直居中，长名字那格的图标就会比
+   短名字的低几像素，一行行看过去参差不齐。这里改成 flex-start + 名称固定占两行高度，
+   于是所有图标的上边缘严格在同一水平线上。 */
+.cell {
+  height: 84px;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 5px;
+  padding: 6px 4px 4px;
+  /* transform 用来做「拖动排序」的让位动画：被拖的格子跟手，其它格子滑一格 */
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.12s ease;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 拖动中的格子：不跟动画（要贴手），抬起来一点 */
+.cell.dragging {
+  transition: none;
+  z-index: 20;
+  cursor: grabbing;
+  background: rgba(47, 111, 235, 0.1);
+  box-shadow: 0 10px 22px rgba(16, 24, 40, 0.2);
+}
+
+/* 多选选中态：强调色淡底 + 内描边（深浅主题都看得见） */
+.cell.sel {
+  background: rgba(47, 111, 235, 0.12);
+  box-shadow: inset 0 0 0 1.5px var(--panel-accent);
+}
+
+.cell.sel:hover {
+  background: rgba(47, 111, 235, 0.2);
+}
+
+/* 框选矩形：跟在指针后面画，不吃指针事件 */
+.band {
+  position: absolute;
+  z-index: 15;
+  border: 1px solid var(--panel-accent);
+  background: rgba(47, 111, 235, 0.12);
+  border-radius: 4px;
+  pointer-events: none;
+}
+
+/* 松手把顺序写回数组的那一帧：关掉过渡，否则会看到「弹回原处再飞过去」 */
+.grid.no-anim .cell {
+  transition: none !important;
+}
+
+.cell:hover {
+  background: var(--hover);
+}
+
+.cell:active {
+  transform: scale(0.96);
+}
+
+.cell img {
+  width: 36px;
+  height: 36px;
+  flex: none;
+  object-fit: contain;
+}
+
+.cell span {
+  font-size: 12px;
+  /* 图标名称统一用微软雅黑，字号比原先大一档 */
+  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  line-height: 1.25;
+  max-width: 92px;
+  /* 固定两行高度（12px × 1.25 × 2 = 30px）：只有一行名字的格子也占满两行，
+     这样每格里「图标 + 名字」的总高一致，图标才能上平齐 */
+  height: 30px;
+  text-align: center;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  /* 英文名优先在空格处折行（长单词才硬断），中文本来就能任意断行 */
+  word-break: normal;
+  overflow-wrap: anywhere;
+  color: var(--panel-text);
+}
+
+.empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.9;
+  text-align: center;
+}
+
+.toast {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(28, 28, 32, 0.92);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.24);
+}
+
+.menu-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+}
+
+.ctx-menu {
+  position: absolute;
+  z-index: 50;
+  min-width: 160px;
+  padding: 5px;
+  border-radius: 11px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  box-shadow: 0 12px 34px rgba(16, 24, 40, 0.2);
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  border-radius: 7px;
+  color: var(--panel-text);
+}
+
+.ctx-item:hover {
+  background: var(--panel-hover);
+  color: var(--panel-accent);
+}
+
+.ctx-item.danger:hover {
+  background: rgba(224, 82, 82, 0.14);
+  color: var(--danger);
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--hair);
+}
+
+.ctx-item.disabled {
+  color: var(--panel-dim);
+  opacity: 0.65;
+}
+
+.ctx-item.disabled:hover {
+  background: transparent;
+  color: var(--panel-dim);
+  opacity: 0.65;
+}
+
+.ctx-hint {
+  padding: 0 10px 4px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--panel-dim);
+  white-space: normal;
+}
+
+/* ---------- 盒子右键菜单（独立窗口） ---------- */
+html[data-mode="menu"],
+html[data-mode="menu"] body,
+html[data-mode="menu"] #root {
+  background: #ffffff;
+}
+
+.menu {
+  width: 100%;
+  height: 100%;
+  padding: 6px;
+  border-radius: 14px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.menu-head {
+  flex: none;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.menu-head-name {
+  font-size: 12px;
+  font-weight: 600;
+  /* 跟着主题：深色背景下这里是白字，不然黑字完全看不清 */
+  color: var(--panel-text);
+  max-width: 118px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-head-count {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--hover);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+.menu-item {
+  flex: none;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  color: var(--panel-text);
+  white-space: nowrap;
+}
+
+.menu-item:hover {
+  background: var(--panel-hover);
+  color: var(--panel-accent);
+}
+
+.menu-item.danger:hover {
+  background: rgba(224, 82, 82, 0.14);
+  color: var(--danger);
+}
+
+/* 置灰：用主题的次要文字色 + 透明度，深底浅底都能读 */
+.menu-item.disabled,
+.menu-item.disabled:hover {
+  color: var(--panel-dim);
+  opacity: 0.55;
+  background: transparent;
+}
+
+.menu-sep {
+  flex: none;
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--hair);
+}
+
+.menu-hint {
+  flex: none;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 10.5px;
+  color: var(--panel-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-hint.bad {
+  color: var(--danger);
+}
+
+/* ---------- 设置弹层 ---------- */
+/* 设置窗口的外壳：铺满整个窗口，圆角就是窗口的圆角（CSS 抗锯齿） */
+.dlg-win {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.dlg-win-empty {
+  height: 100%;
+  background: var(--card-bg);
+}
+
+/* 设置窗口是直角（后端 SET_RADIUS = 0），这里也不能有圆角，否则窗口矩形里会留出
+   四个透明的角。高度由内容决定（height: fit-content），前端量完再让后端把窗口
+   改成一样高，所以正常情况不会出现滚动条；只有内容比屏幕还高时才滚。 */
+.dlg {
+  width: 100%;
+  height: fit-content;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 14px 18px 10px;
+  border-radius: 0;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  color: var(--panel-text);
+}
+
+.dlg::-webkit-scrollbar {
+  width: 8px;
+}
+
+.dlg::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+
+.dlg-title {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  margin: -14px -18px 2px;   /* 撑满卡片顶部，整条标题栏都能拖动 */
+  padding: 12px 44px 8px 18px;  /* 右边留出 ✕ 的位置 */
+  cursor: move;
+  user-select: none;
+}
+
+/* 关闭按钮：不吃拖动（pointerdown 要 stopPropagation），悬停才浮出底色 */
+.dlg-x {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--panel-dim);
+  cursor: default;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.dlg-x:hover {
+  background: var(--panel-hover);
+  color: var(--panel-text);
+}
+
+/* 标题右边跟一个盒子名：设置是独立窗口，得让用户知道在改哪个盒子 */
+.dlg-title-name {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--panel-dim);
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dlg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px solid var(--hair);
+}
+
+/* 整行竖排：标签在上、控件占满整行宽度（透明度滑块用这个） */
+.dlg-row.col {
+  display: block;
+}
+
+.dlg-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dlg-label {
+  flex: 1;
+  font-size: 12.5px;
+  color: var(--panel-text);
+  min-width: 0;
+}
+
+.dlg-desc {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  word-break: break-all;
+  max-height: 30px;
+  overflow: hidden;
+}
+
+/* 单行显示 + 省略号（存储路径这种长文本用，省一行高度） */
+.dlg-desc.one {
+  max-height: none;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  word-break: normal;
+}
+
+.dlg-input {
+  width: 148px;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 8px;
+  color: var(--text);
+  background: var(--card-bg);
+  border: 1px solid var(--panel-hair);
+  border-radius: 7px;
+  outline: none;
+}
+
+.dlg-input:focus {
+  border-color: var(--accent);
+}
+
+/* 滑块：占满整行，右边数字固定在版心内，永远不会顶出边距 */
+.dlg-slider {
+  display: block;
+  width: 100%;
+  height: 18px;
+  margin: 8px 0 2px;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+.dlg-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--panel-hair);
+}
+
+.dlg-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+
+.dlg-op-val {
+  flex: none;
+  min-width: 34px;
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--panel-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.dlg-link {
+  flex: none;
+  font: inherit;
+  font-size: 10.5px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--panel-accent);
+  cursor: default;
+}
+
+.dlg-link:hover {
+  text-decoration: underline;
+}
+
+/* 两个取色格 */
+.dlg-colors {
+  display: flex;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.sw {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-hair);
+  background: var(--panel-hover);
+  /* 这是个 <button>：把浏览器默认样式清干净 */
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+}
+
+.sw:hover {
+  border-color: var(--panel-accent);
+}
+
+/* 展开调色板的那个色块：描一圈强调色，用户知道现在改的是哪个 */
+.sw.on {
+  border-color: var(--panel-accent);
+  box-shadow: inset 0 0 0 1px var(--panel-accent);
+}
+
+/* ---------- 自绘调色板 ---------- */
+.sw-pop {
+  margin-top: 8px;
+  padding: 9px;
+  border-radius: 10px;
+  border: 1px solid var(--panel-hair);
+  background: var(--card-bg);
+}
+
+.sw-presets {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 5px;
+}
+
+.sw-preset {
+  height: 18px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  cursor: pointer;
+}
+
+.sw-preset.on {
+  box-shadow: 0 0 0 2px var(--panel-accent);
+}
+
+/* 饱和 / 明度方块：背景由 JS 拼两层渐变（白→色相、透明→黑），
+   左上角最亮最艳，右下角最暗最灰 —— 和系统取色器一致 */
+.sw-sv {
+  position: relative;
+  height: 92px;
+  margin-top: 9px;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.sw-sv-thumb {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+/* 色相条：一整条彩虹，滑块左右拖 */
+.sw-hue {
+  position: relative;
+  height: 12px;
+  margin-top: 9px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    #f00 0%,
+    #ff0 17%,
+    #0f0 33%,
+    #0ff 50%,
+    #00f 67%,
+    #f0f 83%,
+    #f00 100%
+  );
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.16);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.sw-hue-thumb {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.32);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+
+/* 吸管按钮 */
+.sw-pipette {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--panel-hair);
+  background: var(--panel-hover);
+  color: var(--panel-text);
+  cursor: pointer;
+}
+
+.sw-pipette:hover {
+  border-color: var(--panel-accent);
+  color: var(--panel-accent);
+}
+
+/* ---------- 全屏取色器（mode=pick 的窗口） ---------- */
+.pick {
+  position: fixed;
+  inset: 0;
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow: hidden;
+}
+
+/* 全屏快照：1:1 铺满，取色过程中画面静止（和系统取色器一样） */
+.pick-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+}
+
+.pick-hint {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(16, 18, 24, 0.86);
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+}
+
+/* 放大镜：135×135，里面是光标周围 15×15 物理像素放大 9 倍（不插值，看得清像素格） */
+.pick-mag {
+  position: absolute;
+  width: 135px;
+  height: 135px;
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 3px rgba(0, 0, 0, 0.55), 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  background: #fff;
+}
+
+.pick-mag canvas {
+  display: block;
+  width: 135px;
+  height: 135px;
+}
+
+/* 中心十字线 */
+.pick-cross-h,
+.pick-cross-v {
+  position: absolute;
+  background: rgba(255, 255, 255, 0.85);
+  mix-blend-mode: difference;
+  pointer-events: none;
+}
+
+.pick-cross-h {
+  left: 0;
+  right: 0;
+  top: 67px;
+  height: 1px;
+}
+
+.pick-cross-v {
+  top: 0;
+  bottom: 0;
+  left: 67px;
+  width: 1px;
+}
+
+/* 放大镜下面（或上面）的颜色小条 */
+.pick-chip {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 92px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  background: rgba(16, 18, 24, 0.86);
+  color: #fff;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.pick-chip i {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+}
+
+.sw-hexrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.sw-hex {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--panel-hair);
+  background: var(--panel-hover);
+  color: var(--panel-text);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+}
+
+.sw-hex:focus {
+  border-color: var(--panel-accent);
+}
+
+.sw-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.5);
+}
+
+.sw-txt {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+  font-size: 10px;
+  color: var(--panel-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.sw-txt em {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--panel-text);
+}
+
+.switch {
+  flex: none;
+  position: relative;
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--scroll-thumb);
+  transition: background 0.16s ease;
+}
+
+.switch.on {
+  background: #2f6feb;
+}
+
+.switch.off {
+  opacity: 0.55;
+}
+
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  /* 深色背景上「白色滑块 + 浅色轨道」容易糊成一片，加一圈细边把轮廓交代清楚 */
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.26);
+  transition: transform 0.16s ease;
+}
+
+.switch.on .knob {
+  transform: translateX(18px);
+}
+
+.dlg-btn {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--panel-hair);
+  background: var(--card-bg);
+  color: var(--text);
+  cursor: default;
+}
+
+.dlg-btn:hover {
+  background: var(--hover);
+}
+
+.dlg-btn.primary {
+  /* 主按钮固定用品牌蓝（不跟 --accent 走）：深色背景上 --accent 会被翻成浅蓝，
+     白字压浅蓝就糊了。 */
+  background: #2f6feb;
+  border-color: #2f6feb;
+  color: #fff;
+}
+
+.dlg-btn.primary:hover {
+  filter: brightness(1.07);
+}
+
+.dlg-msg {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  margin-top: 8px;
+}
+
+.dlg-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+}
+
+.dlg-ver {
+  font-size: 10.5px;
+  color: #a6a6ae;
+}
+
+.dlg-hint {
+  font-size: 10.5px;
+  color: var(--panel-dim);
+  opacity: 0.85;
+}
+
+/* ---------- 版本更新窗口 ----------
+ *
+ * 和设置窗口同一套 .dlg 骨架（直角、无边框、标题栏可拖），
+ * 只是内容换成「版本对比 + 更新说明 + 下载」。
+ * 窗口是固定尺寸（后端 UPD_W × UPD_H），内容少了也要铺满整块矩形，
+ * 否则 transparent 窗口会露出后面桌面的颜色，所以给 min-height: 100%。
+ */
+.upd {
+  min-height: 100%;
+  padding-bottom: 14px;
+}
+
+.upd-vers {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  margin-top: 4px;
+  color: var(--panel-text);
+}
+
+.upd-vers em {
+  font-style: normal;
+  color: var(--panel-accent);
+}
+
+.upd-arrow {
+  color: var(--panel-dim);
+  font-weight: 400;
+  margin: 0 2px;
+}
+
+.upd-date {
+  font-size: 11px;
+  color: var(--panel-dim);
+  margin-top: 3px;
+}
+
+.upd-head {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--panel-dim);
+  margin: 14px 0 6px;
+}
+
+.upd-notes {
+  margin: 0;
+  padding: 0 0 0 16px;
+  max-height: 190px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--panel-text);
+}
+
+.upd-notes::-webkit-scrollbar {
+  width: 8px;
+}
+
+.upd-notes::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+
+.upd-notes li {
+  margin: 0 0 3px;
+}
+
+.upd-state {
+  font-size: 12.5px;
+  color: var(--panel-dim);
+  margin-top: 18px;
+}
+
+.upd-state.flat {
+  margin-top: 10px;
+  font-size: 11.5px;
+}
+
+.upd-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* 「跳过此版本」放最左边，弱化成一行小字，不抢主按钮的注意力 */
+.upd-skip {
+  margin-right: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  color: var(--panel-dim);
+  cursor: default;
+}
+
+.upd-skip:hover {
+  color: var(--panel-accent);
+  text-decoration: underline;
+}
+
+.upd-btn {
+  height: 28px;
+  padding: 0 14px;
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--card-bg);
+  color: var(--panel-text);
+  cursor: default;
+  transition: background 0.12s ease;
+}
+
+.upd-btn:hover {
+  background: var(--panel-hover);
+}
+
+.upd-btn.primary {
+  border-color: transparent;
+  background: var(--panel-accent);
+  color: #fff;
+}
+
+.upd-btn.primary:hover {
+  filter: brightness(1.07);
+}
+
+/* 设置页脚那个版本号：「点它可以检查更新」，看起来仍然是一行小字 */
+button.dlg-ver {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 10.5px;
+  color: #a6a6ae;
+  cursor: default;
+}
+
+button.dlg-ver:hover {
+  color: var(--panel-accent);
+  text-decoration: underline;
+}
+
+/* ---------- 盒子右键菜单里的「置顶」开关 ----------
+ * 整行可点（和别的菜单项一样是 .menu-item），右侧画一个小开关。
+ * 尺寸按 30px 行高配：轨道 26×15，滑块 11。
+ */
+.menu-item.menu-switch {
+  justify-content: space-between;
+}
+
+.menu-switch .track {
+  position: relative;
+  flex: none;
+  width: 26px;
+  height: 15px;
+  border-radius: 8px;
+  background: rgba(120, 120, 128, 0.34);
+  transition: background 0.12s ease;
+}
+
+.menu-switch .track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 0.12s ease;
+}
+
+.menu-switch.on .track {
+  background: var(--panel-accent);
+}
+
+.menu-switch.on .track::after {
+  transform: translateX(11px);
+}
+
+/* ---------- 设置页脚「有新版本」的红色提醒 ----------
+ *
+ * 后端查到新版本**不弹窗**，只把状态推过来，靠这一行红字告诉用户。
+ * 用红色 + 小圆点，不加动画（这个项目默认不做观感类动效）。
+ */
+button.dlg-ver.has-new {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #d93036;
+  font-weight: 600;
+}
+
+button.dlg-ver.has-new:hover {
+  color: #b3252b;
+  text-decoration: underline;
+}
+
+.dlg-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #d93036;
+}
+
+button.dlg-ver.has-new:hover .dlg-dot {
+  background: #b3252b;
+}

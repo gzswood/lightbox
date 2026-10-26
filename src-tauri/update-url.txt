@@ -1,0 +1,2 @@
+https://lightbox.while.cc.cd/version.json
+https://light.hyperphp.com/version.json

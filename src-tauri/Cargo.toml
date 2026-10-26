@@ -1,0 +1,36 @@
+[package]
+name = "lightbox"
+version = "0.9.27"
+description = "LightBox - Desktop icon organizer for Windows"
+authors = ["LightBox"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "lightbox_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# 关键：tauri 判断「dev 构建 / 正式构建」看的是 **custom-protocol 这个 feature**
+# （tauri/build.rs: `let dev = !custom_protocol`），跟 cargo 的 debug/release profile 无关。
+# 缺了它，`cargo build --release` 出来的 exe 也会去加载 devUrl(http://localhost:1420)，
+# 没有 vite 在跑时盒子里就是「localhost 拒绝连接」。
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

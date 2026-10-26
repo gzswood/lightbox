@@ -1,0 +1,36 @@
+# ── 依赖 ─────────────────────────────────────────
+node_modules/
+
+# ── 构建产物（可完整重建，不入库）─────────────────
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ── 安装包与运行目录 ─────────────────────────────
+# exe 走 Gitee Releases 附件，不进 git 历史（每版 3.85MB 会永久占用仓库配额）
+# 这里同时屏蔽掉运行时生成的 config.json / boxes/ / update.json
+dist-app/
+lightbox.exe
+lightbox-v*.exe
+
+# ── 用户数据（本地运行状态，绝不入库）────────────
+config.json
+config.backup.json
+config.before-v*.json
+update.json
+boxes/
+update.json.tmp
+
+# ── 本地开发记录 ─────────────────────────────────
+# 含网盘真实提取码、本机绝对路径（用户名），公开仓库不能带
+.workbuddy/
+
+# ── 编辑器 / 系统 ────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.bak
