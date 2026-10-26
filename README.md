@@ -4,7 +4,7 @@
 
 **把散在桌面上的快捷方式收进小方盒 —— Windows 轻量桌面整理工具**
 
-单文件 exe，绿色免安装，约 3.8 MB。盒子可以贴在桌面层，也可以嵌进任务栏。
+单文件 exe，绿色免安装，约 3.7 MB。盒子可以贴在桌面层，也可以嵌进任务栏。
 
 [![版本](https://img.shields.io/badge/version-0.9.27-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
 [![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square&logo=windows&logoColor=white)](#系统要求)
@@ -32,7 +32,7 @@ LightBox 解决一个很小但很烦的问题：桌面图标越堆越多，又�
 里面的图标按你排的顺序铺开，单击直接启动。盒子本身可以贴在桌面层（不进 Alt+Tab、
 按 `Win+D` 回桌面能看到它），也可以**拖进任务栏变成一个小胶囊**，随时一点即用。
 
-程序是**单文件绿色版**：整个 lightbox.exe 约 3.8 MB，双击即用，不需要安装。配置（`config.json`）和
+程序是**单文件绿色版**：整个 lightbox.exe 约 3.7 MB，双击即用，不需要安装。配置（`config.json`）和
 收纳的快捷方式（`boxes\` 目录）都放在 exe 旁边，把整个文件夹拷到别的机器上就能接着用。
 
 ## 截图
@@ -264,13 +264,14 @@ LightBox 是解析 `.lnk` 拿到真实目标再启动的，比直接双击更严
 | 构建 | `vite build` + `cargo build --release --features custom-protocol` |
 
 **为什么网络也自己写？** 只为了查一个 `version.json`，引 `reqwest` 会让体积翻几倍、编译时间多几分钟。
-现在整个后端只依赖 tauri / serde / windows-sys，exe 保持 3.8 MB。
+现在整个后端只依赖 tauri / serde / windows-sys，exe 保持 3.7 MB。
 
 ## 目录结构
 
 ```
 src/                 前端（React）
   BoxView.tsx        盒子窗口页面
+  PanelView.tsx      弹出面板（图标格子、框选多选、拖动排序）
   MenuView.tsx       右键菜单窗口
   SettingsDialog.tsx 设置弹层
   PickView.tsx       自绘取色器
