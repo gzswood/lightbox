@@ -1,6 +1,6 @@
 [package]
 name = "lightbox"
-version = "0.9.27"
+version = "0.9.28"
 description = "LightBox - Desktop icon organizer for Windows"
 authors = ["LightBox"]
 edition = "2021"
