@@ -26,6 +26,13 @@ pub struct BoxConfig {
     /// 面板里的自定义顺序（存文件名）。空 = 按名称排。用户拖动图标后写入。
     #[serde(default)]
     pub order: Vec<String>,
+    /// 「胶囊团」id：几个吸附在一起的盒子被「组合」成一个整体后共享同一个值，
+    /// 拖其中一个，其它成员跟着走（见 lib.rs 的 `group_drag_begin` / `group_follow`）。
+    ///
+    /// `None` = 不属于任何团，可以单独移动。由右键菜单的「组合 / 解散胶囊团」维护，
+    /// 形态切换（嵌入/移出任务栏）、自动排序、删除盒子都会把成员摘出去。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -172,6 +179,11 @@ pub struct State {
     /// 取色期间它被藏起来（否则会被截进快照），commit / cancel 时按 label 原样放回来，
     /// 取到的颜色也发给它——以前写死发给 `settings`，从托盘「设置…」里点吸管就白取。
     pub pick_caller: Mutex<Option<String>>,
+    /// 正在进行中的「胶囊团拖动」会话：锚点 id + 其余成员相对锚点的偏移。
+    ///
+    /// 只在一次拖动期间有值（按下时算偏移，松手落位后清空）。拖动途中每次窗口移动
+    /// 都按它把成员摆到「锚点 + 偏移」的位置，于是整团看起来是一起被拖走的。
+    pub group_drag: Mutex<Option<crate::GroupDrag>>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -198,6 +210,8 @@ pub struct BoxView {
     pub bar_hide_label: bool,
     /// 用户自定义的盒子图标（png data URL 或文件路径）；为空时前端画内置图标
     pub icon: Option<String>,
+    /// 属于某个「胶囊团」：拖动时要先问后端整团的偏移，拖着一起走
+    pub in_group: bool,
 }
 
 /// 程序根目录 = exe 所在目录。

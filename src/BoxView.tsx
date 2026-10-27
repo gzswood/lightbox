@@ -41,6 +41,10 @@ export default function BoxView({ id }: { id: string }) {
   /** 是否嵌在任务栏里（拖动落位要走 snap_bar，不能走 snap_box） */
   const barRef = useRef(false);
   const dragStartedRef = useRef(0);
+  /** 上一次「点开/收起面板」的时间：双击的第二下不能算又一次开关 */
+  const lastClickRef = useRef(0);
+  /** 是否属于某个胶囊团（拖动时要先算整团偏移，拖着一起走） */
+  const inGroupRef = useRef(false);
   const readySent = useRef(false);
 
   // 盒子所在显示器的缩放系数（后端按盒子**位置**查，盒子的窗口 DPI 不可信）。
@@ -86,6 +90,7 @@ export default function BoxView({ id }: { id: string }) {
         if (v.in_bar !== barRef.current) dragStartedRef.current = 0;
         setView(v);
         barRef.current = v.in_bar;
+        inGroupRef.current = !!v.in_group;
       })
       .catch(() => {});
   }, [id]);
@@ -209,6 +214,9 @@ export default function BoxView({ id }: { id: string }) {
         // 拖过，所以程序摆位一律不触发吸附。
         const started = dragStartedRef.current;
         if (!started || Date.now() - started > 8000) return;
+        // 胶囊团：其它成员由后端的跟随线程按「锚点 + 偏移」摆位（拖动开始时就已经起好线程，
+        // 这里不再逐帧发 invoke —— 拖动期间主线程待在系统的拖动模态循环里，跨线程摆位
+        // 会互相等死，用户实测就是「一拖就卡死」）。
         // 兜底落盘：万一吸附那边一直没轮到（比如用户按着鼠标停了很久），
         // 至少这个 400ms 后会把拖动后的坐标写进 config，不会丢位置。
         // 它只写坐标、不动窗口，所以拖动途中调用也安全。
@@ -246,7 +254,18 @@ export default function BoxView({ id }: { id: string }) {
       d.moved = true;
       dragStartedRef.current = Date.now();
       setDragging(true);
-      getCurrentWindow().startDragging().catch(() => {});
+      if (inGroupRef.current) {
+        // 胶囊团：先把「其它成员的偏移」算好再进系统拖动循环。
+        // 顺序不能反 —— startDragging 会一直占着，之后前端再发指令就到不了了。
+        api
+          .groupDragBegin(id)
+          .catch(() => {})
+          .finally(() => {
+            getCurrentWindow().startDragging().catch(() => {});
+          });
+      } else {
+        getCurrentWindow().startDragging().catch(() => {});
+      }
     }
   };
 
@@ -254,14 +273,21 @@ export default function BoxView({ id }: { id: string }) {
     const d = drag.current;
     drag.current = null;
     setDragging(false);
-    if (d && !d.moved) api.openPanel(id).catch(() => {});
+    if (d && !d.moved) {
+      // 面板是「点一次弹出、再点一次收起」的开关。双击的第二下间隔往往不到 300ms，
+      // 直接放过会让面板刚打开就被关上（看起来像点了没反应）。
+      const now = Date.now();
+      if (now - lastClickRef.current < 300) return;
+      lastClickRef.current = now;
+      api.openPanel(id).catch(() => {});
+    }
   };
 
   // 拖动途中「悬停切换形态」：每 60ms 问一次后端。
   //
-  // 用户要求：拖到任务栏上一半以上停住 500ms 就直接嵌进去、把胶囊往上顶住 500ms
+  // 用户要求：拖到任务栏上一半以上停住一会儿就直接嵌进去、把胶囊往上顶住一会儿
   // 就直接退回桌面 —— 都不用等松手。判断逻辑全在后端（要读光标、系统拖动状态），
-  // 判定时间也由后端记（前端只负责定时问）。
+  // 具体的判定时长也由后端记（`HOVER_MS`，前端只负责定时问）。
   //
   // 返回 "idle" 说明这次拖动结束了、或者后端甩不掉系统拖动循环：停下并复位拖动标记；
   // "embed"/"unembed" 说明已经切换，本页面马上会被销毁，也不用再问了。
@@ -301,6 +327,9 @@ export default function BoxView({ id }: { id: string }) {
       const ev = e as MouseEvent;
       if (typeof ev.buttons === "number" && ev.buttons === 1) return;
       setDragging(false);
+      // 胶囊团：拖动结束兜底收个尾（正常由后端吸附时的 group_settle 完成，
+      // 这里只在「没走到吸附」的情况下补一次对齐 + 落盘，没有会话时是空操作）
+      if (inGroupRef.current) api.groupEnd(id).catch(() => {});
       // 拖动会话到此结束：2 秒后把「拖动开始时间」也清掉，之后任何窗口移动
       // （改设置重排、重建、任务栏纠偏）都不再被当成用户拖动去调吸附。
       // 留 2 秒是因为松手到吸附真正执行之间还有 100~400ms 的空档。

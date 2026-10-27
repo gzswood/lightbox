@@ -41,6 +41,10 @@ pub const SWP_NOZORDER: u32 = 0x0004;
 pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const SWP_FRAMECHANGED: u32 = 0x0020;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
+/// 「跨线程摆位不要等」：目标窗口属于别的线程时，SetWindowPos 默认会
+/// SendMessage 过去等对方处理完才返回 —— 对方要是正卡在模态循环里，调用方
+/// 就永远等下去（胶囊团拖动卡死的根源）。带上这一位，请求投递完立刻返回。
+pub const SWP_ASYNCWINDOWPOS: u32 = 0x4000;
 pub const HWND_TOP: isize = 0;
 pub const HWND_BOTTOM: isize = 1;
 pub const HWND_TOPMOST: isize = -1;

@@ -33,9 +33,80 @@ export default function PanelView() {
     selRef.current = files;
     setSelState(files);
   };
+  /** Ctrl+点击：在选中集里加上 / 去掉一个（不启动程序） */
+  const toggleSel = (file: string) => {
+    const cur = selRef.current;
+    setSel(cur.includes(file) ? cur.filter((f) => f !== file) : [...cur, file]);
+  };
   /** 框选矩形（client 坐标，null = 没在框） */
   const [band, setBand] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
-  const bandRef = useRef<{ x0: number; y0: number; x1: number; y1: number; on: boolean } | null>(null);
+  const bandRef = useRef<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+    on: boolean;
+    /** 按下那一刻的 Ctrl 状态：追加还是替换由「按下时」定，别看松手时 */
+    ctrl: boolean;
+  } | null>(null);
+  /**
+   * 「Ctrl 是否按着」的**同步可读镜像**。
+   *
+   * 多选必须在 `pointerdown` 那一刻就决定是「打开程序」还是「切选」，不能等一下 IPC。
+   * 三路来源合成，只要有一路活着，点击前这里就是准的：
+   *  ① 鼠标事件自带的修饰键（`e.ctrlKey`）—— WebView2 在部分窗口状态下不给，靠不住；
+   *  ② 窗口的 keydown/keyup —— 面板聚焦时精确，窗口没焦点时收不到；
+   *  ③ 后端每 40ms 轮询物理键后广播的 `ctrl:changed` —— 不依赖焦点，兜住 ①②。
+   */
+  const ctrlHeldRef = useRef(false);
+  /** 本帧事件或镜像里任一路说 Ctrl 按着，就按 Ctrl 处理 */
+  const ctrlOn = (e: { ctrlKey?: boolean; metaKey?: boolean }) =>
+    !!(e.ctrlKey || e.metaKey || ctrlHeldRef.current);
+
+  useEffect(() => {
+    const sync = (v: boolean) => {
+      ctrlHeldRef.current = v;
+    };
+    const onDown = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") sync(true);
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") sync(false);
+    };
+    // 窗口失焦时收不到 keyup，Ctrl 状态会卡在 true —— 失焦直接复位
+    const onBlur = () => sync(false);
+    window.addEventListener("keydown", onDown, true);
+    window.addEventListener("keyup", onUp, true);
+    window.addEventListener("blur", onBlur);
+
+    let alive = true;
+    let un: (() => void) | undefined;
+    listen<boolean>("ctrl:changed", (e) => {
+      if (alive) sync(!!e.payload);
+    })
+      .then((f) => {
+        if (alive) un = f;
+        else f();
+      })
+      .catch(() => {});
+    // 挂载时先拉一次：之前按下的键不会有事件补发
+    api
+      .ctrlDown()
+      .then((v) => {
+        if (alive) sync(v);
+      })
+      .catch(() => {});
+
+    return () => {
+      alive = false;
+      window.removeEventListener("keydown", onDown, true);
+      window.removeEventListener("keyup", onUp, true);
+      window.removeEventListener("blur", onBlur);
+      un?.();
+    };
+  }, []);
+  /** 手势序号：异步回来的物理键状态只认最后一次 pointerdown */
+  const gestureRef = useRef(0);
   /** items 的最新值（快捷键里读，避免闭包拿到旧值） */
   const itemsRef = useRef(items);
   useEffect(() => {
@@ -67,9 +138,28 @@ export default function PanelView() {
   const [noAnim, setNoAnim] = useState(false);
   /** 正在把图标拖到桌面：这时面板失焦是「拖拽过程」的一部分，不能收起面板 */
   const outDragRef = useRef(false);
-  const suppressClick = useRef(false);
-  /** 新建盒子 / 切换「置于顶层」会重建窗口、短暂抢焦点，这段时间内的失焦不收起面板 */
-  const graceRef = useRef(0);
+  /**
+   * 点击抑制：拖动 / 多选手势之后**不要**顺手把程序打开。
+   *
+   * 存的是「抑制到什么时候」而不是「布尔 + setTimeout」—— 面板窗口是隐藏起来复用的，
+   * Chromium 对隐藏页的定时器会降频（最长 1 分钟才跑一次），布尔标记一旦卡在 true，
+   * 之后所有点击都变成「有按下效果但什么也不做」。
+   */
+  const suppressUntil = useRef(0);
+  const suppress = (ms = 250) => {
+    suppressUntil.current = Date.now() + ms;
+  };
+  const isSuppressed = () => Date.now() < suppressUntil.current;
+  /** 这次手势已经按「多选」处理过了：后面的 click 不能再切一次（否则等于没选） */
+  const cellHandled = useRef(false);
+  /**
+   * 按下时按着 Ctrl，但**还没**切选：到底是「Ctrl+点击（切换选中）」还是
+   * 「Ctrl+拖动（把这批一起拖出去）」，要等松手才知道。
+   *
+   * 以前是按下就切选，于是「按住 Ctrl 拖已选中的图标」先把这一下从选中集里踢掉，
+   * 再拖就只剩它自己（用户反馈：多选后拖动只拖出去一个）。
+   */
+  const pendingToggle = useRef<string | null>(null);
   /** 当前展示的盒子 id（事件回调里读，避免闭包拿到旧值） */
   const boxIdRef = useRef("");
   useEffect(() => {
@@ -226,9 +316,10 @@ export default function PanelView() {
         if (await api.foregroundIsSelf()) return;
         // 松手时光标落在面板里（刚把图标拖进来）→ 保持打开
         if (await api.cursorInPanel()) return;
-        // 只剩「我们自己折腾窗口」这类情况靠宽限期兜（新建盒子 / 切置顶重建窗口），
-        // 按钮里会设一个很短的时间窗。
-        if (Date.now() - graceRef.current < 900) return;
+        // 光标停在某个收纳盒上 → 用户是去点盒子了。点一次弹出、再点一次收起，
+        // 这个「收起」必须由盒子那边判断（open_panel 看得到面板还开着）；
+        // 如果这里先把它收掉，盒子再点就永远只会「打开」，看起来像点第二次没反应。
+        if (await api.cursorOnBox()) return;
       } catch {
         /* ignore */
         /* 判断不出来就按原来的行为收起 */
@@ -389,7 +480,7 @@ export default function PanelView() {
   };
 
   const startDragOut = (files: string[]) => {
-    suppressClick.current = true;
+    suppress(400);
     outDragRef.current = true;
     setSort(null);
     api
@@ -404,7 +495,6 @@ export default function PanelView() {
         // refresh 会一并清掉选择集
         refresh(boxId);
         window.setTimeout(() => {
-          suppressClick.current = false;
           outDragRef.current = false;
           // 拖拽把前台交给了落点（桌面），面板此后再也收不到失焦事件 ——
           // 把前台抢回来，用户「点桌面」时才能照常收起面板。
@@ -415,19 +505,36 @@ export default function PanelView() {
 
   const onCellPointerDown = (e: React.PointerEvent, it: Item, idx: number) => {
     if (e.button !== 0) return;
-    // Ctrl/⌘ + 点击：切换选中（不启动程序、不进入拖动）
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      const cur = selRef.current;
-      const next = cur.includes(it.file)
-        ? cur.filter((f) => f !== it.file)
-        : [...cur, it.file];
-      setSel(next);
-      suppressClick.current = true; // 别顺手把程序打开
-      window.setTimeout(() => {
-        suppressClick.current = false;
-      }, 200);
-      return;
+    // 先记下这一刻的 Ctrl 状态：事件里带的是首选来源，镜像（keydown / 后端推送）兜底
+    const g = ++gestureRef.current;
+    cellHandled.current = false;
+    pendingToggle.current = null;
+    const ctrlEvt = ctrlOn(e);
+    if (ctrlEvt) {
+      // Ctrl 按着 → 先**不**切选。
+      //
+      // 按下去这一刻还不知道用户要「点击（切换选中）」还是「拖动（把这批拖到桌面）」。
+      // 立刻切选会把这一下从选中集里踢掉：按住 Ctrl 拖已选中的图标去桌面，
+      // 结果只拖出去一个（用户实测）。先记下来，松手时确认没拖动再切。
+      pendingToggle.current = it.file;
+      cellHandled.current = true; // 后面的 click 别再处理一次
+    } else {
+      // 事件没带 Ctrl（WebView2 在部分窗口状态下不给鼠标事件带修饰键）→
+      // 当场问一次后端物理键状态。回来是「按着」就按 Ctrl 手势处理（同样推迟到松手）。
+      //
+      // 以前是「立刻切选」：一旦用户其实是在拖动，这一下就把选中集改坏了。
+      api
+        .ctrlDown()
+        .then((v) => {
+          if (!v || gestureRef.current !== g) return;
+          ctrlHeldRef.current = true;
+          const d = dragRef.current;
+          // 已经松手（dragRef 被清空）或者已经在拖了 → 交给 click / 拖动逻辑
+          if (!d || d.file !== it.file || d.mode !== "idle") return;
+          pendingToggle.current = it.file;
+          cellHandled.current = true;
+        })
+        .catch(() => {});
     }
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     dragRef.current = {
@@ -443,6 +550,18 @@ export default function PanelView() {
       sel: selRef.current,
     };
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+  };
+
+  /**
+   * 这次拖动要带出去的图标：多选状态里拖其中一个 = **整批**。
+   *
+   * 现场读 `selRef` 而不是用按下时的快照：最后一次 Ctrl+点击的选中是异步落到
+   * `selRef` 上的（要等一次 `ctrlDown` 往返），手快的话快照可能还是旧的
+   * （用户反馈：多选后拖动只拖出去一个）。
+   */
+  const dragBatch = (file: string) => {
+    const cur = selRef.current;
+    return cur.length > 1 && cur.includes(file) ? cur.slice() : [file];
   };
 
   const onCellPointerMove = (e: React.PointerEvent, it: Item) => {
@@ -467,7 +586,8 @@ export default function PanelView() {
       setSort(null);
       // 多选后拖动其中一个 = 整批拖出去；没多选（或拖的是选中集之外的图标）
       // 就只拖这一个。多文件走 CF_HDROP，资源管理器按移动处理。
-      const batch = d.sel.length > 1 && d.sel.includes(it.file) ? d.sel : [it.file];
+      const batch = dragBatch(it.file);
+      d.sel = batch;
       startDragOut(batch);
       return;
     }
@@ -484,6 +604,13 @@ export default function PanelView() {
   const onCellPointerUp = () => {
     const d = dragRef.current;
     dragRef.current = null;
+    // Ctrl 手势且没拖动 = 一次「Ctrl+点击」：现在才切选（拖动的话整批都保留）。
+    const toggle = pendingToggle.current;
+    pendingToggle.current = null;
+    if (toggle && (!d || d.mode === "idle")) {
+      toggleSel(toggle);
+      suppress(); // 别顺手把程序打开
+    }
     if (!d || d.mode !== "reflow") return;
     setSort(null);
     // 落回自己那一格 = 抖了一下的点击，照旧让它冒泡成 click（打开程序）
@@ -497,10 +624,7 @@ export default function PanelView() {
     // 以前只在「落点变了」时才抑制，于是「拖到空白处松手」漏了：空白处被
     // indexAt 夹到最后一个格子，如果拖的正好是最后一个图标，to === from 直接
     // return，click 没被吃掉 → 图标弹回原位的同时把程序打开了。
-    suppressClick.current = true;
-    window.setTimeout(() => {
-      suppressClick.current = false;
-    }, 200);
+    suppress(250);
     if (d.to === d.from) return;
     const next = [...items];
     const [moved] = next.splice(d.from, 1);
@@ -513,11 +637,8 @@ export default function PanelView() {
         next.map((x) => x.file),
       )
       .catch(() => {});
-    suppressClick.current = true;
+    suppress(250);
     requestAnimationFrame(() => setNoAnim(false));
-    window.setTimeout(() => {
-      suppressClick.current = false;
-    }, 200);
   };
 
   /** 拖动时每个格子的位移：被拖的跟手，被让位的平移一格 */
@@ -539,7 +660,25 @@ export default function PanelView() {
   const onGridPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest(".cell")) return;
-    bandRef.current = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY, on: false };
+    // Ctrl 状态同样兜底采样（框选时按着 Ctrl = 在原有选择上追加）
+    const g = ++gestureRef.current;
+    const ctrlEvt = ctrlOn(e);
+    if (!ctrlEvt) {
+      api
+        .ctrlDown()
+        .then((v) => {
+          if (gestureRef.current === g && v) ctrlHeldRef.current = true;
+        })
+        .catch(() => {});
+    }
+    bandRef.current = {
+      x0: e.clientX,
+      y0: e.clientY,
+      x1: e.clientX,
+      y1: e.clientY,
+      on: false,
+      ctrl: ctrlEvt,
+    };
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   };
 
@@ -575,8 +714,9 @@ export default function PanelView() {
         if (f) hits.push(f);
       }
     });
-    // Ctrl + 框选 = 在原有选择上追加
-    setSel(e.ctrlKey || e.metaKey ? Array.from(new Set([...selRef.current, ...hits])) : hits);
+    // Ctrl + 框选 = 在原有选择上追加（以**按下时**的 Ctrl 为准）
+    const withCtrl = b.ctrl || ctrlOn(e);
+    setSel(withCtrl ? Array.from(new Set([...selRef.current, ...hits])) : hits);
   };
 
   const commitRename = async () => {
@@ -584,17 +724,6 @@ export default function PanelView() {
     await api.renameBox(boxId, renaming).catch(() => {});
     setRenaming(null);
     refresh(boxId);
-  };
-
-  const newBox = async () => {
-    setMenu(null);
-    graceRef.current = Date.now();
-    try {
-      await api.createBox("");
-      showToast("已创建新收纳盒，可在桌面上拖动它");
-    } catch (e) {
-      showToast(String(e));
-    }
   };
 
   /** 「解散收纳盒」：整个盒子的图标全部移回桌面（盒子留着，变成空盒） */
@@ -666,9 +795,8 @@ export default function PanelView() {
         )}
         <div className="panel-count">{items.length}</div>
         <div className="spacer" />
-        <button className="icon-btn" title="新建收纳盒" onClick={newBox}>
-          ＋
-        </button>
+        {/* 「＋」已按用户要求移除：它紧挨着标题，容易被当成「往这个盒子里加图标」。
+            新建收纳盒的入口在托盘菜单和盒子右键菜单里，功能没少。 */}
         <button
           className="icon-btn"
           title="更多"
@@ -728,8 +856,30 @@ export default function PanelView() {
               onPointerDown={(e) => onCellPointerDown(e, it, i)}
               onPointerMove={(e) => onCellPointerMove(e, it)}
               onPointerUp={onCellPointerUp}
-              onClick={() => {
-                if (suppressClick.current) return;
+              onClick={async (e) => {
+                // 这次手势在 pointerdown 里已经按「多选」处理过了（切过选，别再切回去）
+                if (cellHandled.current) {
+                  cellHandled.current = false;
+                  return;
+                }
+                if (isSuppressed()) return;
+                // Ctrl 判定：事件 → 镜像 → 最后**等一次**后端的物理键状态。
+                // 这里可以等：即便等出 20ms 也只是「选中晚一拍」，不像启动程序那样不可逆。
+                // 顺手把手势序号推进一格，让 pointerdown 那次还没回来的查询作废。
+                gestureRef.current++;
+                let ctrl = ctrlOn(e);
+                if (!ctrl) {
+                  try {
+                    ctrl = await api.ctrlDown();
+                  } catch {
+                    ctrl = false;
+                  }
+                  if (ctrl) ctrlHeldRef.current = true;
+                }
+                if (ctrl) {
+                  toggleSel(it.file);
+                  return;
+                }
                 // 普通点击 = 启动 + 取消选择（Ctrl 点击在上面已拦截）
                 if (selRef.current.length > 0) setSel([]);
                 // 启动成功即收起面板。点击图标是明确的操作意图，此时与其依赖

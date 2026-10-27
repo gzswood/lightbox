@@ -593,6 +593,63 @@ unsafe fn to_place_xy(hwnd: isize, x: i32, y: i32) -> (i32, i32) {
     (x - pt.x, y - pt.y)
 }
 
+/// 只把窗口挪到新位置，**不动尺寸/样式/区域**。
+///
+/// 专门给「胶囊团」整体拖动用：拖动途中每帧都要摆一次成员窗口，
+/// `place_bar_box` / `strip_chrome` 那套（改样式、重设区域、调 DWM 属性）太重，
+/// 60Hz 跑下来会闪。落位收尾时再走一次完整的那套。
+/// 胶囊团跟随线程专用：坐标**已经**换算成父客户区坐标，异步投递，绝不阻塞。
+///
+/// 和 `move_box_window` 的区别只有两点，都是为「拖动途中由后台线程摆别人的窗口」准备的：
+///  ① 不做 `to_place_xy`（那里面有 `ClientToScreen(parent)`，父窗口是 Explorer 的
+///     Progman，跨线程调用要等对方；每帧两次，拖动时就是卡顿/死锁来源）——
+///     偏移在拖动开始时算一次就够；
+///  ② 带 `SWP_ASYNCWINDOWPOS`：窗口归主线程，主线程此刻正待在系统的窗口拖动模态循环里，
+///     同步 `SendMessage` 过去有可能永远等不到派发，整条跟随线程就吊死在那一句上。
+pub fn move_box_window_place(hwnd: isize, wx: i32, wy: i32) {
+    if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            wx,
+            wy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
+}
+
+/// 屏幕坐标 → 父客户区坐标 的固定偏移，**只算一次**。
+///
+/// 给跟随线程用：拖动开始时对每个成员调一次存起来，之后每帧只做一次加法
+/// （`place = screen + off`），不再碰 `ClientToScreen` —— 那个调用要问父窗口
+/// （Progman，Explorer 的线程），拖动途中每帧问两次就是卡顿的来源。
+pub fn place_offset(hwnd: isize) -> (i32, i32) {
+    unsafe { to_place_xy(hwnd, 0, 0) }
+}
+
+pub fn move_box_window(hwnd: isize, x: i32, y: i32) {
+    if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
+        return;
+    }
+    unsafe {
+        let (wx, wy) = to_place_xy(hwnd, x, y);
+        SetWindowPos(
+            hwnd,
+            0,
+            wx,
+            wy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// 窗口在**屏幕坐标**下的矩形（物理像素）。
 ///
 /// 盒子的位置一律从这里取：tao 的 `outer_position()` / `onMoved` 事件 payload 拿到的是

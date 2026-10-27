@@ -339,7 +339,8 @@ unsafe fn make_hdrop(paths: &[Vec<u16>]) -> isize {
         f_wide: i32,
     }
     let header = std::mem::size_of::<DropFiles>(); // 20
-    // 每个路径各带一个结尾 0，最后再补一个 0（双 0 收尾）
+    // 每条路径「自身 + 一个分隔 0」，最后再补一个 0（双 0 收尾）。
+    // `+1` 是给「调用方没带结尾 0」留的余量，多分配一点无所谓。
     let bytes = header + paths.iter().map(|p| (p.len() + 1) * 2).sum::<usize>() + 2;
     let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
     if h == 0 {
@@ -358,12 +359,22 @@ unsafe fn make_hdrop(paths: &[Vec<u16>]) -> isize {
     (*df).f_wide = 1;
     let mut list = p.add(header) as *mut u16;
     for path in paths {
-        std::ptr::copy_nonoverlapping(path.as_ptr(), list, path.len());
-        list = list.add(path.len());
+        // 每条路径**只以单个 0 结尾**，多条之间用这个 0 分隔。
+        //
+        // 这里踩过一个很隐蔽的坑：`paths` 来自 `do_drag` 的
+        // `encode_wide().chain(once(0))`，**已经带了结尾 0**。之前这里拷完再补一个 0，
+        // 于是第一个文件后面紧跟的就是「空文件名」= 列表结束标记 ——
+        // 资源管理器/桌面只认第一个文件，多选拖出永远只拖出去一个（用户实测）。
+        let n = match path.last() {
+            Some(&0) => path.len() - 1,
+            _ => path.len(),
+        };
+        std::ptr::copy_nonoverlapping(path.as_ptr(), list, n);
+        list = list.add(n);
         *list = 0;
         list = list.add(1);
     }
-    *list = 0; // 双 0 结尾
+    *list = 0; // 末尾再补一个 0：与前一条的结尾 0 一起构成双 0 收尾
     GlobalUnlock(h);
     h
 }

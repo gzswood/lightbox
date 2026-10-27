@@ -23,6 +23,8 @@ export type BoxView = {
   bar_hide_label: boolean;
   /** 自定义图标（png data URL）；为空时用内置图标 */
   icon: string | null;
+  /** 属于某个「胶囊团」：拖动前要先问后端整团偏移，拖着一起走 */
+  in_group: boolean;
 };
 
 export type ImportReport = {
@@ -39,6 +41,10 @@ export type MenuData = {
   in_bar: boolean;
   /** 是否设过自定义图标（决定菜单里出不出「恢复默认图标」） */
   has_icon: boolean;
+  /** 已经在某个胶囊团里（菜单显示「解散胶囊团」） */
+  grouped: boolean;
+  /** 旁边有吸附在一起的邻居、还没组过（菜单显示「组合为胶囊团」） */
+  can_group: boolean;
 };
 
 export type AppSettings = {
@@ -164,6 +170,21 @@ export const api = {
   mouseLeftDown: () => invoke<boolean>("mouse_left_down"),
   /** 光标是否在面板窗口里：拖拽松手时落在面板内就保持打开 */
   cursorInPanel: () => invoke<boolean>("cursor_in_panel"),
+  /** 光标是否停在某个收纳盒（含任务栏胶囊）上 —— 用来区分「用户要点盒子」和「用户离开」 */
+  cursorOnBox: () => invoke<boolean>("cursor_on_box"),
+  /** 左 Ctrl 的物理按键状态：WebView2 偶尔不给鼠标事件带修饰键，Ctrl+点击拿它兜底 */
+  ctrlDown: () => invoke<boolean>("ctrl_down"),
+  // ---------- 胶囊团 ----------
+  /** 把旁边吸附成一片的盒子组合成一个整体；返回成员个数 */
+  groupBoxes: (id: string) => invoke<number>("group_boxes", { id }),
+  /** 解散整个胶囊团（成员恢复成可以单独拖动）；返回解散的个数 */
+  ungroupBox: (id: string) => invoke<number>("ungroup_box", { id }),
+  /** 拖动开始前算好整团偏移（必须早于 startDragging）；返回是否真的在团里 */
+  groupDragBegin: (id: string) => invoke<boolean>("group_drag_begin", { id }),
+  /** 拖动途中每次窗口移动：把其它成员跟到「锚点 + 偏移」 */
+  groupFollow: (id: string) => invoke<boolean>("group_follow", { id }),
+  /** 这次拖动没走吸附时，收个尾（对齐 + 落盘） */
+  groupEnd: (id: string) => invoke<void>("group_end", { id }),
   closePanel: () => invoke<void>("close_panel"),
   /** 在光标处弹出盒子右键菜单（独立窗口） */
   showBoxMenu: (id: string) => invoke<void>("show_box_menu", { id }),

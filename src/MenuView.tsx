@@ -274,16 +274,36 @@ export default function MenuView() {
         </div>
       )}
       {/* 嵌入任务栏：盒子变成任务栏里的方形按钮（高 = 任务栏厚度），
-          只能沿任务栏横向拖动，由用户自己挑不挡任务栏信息的位置 */}
+          只能沿任务栏横向拖动，由用户自己挑不挡任务栏信息的位置。
+          胶囊团成员是**整团**一起换形态（团是一个整体，只切一个会当场散架），
+          所以文案也按团说。 */}
       <div
         className="menu-item"
         onClick={() => run(() => api.setBoxInBar(data.id, !data.in_bar))}
       >
-        {data.in_bar ? "移出任务栏" : "嵌入任务栏"}
+        {data.grouped
+          ? data.in_bar
+            ? "整团移出任务栏"
+            : "整团嵌入任务栏"
+          : data.in_bar
+            ? "移出任务栏"
+            : "嵌入任务栏"}
       </div>
-      {/* 指向托盘的「设置…」：全局设置窗口（外观 / 开机自启 / 存储位置） */}
+      {/* 胶囊团：几个吸附在一起的盒子可以组合成一个整体，拖一个就整团走。
+          孤零零一个盒子（周围没有吸附的邻居）不显示这一项；已在团里就换成「解散」。 */}
+      {data.grouped ? (
+        <div className="menu-item" onClick={() => run(() => api.ungroupBox(data.id))}>
+          解散胶囊团
+        </div>
+      ) : data.can_group ? (
+        <div className="menu-item" onClick={() => run(() => api.groupBoxes(data.id))}>
+          组合为胶囊团
+        </div>
+      ) : null}
+      {/* 指向托盘的「设置…」：全局设置窗口（外观 / 开机自启 / 存储位置）。
+          文案就用「设置...」——菜单里只有这一个设置入口，带上产品名反而啰嗦 */}
       <div className="menu-item" onClick={() => run(() => api.openGlobalSettings())}>
-        设置LightBox
+        设置...
       </div>
 
       <div className="menu-sep" />

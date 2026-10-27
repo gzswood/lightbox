@@ -139,6 +139,27 @@ fn box_window(app: &AppHandle, id: &str) -> Option<tauri::WebviewWindow> {
     fallback
 }
 
+/// 这个盒子 id 名下**所有**还活着的窗口。
+///
+/// 正常只应该有一个；形态切换的竞态（两处同时触发整团切换）会留下两个，
+/// 两个都摆在桌面上就是用户看到的「同一个收纳盒被复制了」。
+/// `rebuild_box_flashless` 靠它把多余的收干净。
+fn box_windows_all(app: &AppHandle, id: &str) -> Vec<tauri::WebviewWindow> {
+    let prefix = format!("box-{id}-");
+    app.webview_windows()
+        .into_iter()
+        .filter(|(label, win)| {
+            if !label.starts_with(&prefix) {
+                return false;
+            }
+            let h = hwnd_of(win);
+            // 僵尸条目（Explorer 重启后 hwnd 已经没了）不算：销毁它会卡在窗口表上
+            h != 0 && unsafe { win32::IsWindow(h) } != 0
+        })
+        .map(|(_, w)| w)
+        .collect()
+}
+
 fn mark_box_not_ready(id: &str) {
     BOX_READY.lock().unwrap().retain(|x| x != id);
 }
@@ -167,19 +188,22 @@ fn box_ready(id: String) {
 
 /// 右键菜单高度（逻辑像素）。结构对应 MenuView.tsx：
 /// padding 6×2 + 头 28 + 边框 2 + 固定 7 项（新建/重命名/设置图标/置顶/
-/// 设置LightBox/删除收纳盒/退出）× 30 + 两处 sep × 9 + 2px 余量。
+/// 设置.../删除收纳盒/退出）× 30 + 两处 sep × 9 + 2px 余量。
 /// 非空盒子多一行提示；自定义过图标的多一项「恢复默认图标」。
 ///
 /// 这只是**首次显示的估值**——菜单内容条件渲染复杂，估值难免有偏差，
 /// 前端渲染后会测量真实高度回报 `fit_menu` 做修正，两者配合才不会裁掉底部。
-fn menu_height(show_hint: bool, has_icon: bool) -> f64 {
-    // 基准含：标题 / 新建 / 重命名 / 设置图标 / 置顶 / 嵌入任务栏 / 设置LightBox
+fn menu_height(show_hint: bool, has_icon: bool, group_row: bool) -> f64 {
+    // 基准含：标题 / 新建 / 重命名 / 设置图标 / 置顶 / 嵌入任务栏 / 设置...
     // + 两条分割线 + 删除 + 退出。前端渲染完还会回报真实高度修正（fit_menu）。
     let mut h = 302.0;
     if show_hint {
         h += 22.0;
     }
     if has_icon {
+        h += 30.0;
+    }
+    if group_row {
         h += 30.0;
     }
     h
@@ -734,6 +758,41 @@ fn rebuild_missing_boxes(app: &AppHandle) {
     }
 }
 
+/// 同一个盒子名下有**多个**窗口时，只留一个（其余销毁）。
+///
+/// 正常一个盒子只有一个窗口；形态切换被两处同时触发时会漏下一个，
+/// 两个窗口都画着同一个盒子 = 用户看到的「收纳盒被复制了一个」。
+/// 重建过程本身会短暂出现两个窗口（新的画好了才销毁旧的），所以正在切换的跳过。
+fn prune_duplicate_boxes(app: &AppHandle) {
+    let ids: Vec<String> = {
+        let st = app.state::<State>();
+        let cfg = st.cfg.lock().unwrap();
+        cfg.boxes.iter().map(|b| b.id.clone()).collect()
+    };
+    for id in ids {
+        if switching(&id) {
+            continue;
+        }
+        let wins = box_windows_all(app, &id);
+        if wins.len() < 2 {
+            continue;
+        }
+        // 留「可见的那个」，没有可见的就留第一个
+        let keep = wins
+            .iter()
+            .position(|w| unsafe { win32::IsWindowVisible(hwnd_of(w)) } != 0)
+            .unwrap_or(0);
+        for (i, w) in wins.iter().enumerate() {
+            if i == keep {
+                continue;
+            }
+            desktop::forget(hwnd_of(w));
+            let _ = w.destroy();
+            eprintln!("多余的收纳盒窗口已清理：{}", w.label());
+        }
+    }
+}
+
 /// 每 3 秒看一遍：配置里的盒子是不是都还有窗口，缺的就补建。
 ///
 /// 只是「查一下有没有少」的成本极低（遍历几个字符串），真正建窗口只在缺失时才发生。
@@ -749,6 +808,7 @@ fn start_box_heal(app: AppHandle) {
             if !HEALING.swap(true, Ordering::SeqCst) {
                 let a = app.clone();
                 tauri::async_runtime::spawn(async move {
+                    prune_duplicate_boxes(&a);
                     rebuild_missing_boxes(&a);
                     HEALING.store(false, Ordering::SeqCst);
                 });
@@ -1047,7 +1107,7 @@ fn build_tray(app: &AppHandle) -> Result<(), String> {
 fn spawn_menu(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let win = WebviewWindowBuilder::new(app, "menu", WebviewUrl::App("index.html?mode=menu".into()))
         .title("LightBox")
-        .inner_size(MENU_W, menu_height(false, false))
+        .inner_size(MENU_W, menu_height(false, false, false))
         .decorations(false)
         .transparent(true)
         .shadow(false)
@@ -1059,7 +1119,7 @@ fn spawn_menu(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
         .visible(false)
         .build()
         .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), 0, 0, MENU_W as i32, menu_height(false, false) as i32, MENU_RADIUS, false);
+    desktop::strip_chrome(hwnd_of(&win), 0, 0, MENU_W as i32, menu_height(false, false, false) as i32, MENU_RADIUS, false);
     Ok(win)
 }
 /// 菜单贴着光标弹出，并保证整块留在光标所在那块屏幕里
@@ -1127,6 +1187,10 @@ struct MenuData {
     in_bar: bool,
     /// 这个盒子是否设置了自定义图标（决定菜单里要不要出「恢复默认图标」）
     has_icon: bool,
+    /// 已经在某个「胶囊团」里（菜单显示「解散胶囊团」）
+    grouped: bool,
+    /// 旁边有吸附在一起的邻居，可以组合（菜单显示「组合为胶囊团」）
+    can_group: bool,
 }
 
 // ---------------- commands ----------------
@@ -1207,13 +1271,12 @@ async fn get_box_view(id: String, state: tauri::State<'_, State>) -> Result<BoxV
     } else {
         (BOX_W, BOX_W)
     };
-    let order = {
+    let (order, in_group) = {
         let cfg = state.cfg.lock().unwrap();
-        cfg.boxes
-            .iter()
-            .find(|b| b.id == id)
-            .map(|b| b.order.clone())
-            .unwrap_or_default()
+        match cfg.boxes.iter().find(|b| b.id == id) {
+            Some(b) => (b.order.clone(), b.group.is_some()),
+            None => (Vec::new(), false),
+        }
     };
     let items = store::list_items(&id, &order);
     Ok(BoxView {
@@ -1226,6 +1289,7 @@ async fn get_box_view(id: String, state: tauri::State<'_, State>) -> Result<BoxV
         h,
         bar_hide_label: bar_hide_label(),
         icon: icon,
+        in_group,
     })
 }
 
@@ -1450,6 +1514,7 @@ async fn create_box_inner(app: &AppHandle, name: String) -> Result<BoxConfig, St
             in_bar: false,
             icon: None,
             order: Vec::new(),
+            group: None,
         };
         cfg.boxes.push(b.clone());
         store::save(&cfg);
@@ -1546,6 +1611,18 @@ async fn auto_sort_boxes(app: &AppHandle) -> Result<(), String> {
     // 坐标改一遍，用户点完还是看不到任何盒子（Explorer 重启后就是这个症状）。
     rebuild_missing_boxes(app);
 
+    // 自动排序会把所有盒子重新摆一遍，团内那套「固定偏移」随之失效 ——
+    // 先把团全部解散（盒子位置不动，只是不再联动拖动），用户想接着整团拖就再组合一次。
+    {
+        let mut cfg = st.cfg.lock().unwrap();
+        if cfg.boxes.iter().any(|b| b.group.is_some()) {
+            for b in cfg.boxes.iter_mut() {
+                b.group = None;
+            }
+            store::save(&cfg);
+        }
+    }
+
     // Win11：把任务栏里的贴条全部退回桌面。只改配置，窗口交给下面的重建处理
     // （顶层窗口 → 桌面层子窗口没法就地换，见 rebuild_box_flashless）。
     let pulled: Vec<String> = if desktop::win11() {
@@ -1603,7 +1680,7 @@ async fn auto_sort_boxes(app: &AppHandle) -> Result<(), String> {
         };
         let app2 = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let _guard = RELAY_LOCK.lock().unwrap();
+            let Some(_guard) = lock_relay(8000) else { return };
             for b in list {
                 // 重建期间挂个牌子：这一刻的窗口移动不是用户拖动
                 let _sg = switching_begin(&b.id);
@@ -1715,6 +1792,8 @@ async fn delete_box(app: AppHandle, state: tauri::State<'_, State>, id: String) 
     {
         let mut cfg = state.cfg.lock().unwrap();
         cfg.boxes.retain(|b| b.id != id);
+        // 删掉的盒子可能在一个团里：摘出去，别让剩下的人拖着一个不存在的成员
+        drop_from_group(&mut cfg, &id);
         store::save(&cfg);
     }
     if let Some(w) = box_window(&app, &id) {
@@ -1851,44 +1930,60 @@ async fn snap_box(app: AppHandle, state: tauri::State<'_, State>, id: String) ->
 
     let others: Vec<Rect> = {
         let cfg = state.cfg.lock().unwrap();
+        // 同一个团里的成员不参与吸附：它们跟着锚点整体走（偏移固定），
+        // 如果还拿它们当吸附目标，吸一下就会把整团拉变形。
+        let gid = cfg
+            .boxes
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.group.clone());
         cfg.boxes
             .iter()
-            .filter(|b| b.id != id)
+            .filter(|b| b.id != id && !(gid.is_some() && b.group == gid))
             .map(|b| Rect { x: b.x, y: b.y, w, h })
             .collect()
     };
 
     let (mut nx, mut ny) = (ox, oy);
-    let mut best: Option<i32> = None; // 位移代价：多个候选时取移动最少的那个
+    // 排序键：(优先级, 位移代价)。优先级 0 = 贴自己左边/上边那个邻居，1 = 贴右边/下边。
+    //
+    // 为什么需要优先级：左右两个邻居的间隙同时落在 `dist` 内时，只比「谁更近」的话
+    // 两个候选往往只差一两像素；吸完会触发一次重排，这一回又选中另一边 —— 表现就是
+    // 盒子在两个邻居之间来回跳（用户实测反馈）。固定优先左边（纵向优先上边），结果就稳定。
+    let mut best: Option<(u8, i32)> = None;
 
     for o in &others {
         // ① 横向并排：两盒在竖直方向大致对齐（中心差不到半个盒子高）
         if (oy - o.y).abs() <= h / 2 {
-            for (cand_x, cur_gap) in [
-                (o.x - gap - w, o.x - (ox + w)),     // 本盒子在对方左边
-                (o.x + o.w + gap, ox - (o.x + o.w)), // 本盒子在对方右边
+            for (cand_x, cur_gap, prio) in [
+                // 落到对方右边 = 贴在「我左边那个盒子」的右侧 → 优先
+                (o.x + o.w + gap, ox - (o.x + o.w), 0u8),
+                // 落到对方左边 = 贴在「我右边那个盒子」的左侧
+                (o.x - gap - w, o.x - (ox + w), 1u8),
             ] {
                 if cur_gap.abs() <= dist {
                     // 吸附时 y 对齐到对方 —— 这就是「水平对齐」
                     let cost = (cand_x - ox).abs() + (o.y - oy).abs();
-                    if best.map_or(true, |b| cost < b) {
-                        best = Some(cost);
+                    if best.map_or(true, |(bp, bc)| prio < bp || (prio == bp && cost < bc)) {
+                        best = Some((prio, cost));
                         nx = cand_x;
                         ny = o.y;
                     }
                 }
             }
         }
-        // ② 纵向堆叠：两盒在水平方向大致对齐（中心差不到半个盒子宽）
+        // ② 纵向堆叠：两盒在水平方向大致对齐（中心差不到半个盒子宽），同一套优先级
         if (ox - o.x).abs() <= w / 2 {
-            for (cand_y, cur_gap) in [
-                (o.y - gap - h, o.y - (oy + h)),     // 本盒子在对方上边
-                (o.y + o.h + gap, oy - (o.y + o.h)), // 本盒子在对方下边
+            for (cand_y, cur_gap, prio) in [
+                // 落到对方下边 = 贴在「我上边那个盒子」的下侧 → 优先
+                (o.y + o.h + gap, oy - (o.y + o.h), 0u8),
+                // 落到对方上边 = 贴在「我下边那个盒子」的上侧
+                (o.y - gap - h, o.y - (oy + h), 1u8),
             ] {
                 if cur_gap.abs() <= dist {
                     let cost = (cand_y - oy).abs() + (o.x - ox).abs();
-                    if best.map_or(true, |b| cost < b) {
-                        best = Some(cost);
+                    if best.map_or(true, |(bp, bc)| prio < bp || (prio == bp && cost < bc)) {
+                        best = Some((prio, cost));
                         nx = o.x;
                         ny = cand_y;
                     }
@@ -1923,6 +2018,27 @@ async fn snap_box(app: AppHandle, state: tauri::State<'_, State>, id: String) ->
     nx = clamp_i(nx, area.x, area.right() - w);
     ny = clamp_i(ny, area.y, bot_limit - h);
 
+    // ③ 绝不覆盖别的盒子：落点还压在人家身上 → 推去最近的空位。
+    //
+    // 光靠 ① 不够：盒子被直接扔到另一个盒子**身上**时，两个方向的缝隙都超出了
+    // `dist`（重叠时缝隙算出来是负数，绝对值是半个盒子），于是谁都不吸，
+    // 就这么叠着放下了（用户反馈「覆盖过多时不会吸附」）。
+    // 这里的规则和任务栏胶囊一致：不允许重叠，就近找空位；
+    // 左右（上下）差不多近时**优先往左**，这样夹在两个邻居中间时不会来回跳。
+    let tol = (2.0 * sc).round() as i32; // 2 逻辑像素内的贴边不算覆盖
+    let covered = |x: i32, y: i32| {
+        others.iter().any(|o| {
+            overlap_len(x, x + w, o.x, o.right()) > tol
+                && overlap_len(y, y + h, o.y, o.bottom()) > tol
+        })
+    };
+    if covered(nx, ny) {
+        if let Some((fx, fy)) = nearest_free_spot(&others, &area, bot_limit, nx, ny, w, h, gap, dist) {
+            nx = fx;
+            ny = fy;
+        }
+    }
+
     let moved = nx != ox || ny != oy;
     // 跨屏拖动：盒子是 Progman 的子窗口，系统不会按新屏的 DPI 自动重设尺寸，
     // 圆角区域也还是旧屏那个尺寸 —— 必须按「现在所在显示器」重算一次。
@@ -1948,6 +2064,9 @@ async fn snap_box(app: AppHandle, state: tauri::State<'_, State>, id: String) ->
             }
         }
     }
+    // 整团对齐：锚点吸好了，其余成员按固定偏移跟过来并一起落盘。
+    // 必须在下面 embed_after_snap 之前 —— 那个函数可能把这个盒子改成胶囊、换掉坐标系。
+    group_settle(&app, &state, &id);
     // 压在任务栏上 / 从任务栏拖回来 → 后台切换窗口层级（顶层才盖得住任务栏）。
     // 必须放在落盘之后：重建窗口读的是配置里的位置。
     embed_after_snap(&app, id.clone());
@@ -1985,18 +2104,34 @@ async fn snap_bar(
     // ② 必须限定「光标贴着胶囊」：只按「光标在高处」判断的话，任何一次程序性
     // 移动（改设置、重建）都会因为光标不在任务栏而把胶囊踢出任务栏。
     let cursor = cursor_xy();
+    // 团成员：拖动途中 `bar_hover` 记过「光标离开过任务栏」，松手就算拖出去
+    let grouped = in_group(&*state, &id);
+    let escaped = if grouped {
+        let mut v = DRAG_ESCAPED.lock().unwrap();
+        let had = v.iter().any(|x| x == &id);
+        v.retain(|x| x != &id);
+        had
+    } else {
+        false
+    };
     let out_by_window = br.y + br.h / 2 < bar.y;
-    let out_by_cursor = matches!(cursor, Some((cx, cy)) if {
-        let above = cy < bar.y - BAR_UP_MIN && cy > bar.y - bar.h * 6;
-        let near = (cx - (br.x + br.w / 2)).abs() <= br.w + 8;
-        above && near
-    });
+    let out_by_cursor = escaped
+        || matches!(cursor, Some((cx, cy)) if {
+            let above = cy < bar.y - BAR_UP_MIN && cy > bar.y - bar.h * 6;
+            let near = (cx - (br.x + br.w / 2)).abs() <= br.w + 8;
+            above && near
+        });
     if out_by_window || out_by_cursor {
         let (cx, cy) = match cursor {
             Some((cx, cy)) => (cx, cy),
             None => (br.x + br.w / 2, br.y + br.h / 2),
         };
-        unembed_at(&app, id.clone(), cx, cy);
+        // 团成员：整团一起退回桌面（不能只把这一个拿出来，那样整团会散架）
+        if grouped {
+            group_switch_mode(&app, &id, false, cx, cy);
+        } else {
+            unembed_at(&app, id.clone(), cx, cy);
+        }
         return Ok(Some(true));
     }
 
@@ -2006,9 +2141,15 @@ async fn snap_bar(
     let nx = {
         let others: Vec<i32> = {
             let cfg = state.cfg.lock().unwrap();
+            // 同团成员不参与「找空位」：它们跟着锚点走固定的横向偏移
+            let gid = cfg
+                .boxes
+                .iter()
+                .find(|b| b.id == id)
+                .and_then(|b| b.group.clone());
             cfg.boxes
                 .iter()
-                .filter(|b| b.in_bar && b.id != id)
+                .filter(|b| b.in_bar && b.id != id && !(gid.is_some() && b.group == gid))
                 .map(|b| b.x)
                 .collect()
         };
@@ -2028,6 +2169,8 @@ async fn snap_bar(
             }
         }
     }
+    // 胶囊团：其余成员按固定偏移跟到新位置并落盘
+    group_settle(&app, &state, &id);
     let _ = app.emit(
         "box:scale",
         BoxScale {
@@ -2077,20 +2220,29 @@ fn wait_window_closed(app: &AppHandle, label: &str) -> bool {
 /// 于是切换过程里屏幕上一直有个一模一样的盒子盖着，看不出闪烁。
 fn rebuild_box_flashless(app: &AppHandle, b: &BoxConfig) -> Result<(), String> {
     mark_box_not_ready(&b.id);
-    let old = box_window(app, &b.id);
-    let old_label = old.as_ref().map(|w| w.label().to_string());
+    // 这个 id 名下**所有**还活着的窗口都要收掉，不只是「第一个」。
+    // 整团切换被两处同时触发时（松手吸附 + 某个成员自己的 snap_bar），会各建一个窗口，
+    // 只销毁一个就漏下一个 —— 用户看到的就是「同一个收纳盒被复制了一个」。
+    let old = box_windows_all(app, &b.id);
     let new_win = spawn_box_window(app, b, false)?;
+    let keep = new_win.label().to_string();
     wait_box_ready(&b.id, 900);
     show_box(&new_win, b);
 
     std::thread::sleep(std::time::Duration::from_millis(140));
 
-    if let Some(w) = old {
+    let mut stale: Vec<String> = Vec::new();
+    for w in old {
+        if w.label() == keep {
+            continue;
+        }
         // 先摘掉守护登记：窗口马上销毁，别让守护线程再去碰它
         desktop::forget(hwnd_of(&w));
+        stale.push(w.label().to_string());
         let _ = w.destroy();
     }
-    if let Some(l) = old_label {
+    // 等它们真的从窗口表里消失，否则下一次 `box_window` 可能拿到即将销毁的那个
+    for l in stale {
         wait_window_closed(app, &l);
     }
     // 重建窗口会抢焦点，面板本来开着就会被「失焦自动收起」误收，把焦点还回去
@@ -2158,6 +2310,28 @@ async fn set_box_in_bar(
     id: String,
     on: bool,
 ) -> Result<(), String> {
+    // 胶囊团成员：整团一起移入 / 移出。
+    //
+    // 团是一个整体，菜单里这一项点的是「团」，不是「这一个成员」：
+    // 只把点中的那个切过去，队友还留在原形态里，团当场散架（用户实测反馈）。
+    // 整团切换要重建 N 个窗口，走 `group_switch_mode` 那条路（它自带互斥闸）。
+    {
+        let in_group = {
+            let cfg = state.cfg.lock().unwrap();
+            group_members_of(&cfg, &id).is_some()
+        };
+        if in_group {
+            let r = {
+                let cfg = state.cfg.lock().unwrap();
+                cfg.boxes.iter().find(|b| b.id == id).map(|b| live_rect(&app, b))
+            };
+            let Some(r) = r else {
+                return Err("盒子不存在".into());
+            };
+            group_switch_mode(&app, &id, on, r.x + r.w / 2, r.y + r.h / 2);
+            return Ok(());
+        }
+    }
     // 整个嵌入/移出过程（改配置 + 重建窗口）都别让 snap / move_box 插进来
     let _sg = switching_begin(&id);
     let b = {
@@ -2201,6 +2375,9 @@ async fn set_box_in_bar(
             }
         }
         let b = b.clone();
+        // 换成另一种形态（桌面盒 ↔ 任务栏胶囊）就没法和原来的团保持同一个坐标系了，
+        // 把它从团里摘出去（剩下的人继续是一个团）。
+        drop_from_group(&mut cfg, &id);
         store::save(&cfg);
         b
     };
@@ -2211,6 +2388,25 @@ async fn set_box_in_bar(
 }
 /// 重建串行闸：同一时刻只允许一个盒子在重建（重建要 300~500ms）。
 static RELAY_LOCK: Mutex<()> = Mutex::new(());
+
+/// 拿重建闸，**最多等 `ms` 毫秒**。
+///
+/// 原来一律用 `lock()`：万一某个重建线程卡死（比如被迫在系统拖动循环里建窗口，
+/// 主线程一直不回到消息泵），锁就永远回不来 —— 之后所有「嵌入 / 移出任务栏」
+/// 全部排队等死，用户看到的是「整个程序卡死」。这里改成有超时：
+/// 等不到就放弃这次切换（盒子留在原形态），至少别的盒子还能用。
+fn lock_relay(ms: u64) -> Option<std::sync::MutexGuard<'static, ()>> {
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        if let Ok(g) = RELAY_LOCK.try_lock() {
+            return Some(g);
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 
 /// 把屏幕坐标 (x, y) 处、边长 size 的盒子换算成「嵌入任务栏」后的位置。
 ///
@@ -2253,22 +2449,40 @@ fn bar_free_x(bar: Rect, want_w: i32, nx0: i32, others: &[i32], snap: i32) -> i3
     // 整个胶囊都不和任何邻居重叠才算「可行」
     let free = |x: i32| others.iter().all(|&ox| x + want_w <= ox || x >= ox + want_w);
 
-    // ① 距邻居够近（< snap）就贴上去，不留缝
-    let mut flush: Option<(i32, i32)> = None; // (距离, x)
-    for &x in &cands {
-        if x == target || !free(x) {
-            continue;
+    // ① 距邻居够近（<= snap）就贴上去，不留缝。
+    //
+    // **左侧优先**：左右两个邻居都够得着时固定贴左边那个（用户要求）。原来把所有
+    // 候选混在一起按「离目标最近」选，两侧间隙接近时会在两个邻居之间来回跳。
+    let mut left: Option<(i32, i32)> = None; // (距离, x) 贴在我左边那个邻居的右侧
+    let mut right: Option<(i32, i32)> = None; // (距离, x) 贴在我右边那个邻居的左侧
+    for &ox in others {
+        let x = clamp_i(ox + want_w, lo, hi);
+        if free(x) {
+            let d = (x - target).abs();
+            if d <= snap && left.map_or(true, |(bd, _)| d < bd) {
+                left = Some((d, x));
+            }
         }
-        let d = (x - target).abs();
-        if d <= snap && flush.map_or(true, |(bd, _)| d < bd) {
-            flush = Some((d, x));
+        let x = clamp_i(ox - want_w, lo, hi);
+        if free(x) {
+            let d = (x - target).abs();
+            if d <= snap && right.map_or(true, |(bd, _)| d < bd) {
+                right = Some((d, x));
+            }
         }
     }
-    if let Some((_, x)) = flush {
+    if let Some((_, x)) = left.or(right) {
         return x;
     }
 
-    // ② 否则取最近的可行点（目标本身可行时距离为 0，原地不动）
+    // ② 没有邻居可贴，但离任务栏两端够近 → 贴着那一端
+    for x in [lo, hi] {
+        if free(x) && (x - target).abs() <= snap {
+            return x;
+        }
+    }
+
+    // ③ 否则取最近的可行点（目标本身可行时距离为 0，原地不动）
     let mut best: Option<(i32, i32)> = None;
     for &x in &cands {
         if !free(x) {
@@ -2279,8 +2493,883 @@ fn bar_free_x(bar: Rect, want_w: i32, nx0: i32, others: &[i32], snap: i32) -> i3
             best = Some((d, x));
         }
     }
-    // ③ 整条任务栏都塞满了（极罕见）：只能原地放着，总比飞到别处强
+    // ④ 整条任务栏都塞满了（极罕见）：只能原地放着，总比飞到别处强
     best.map(|(_, x)| x).unwrap_or(target)
+}
+
+/// 桌面盒子的「找空位」：盒子落到别人**身上**时，推去离它最近的、不压任何人的位置。
+///
+/// 和 `bar_free_x` 同一套思路（枚举可行落点，取离目标最近的），区别是桌面是二维的：
+/// 候选点 = 目标位置本身 + 每个邻居的左右上下四侧 + 工作区四角（夹过边界之后）。
+///
+/// **左右 / 上下差不多近时优先「左边、上边」**：盒子夹在两个邻居中间时，
+/// 两侧的空位往往只差一两像素，只按距离选会在两边来回跳（用户明确要求左优先）。
+/// 所以距离差不超过 `pref`（吸附阈值）时，优先取左边/上边那个候选。
+fn nearest_free_spot(
+    others: &[Rect],
+    area: &Rect,
+    bot_limit: i32,
+    ox: i32,
+    oy: i32,
+    w: i32,
+    h: i32,
+    gap: i32,
+    pref: i32,
+) -> Option<(i32, i32)> {
+    let lo_x = area.x;
+    let hi_x = (area.right() - w).max(area.x);
+    let lo_y = area.y;
+    let hi_y = (bot_limit - h).max(area.y);
+    // 优先级：0 = 让到邻居的左边 / 上边（用户要求优先），1 = 右边 / 下边
+    let mut cands: Vec<(i32, i32, u8)> = Vec::with_capacity(others.len() * 4 + 1);
+    cands.push((clamp_i(ox, lo_x, hi_x), clamp_i(oy, lo_y, hi_y), 0));
+    for o in others {
+        let y = clamp_i(o.y, lo_y, hi_y);
+        let x = clamp_i(o.x, lo_x, hi_x);
+        // 邻居左边 / 上边（优先）
+        cands.push((clamp_i(o.x - gap - w, lo_x, hi_x), y, 0));
+        cands.push((x, clamp_i(o.y - gap - h, lo_y, hi_y), 0));
+        // 邻居右边 / 下边
+        cands.push((clamp_i(o.x + o.w + gap, lo_x, hi_x), y, 1));
+        cands.push((x, clamp_i(o.y + o.h + gap, lo_y, hi_y), 1));
+    }
+    let free = |x: i32, y: i32| {
+        let r = Rect { x, y, w, h };
+        !others.iter().any(|o| r.hits(o))
+    };
+    let mut scored: Vec<(i32, u8, i32, i32)> = Vec::with_capacity(cands.len());
+    for (x, y, prio) in cands {
+        if !free(x, y) {
+            continue;
+        }
+        scored.push(((x - ox).abs() + (y - oy).abs(), prio, x, y));
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    let best_d = scored.iter().map(|s| s.0).min().unwrap_or(0);
+    // 距离相近的候选里，左/上优先；同一优先级里再比距离
+    let pick = scored
+        .iter()
+        .filter(|s| s.0 <= best_d + pref)
+        .min_by_key(|s| (s.1, s.0))
+        .copied()?;
+    Some((pick.2, pick.3))
+}
+
+// ---------------- 胶囊团（多个吸附在一起的盒子当整体拖） ----------------
+/// 一次「胶囊团拖动」会话。
+///
+/// 只在拖动期间存在：按下时按窗口真实位置算出「其它成员相对锚点的偏移」，
+/// 之后由一个**独立线程**每 8ms 读一次锚点窗口的真实位置，把成员摆到「锚点 + 偏移」，
+/// 松手落位后清空。
+///
+/// 为什么用后台线程而不是「前端每次 onMoved 发一次 invoke」：
+/// 拖动期间主线程待在系统的窗口拖动模态循环里，任何一次跨线程 `SetWindowPos`
+/// （不带 `SWP_ASYNCWINDOWPOS`）都可能永远等不到派发 —— 用户实测「一拖动就卡死」。
+/// 线程里只做 `GetWindowRect` + 异步 `SetWindowPos`，不碰 Tauri 的窗口表、不发 IPC。
+#[derive(Clone)]
+pub(crate) struct GroupDrag {
+    /// 正在被用户拖的那个盒子（其余成员跟着它走）
+    pub anchor: String,
+    /// 锚点窗口句柄（线程里直接用它读位置，不去查 Tauri 的窗口表）
+    pub anchor_hwnd: isize,
+    /// (成员 id, dx, dy)：dy 对任务栏胶囊没有意义（y 恒等于任务栏上沿）。
+    /// 收尾落盘还在用，所以要留着。
+    pub members: Vec<(String, i32, i32)>,
+    /// 拖动途中真正要摆的窗口（纯 Win32 数据，线程只认这个）
+    pub chips: Vec<FollowChip>,
+    /// 锚点所在的那条任务栏（团在任务栏里拖动时要横向夹住；在桌面上是 None）
+    pub bar: Option<Rect>,
+    /// 胶囊尺寸（任务栏模式下的宽高）
+    pub bar_size: (i32, i32),
+    /// 会话代号：新的一次拖动会自增，旧线程看见代号变了就自己退出
+    pub gen: u64,
+}
+
+/// 跟随线程要摆的一个窗口。
+#[derive(Clone)]
+pub(crate) struct FollowChip {
+    pub hwnd: isize,
+    /// 相对锚点左上角的屏幕坐标偏移
+    pub dx: i32,
+    pub dy: i32,
+    /// 屏幕坐标 → 父客户区坐标 的固定偏移（`place = screen + off`），开始拖时算一次
+    pub off: (i32, i32),
+    /// 胶囊：纵坐标恒为任务栏上沿、横坐标夹在任务栏范围内
+    pub in_bar: bool,
+}
+
+/// 两块区间 `[a0,a1)` 与 `[b0,b1)` 的重叠长度
+fn overlap_len(a0: i32, a1: i32, b0: i32, b1: i32) -> i32 {
+    (a1.min(b1) - a0.max(b0)).max(0)
+}
+
+/// 两个盒子是否「吸附在一起」—— 组成胶囊团的判据。
+///
+/// 和 `snap_box` 的吸附条件同源：一个方向上重叠过半、另一个方向上缝隙不超过吸附阈值。
+/// 吸好的盒子之间缝隙是 0，但用户可能只吸住一部分（比如拖到一半没吸上），
+/// 这里同样按 `SNAP_DIST` 放宽，判定结果才和用户眼睛看到的一致。
+fn boxes_touch(a: Rect, b: Rect, snap: i32) -> bool {
+    let ov_x = overlap_len(a.x, a.right(), b.x, b.right());
+    let ov_y = overlap_len(a.y, a.bottom(), b.y, b.bottom());
+    // 分离时的缝隙（重叠时为 0）
+    let gap_x = (b.x - a.right()).max(a.x - b.right()).max(0);
+    let gap_y = (b.y - a.bottom()).max(a.y - b.bottom()).max(0);
+    // 横向并排：竖直方向重叠过半 + 水平缝隙够小
+    if ov_y * 2 >= a.h.min(b.h) && gap_x <= snap {
+        return true;
+    }
+    // 纵向堆叠：水平方向重叠过半 + 竖直缝隙够小
+    ov_x * 2 >= a.w.min(b.w) && gap_y <= snap
+}
+
+/// 盒子**当前**的屏幕矩形（物理像素）。
+///
+/// 有窗口就问 Win32（配置里的坐标可能还没落盘）；窗口没了（Explorer 重启留下的
+/// 僵尸记录）就按配置和形态估算 —— 至少不会把整团判断成「孤零零一个」。
+fn live_rect(app: &AppHandle, b: &BoxConfig) -> Rect {
+    if let Some(w) = box_window(app, &b.id) {
+        if let Some(r) = rect_of(&w) {
+            return r;
+        }
+    }
+    if b.in_bar {
+        let (w, h) = bar_box_size();
+        let (x, y) = bar_place_xy(b, w);
+        Rect { x, y, w, h }
+    } else {
+        let s = (BOX_W * desktop::scale_at(b.x + 1, b.y + 1)).round() as i32;
+        Rect { x: b.x, y: b.y, w: s, h: s }
+    }
+}
+
+/// 从 `id` 出发，把「吸附连成一片」的盒子全部找出来（含自己）。
+///
+/// 只连**同一形态**的盒子：桌面盒和任务栏胶囊不在一个空间里，混在一团里
+/// 拖动会互相拉扯（一个要钉在任务栏上沿、一个要待在桌面）。
+fn cluster_of(app: &AppHandle, cfg: &Config, id: &str) -> Vec<String> {
+    let Some(start) = cfg.boxes.iter().find(|b| b.id == id) else {
+        return Vec::new();
+    };
+    let mode = start.in_bar;
+    let snap = (SNAP_DIST * desktop::scale_at(start.x + 1, start.y + 1)).round() as i32;
+    let nodes: Vec<(String, Rect)> = cfg
+        .boxes
+        .iter()
+        .filter(|b| b.in_bar == mode)
+        .map(|b| (b.id.clone(), live_rect(app, b)))
+        .collect();
+
+    let mut out: Vec<String> = vec![id.to_string()];
+    let mut frontier: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, (nid, _))| nid == id)
+        .map(|(i, _)| i)
+        .collect();
+    while let Some(i) = frontier.pop() {
+        for j in 0..nodes.len() {
+            if out.iter().any(|x| x == &nodes[j].0) {
+                continue;
+            }
+            if boxes_touch(nodes[i].1, nodes[j].1, snap) {
+                out.push(nodes[j].0.clone());
+                frontier.push(j);
+            }
+        }
+    }
+    out
+}
+
+/// 把盒子从所属的团里摘出来；摘完只剩一个成员的团就地解散（一个人的「团」没有意义）。
+fn drop_from_group(cfg: &mut Config, id: &str) {
+    let Some(b) = cfg.boxes.iter_mut().find(|b| b.id == id) else {
+        return;
+    };
+    let Some(gid) = b.group.take() else {
+        return;
+    };
+    let left = cfg
+        .boxes
+        .iter()
+        .filter(|b| b.group.as_deref() == Some(gid.as_str()))
+        .count();
+    if left < 2 {
+        for b in cfg.boxes.iter_mut() {
+            if b.group.as_deref() == Some(gid.as_str()) {
+                b.group = None;
+            }
+        }
+    }
+}
+
+/// 把成员摆到「锚点当前位置 + 偏移」。`gd` 是本次拖动的快照（不读 `state.group_drag`）。
+///
+/// `full = false` 时只挪位置（拖动途中每帧都在摆，重的摆位会闪）；
+/// `full = true` 走完整的摆位（尺寸/圆角区域/DPI 一次对齐），只在收尾时调一次。
+fn group_follow_with(app: &AppHandle, state: &State, gd: &GroupDrag, full: bool) -> bool {
+    let id = gd.anchor.as_str();
+    let Some(aw) = box_window(app, id) else {
+        return false;
+    };
+    let Some(ar) = rect_of(&aw) else {
+        return false;
+    };
+    // 成员是桌面盒还是任务栏胶囊，决定用哪套摆位函数；
+    // 顺带核一遍它还在这团里（拖动途中被摘出去的成员就别再拽了）
+    let modes: Vec<Option<bool>> = {
+        let cfg = state.cfg.lock().unwrap();
+        let gid = cfg
+            .boxes
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.group.clone());
+        gd.members
+            .iter()
+            .map(|(mid, _, _)| {
+                cfg.boxes
+                    .iter()
+                    .find(|b| &b.id == mid)
+                    .filter(|b| gid.is_some() && b.group == gid)
+                    .map(|b| b.in_bar)
+            })
+            .collect()
+    };
+    let bar = taskbar_rect();
+    for (i, (mid, dx, dy)) in gd.members.iter().enumerate() {
+        let Some(in_bar) = modes[i] else { continue };
+        // 正在重建（整团切形态）的成员别碰：那个 hwnd 随时会失效
+        if switching(mid) {
+            continue;
+        }
+        let Some(w) = box_window(app, mid) else {
+            continue;
+        };
+        let hwnd = hwnd_of(&w);
+        if in_bar {
+            let (ww, wh) = bar_box_size();
+            let Some(bar) = bar else { continue };
+            let nx = clamp_i(ar.x + dx, bar.x, (bar.right() - ww).max(bar.x));
+            if full {
+                desktop::place_bar_box(hwnd, nx, bar.y, ww, wh, true);
+            } else {
+                desktop::move_box_window(hwnd, nx, bar.y);
+            }
+        } else if full {
+            // 桌面盒尺寸随屏缩放，strip_chrome 收的是**逻辑**尺寸（内部按目标位置换算）
+            desktop::strip_chrome(hwnd, ar.x + dx, ar.y + dy, BOX_W as i32, BOX_W as i32, BOX_RADIUS, true);
+        } else {
+            desktop::move_box_window(hwnd, ar.x + dx, ar.y + dy);
+        }
+    }
+    true
+}
+
+/// 拖动结束（吸附已完成）后：把成员对齐到锚点最终位置，并把**所有**成员的新坐标落盘。
+///
+/// 必须在锚点自己落盘、且吸附算完之后调 —— 否则成员会跟着一个还没修正的坐标走，
+/// 出现「吸好了又散开」。跨屏拖动时顺带按新位置重发一次页面缩放。
+fn group_settle(app: &AppHandle, state: &State, id: &str) {
+    // 会话先摘下来：跟随线程一旦发现会话没了就停手，收尾期间不会再有窗口被它挪
+    // （否则「对齐完又被拖走一帧」，落盘的位置还是旧的）。不是自己的会话就别动它。
+    let gd = {
+        let mut g = state.group_drag.lock().unwrap();
+        match g.as_ref() {
+            Some(s) if s.anchor == id => g.take(),
+            _ => None,
+        }
+    };
+    let Some(gd) = gd else { return };
+    // 拖动途中形态被切了（比如从任务栏拖出来，`unembed_at` 把它摘出了团）：
+    // 这次的偏移已经失效，直接丢弃会话，别把老队友拽到新位置去。
+    let still_grouped = {
+        let cfg = state.cfg.lock().unwrap();
+        cfg.boxes.iter().find(|b| b.id == id).and_then(|b| b.group.clone()).is_some()
+    };
+    if !still_grouped {
+        return;
+    }
+    // 收尾这一下走完整摆位：拖动途中只挪了位置，尺寸/圆角区域/跨屏 DPI 在这里一次对齐
+    if !group_follow_with(app, state, &gd, true) {
+        return;
+    }
+    let members = gd.members;
+    let mut changed = false;
+    {
+        let mut cfg = state.cfg.lock().unwrap();
+        for (mid, _, _) in &members {
+            let Some(w) = box_window(app, mid) else { continue };
+            let Some(r) = rect_of(&w) else { continue };
+            if let Some(b) = cfg.boxes.iter_mut().find(|b| &b.id == mid) {
+                // 和 move_box 一个口径：胶囊只认横坐标，纵坐标恒等于任务栏上沿
+                let ny = if b.in_bar { b.y } else { r.y };
+                if b.x != r.x || b.y != ny {
+                    b.x = r.x;
+                    b.y = ny;
+                    changed = true;
+                }
+            }
+            let _ = app.emit(
+                "box:scale",
+                BoxScale {
+                    id: mid.clone(),
+                    scale: desktop::scale_at(r.x + r.w / 2, r.y + r.h / 2),
+                },
+            );
+        }
+        if changed {
+            store::save(&cfg);
+        }
+    }
+}
+
+/// 「组合为胶囊团」：把当前吸附成一片的盒子（`cluster_of`）打上同一个团 id。
+///
+/// 单个盒子（周围没有吸附的邻居）不允许组合 —— 菜单里也不会出现这一项。
+#[tauri::command]
+async fn group_boxes(app: AppHandle, state: tauri::State<'_, State>, id: String) -> Result<usize, String> {
+    let members = {
+        let cfg = state.cfg.lock().unwrap();
+        cluster_of(&app, &cfg, &id)
+    };
+    if members.len() < 2 {
+        return Err("附近没有吸附在一起的收纳盒，不用组合".into());
+    }
+    let gid = format!("g{}", now_ms());
+    {
+        let mut cfg = state.cfg.lock().unwrap();
+        for b in cfg.boxes.iter_mut() {
+            if members.iter().any(|m| m == &b.id) {
+                b.group = Some(gid.clone());
+            }
+        }
+        store::save(&cfg);
+    }
+    for m in &members {
+        notify_box_changed(&app, m);
+    }
+    Ok(members.len())
+}
+
+/// 「解散胶囊团」：把整个团的 `group` 清掉，成员恢复成可以单独拖动。
+#[tauri::command]
+async fn ungroup_box(app: AppHandle, state: tauri::State<'_, State>, id: String) -> Result<usize, String> {
+    let ids: Vec<String> = {
+        let mut cfg = state.cfg.lock().unwrap();
+        let gid = cfg.boxes.iter().find(|b| b.id == id).and_then(|b| b.group.clone());
+        let Some(gid) = gid else {
+            return Ok(0);
+        };
+        let mut ids = Vec::new();
+        for b in cfg.boxes.iter_mut() {
+            if b.group.as_deref() == Some(gid.as_str()) {
+                b.group = None;
+                ids.push(b.id.clone());
+            }
+        }
+        store::save(&cfg);
+        ids
+    };
+    for i in &ids {
+        notify_box_changed(&app, i);
+    }
+    Ok(ids.len())
+}
+
+/// 这个盒子所属团的**全部成员**（含自己，按横坐标从左到右排好）。
+///
+/// 不在团里、或团里只剩自己一个 → `None`（一个人的「团」和没组队没区别）。
+fn group_members_of(cfg: &Config, id: &str) -> Option<Vec<String>> {
+    let gid = cfg.boxes.iter().find(|b| b.id == id)?.group.clone()?;
+    let mut ids: Vec<String> = cfg
+        .boxes
+        .iter()
+        .filter(|b| b.group.as_deref() == Some(gid.as_str()))
+        .map(|b| b.id.clone())
+        .collect();
+    if ids.len() < 2 {
+        return None;
+    }
+    // 左右顺序按当前横坐标定：切换形态后「谁在谁旁边」和用户看到的一致
+    ids.sort_by_key(|i| cfg.boxes.iter().find(|b| &b.id == i).map(|b| b.x).unwrap_or(0));
+    Some(ids)
+}
+
+/// `group_members_of` 的加锁版：这个盒子是不是某个团的成员。
+fn in_group(state: &State, id: &str) -> bool {
+    let cfg = state.cfg.lock().unwrap();
+    group_members_of(&cfg, id).is_some()
+}
+
+/// 在任务栏里给「连续 `n` 个胶囊」找一段不压别人的起始横坐标。
+///
+/// 和 `bar_free_x` 同一套思路（枚举可行起点，取离目标最近的），区别只在于这里
+/// 比较的是**一整排**的宽度 —— 团必须连在一起，不能拆开各找各的空位。
+fn bar_free_span(bar: Rect, unit_w: i32, n: i32, nx0: i32, others: &[i32]) -> i32 {
+    let span = unit_w * n.max(1);
+    let lo = bar.x;
+    let hi = (bar.right() - span).max(bar.x);
+    let target = clamp_i(nx0, lo, hi);
+    let free = |x: i32| others.iter().all(|&ox| x + span <= ox || x >= ox + unit_w);
+    let mut cands: Vec<i32> = Vec::with_capacity(others.len() * 2 + 3);
+    cands.push(target);
+    for &ox in others {
+        cands.push(clamp_i(ox - span, lo, hi));
+        cands.push(clamp_i(ox + unit_w, lo, hi));
+    }
+    cands.push(lo);
+    cands.push(hi);
+    let mut best: Option<(i32, i32)> = None;
+    for x in cands {
+        if !free(x) {
+            continue;
+        }
+        let d = (x - target).abs();
+        if best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, x));
+        }
+    }
+    best.map(|(_, x)| x).unwrap_or(target)
+}
+
+/// 整团在「桌面盒 ↔ 任务栏胶囊」之间切换形态。
+///
+/// 团是**一个整体**，形态也必须整团一起换 —— 原来只把被拖的那一个切过去，
+/// 队友留在任务栏里，整团当场散架，接着程序就卡死了（用户实测）。
+///
+/// `anchor` 是被用户拖动的那个盒子，`cx/cy` 是落点（屏幕坐标，物理像素）：
+/// 它落到光标处，其余成员按原来的左右顺序紧挨着排在它旁边。
+///
+/// 只能在**松手之后**调：一次要重建 N 个窗口（每个几百毫秒），手还按着的时候做
+/// 这件事既慢又容易和系统拖动循环互锁。
+fn group_switch_mode(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i32) {
+    // 同一个团同一时刻只允许一次切换。
+    //
+    // 一次「拖出去松手」会被两处同时看到：`snap_bar` 的松手分支，以及被打上
+    // `DRAG_ESCAPED` 之后某个成员自己那一轮的 `snap_bar`。两处各起一个线程，
+    // 就会把同一批窗口重建两遍，中间那一下会留下两个同 id 的窗口 ——
+    // 用户看到的就是「收纳盒被复制了一个」。这里用团 id 加一道闸，第二次直接忽略。
+    let gid = {
+        let st = app.state::<State>();
+        let cfg = st.cfg.lock().unwrap();
+        cfg.boxes
+            .iter()
+            .find(|b| b.id == anchor)
+            .and_then(|b| b.group.clone())
+    };
+    let Some(gid) = gid else { return };
+    {
+        let mut list = GROUP_SWITCHING.lock().unwrap();
+        if list.iter().any(|g| g == &gid) {
+            return;
+        }
+        list.push(gid.clone());
+    }
+    let app = app.clone();
+    let anchor = anchor.to_string();
+    std::thread::spawn(move || {
+        do_group_switch(&app, &anchor, to_bar, cx, cy);
+        GROUP_SWITCHING.lock().unwrap().retain(|g| g != &gid);
+    });
+}
+
+/// 正在切换形态的团 id（`group_switch_mode` 的互斥表），见那里的说明。
+static GROUP_SWITCHING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 整团**一次性**换形态：先把所有新窗口隐藏着建好、等首帧，再同一轮全部显示，
+/// 最后统一销毁旧窗口。
+///
+/// 为什么不直接循环调 `rebuild_box_flashless`：那是一个盒子一个盒子地
+/// 「建 → 等首帧 → 显示 → 睡 140ms → 销毁旧的」，一个成员 300~500ms，
+/// 三个成员就要一秒多 —— 用户看到的就是「一个一个挪进/挪出任务栏」。
+/// 整团的意义是一次动完，所以把等待合并：新窗口并行建、并行等首帧，
+/// 顺序只影响建窗口那几十毫秒，显示和销毁都落在同一帧里。
+fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) {
+    if plan.is_empty() {
+        return;
+    }
+    // 新旧交替这段时间里，这一批盒子都不许被 snap / move_box / 守护线程碰。
+    // 不同 id 的 guard 互不干扰（见 switching_begin 的说明），放一个 Vec 里一起活着。
+    let _guards: Vec<SwitchGuard> = plan.iter().map(|b| switching_begin(&b.id)).collect();
+
+    let mut olds: Vec<Vec<tauri::WebviewWindow>> = Vec::with_capacity(plan.len());
+    let mut news: Vec<(BoxConfig, tauri::WebviewWindow)> = Vec::with_capacity(plan.len());
+    for b in plan {
+        mark_box_not_ready(&b.id);
+        // 同一 id 名下所有旧窗口都要收掉（整团切换被两处触发过会留下两个）
+        olds.push(box_windows_all(app, &b.id));
+        match spawn_box_window(app, b, false) {
+            Ok(w) => news.push((b.clone(), w)),
+            Err(e) => eprintln!("胶囊团切换形态失败（{}）：{e}", b.id),
+        }
+    }
+    if news.is_empty() {
+        return;
+    }
+    // 新窗口是并行画的：第一个等得久一点，后面的基本已经画完了，瞬间返回
+    for (b, _) in &news {
+        wait_box_ready(&b.id, 900);
+    }
+    // 同一轮里全部露出来 —— 这一步就是「整体」的观感来源
+    for (b, w) in &news {
+        show_box(w, b);
+    }
+    // 等新窗口都稳定出帧，屏幕上已经有整排新盒子盖在旧盒子上面了
+    std::thread::sleep(std::time::Duration::from_millis(140));
+    let mut stale: Vec<String> = Vec::new();
+    for ws in olds {
+        for w in ws {
+            if news.iter().any(|(_, n)| n.label() == w.label()) {
+                continue;
+            }
+            // 先摘掉守护登记：窗口马上销毁，别让守护线程再去碰它
+            desktop::forget(hwnd_of(&w));
+            stale.push(w.label().to_string());
+            let _ = w.destroy();
+        }
+    }
+    for l in stale {
+        wait_window_closed(app, &l);
+    }
+    // 重建窗口会抢焦点，面板本来开着就会被「失焦自动收起」误收，把焦点还回去
+    if let Some(p) = app.get_webview_window("panel") {
+        if p.is_visible().unwrap_or(false) {
+            let _ = p.set_focus();
+        }
+    }
+    for b in plan {
+        notify_box_changed(app, &b.id);
+    }
+}
+
+fn do_group_switch(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i32) {
+    let Some(_guard) = lock_relay(8000) else { return };
+    let st = app.state::<State>();
+    // 拖动留下的偏移会话到此为止：坐标要整体重排，旧偏移没有意义
+    *st.group_drag.lock().unwrap() = None;
+
+    let (order, already) = {
+        let cfg = st.cfg.lock().unwrap();
+        match group_members_of(&cfg, anchor) {
+            // 整团**已经都是目标形态**：只要把位置摆正，不用重建窗口。
+            // 这条守住了「同一次切换被触发两遍」的第二遍 —— 第二遍到这里发现
+            // 形态早就对了，直接摆位收工，不会再建一批窗口。
+            Some(ids) => {
+                let already = ids.iter().all(|i| {
+                    cfg.boxes
+                        .iter()
+                        .find(|b| &b.id == i)
+                        .map(|b| b.in_bar == to_bar)
+                        .unwrap_or(false)
+                });
+                (ids, already)
+            }
+            None => return,
+        }
+    };
+    let ai = match order.iter().position(|i| i == anchor) {
+        Some(i) => i,
+        None => return,
+    };
+    let mon = desktop::monitor_at(cx, cy).or_else(desktop::primary_monitor);
+    let Some(mon) = mon else { return };
+    let size = (BOX_W * mon.scale).round() as i32;
+    let work = mon.work;
+
+    let mut plan: Vec<BoxConfig> = Vec::with_capacity(order.len());
+    {
+        let mut cfg = st.cfg.lock().unwrap();
+        // 团外、已经在任务栏里的胶囊：整排落位时要避开它们
+        let taken: Vec<i32> = cfg
+            .boxes
+            .iter()
+            .filter(|o| o.in_bar && !order.iter().any(|i| &o.id == i))
+            .map(|o| o.x)
+            .collect();
+        let bar = taskbar_rect();
+        if to_bar && bar.is_none() {
+            return; // 任务栏不在底部（或自动隐藏）：没法嵌，保持原样
+        }
+        let (x0, y0, step) = if to_bar {
+            let bar = bar.unwrap();
+            let (unit_w, _) = bar_box_size();
+            let n = order.len() as i32;
+            // 锚点在整排里的位置决定整排起点：它中心对着光标
+            let want = cx - unit_w * (ai as i32) - unit_w / 2;
+            (bar_free_span(bar, unit_w, n, want, &taken), bar.y, unit_w)
+        } else {
+            // 桌面盒之间是无缝贴紧（SNAP_GAP = 0），整排夹进工作区
+            let n = order.len() as i32;
+            let span = size * n;
+            let want = cx - size * (ai as i32) - size / 2;
+            let x = clamp_i(want, work.x, (work.right() - span).max(work.x));
+            let y = clamp_i(cy - size / 2, work.y, (work.bottom() - size).max(work.y));
+            (x, y, size)
+        };
+        for (i, id) in order.iter().enumerate() {
+            let Some(b) = cfg.boxes.iter_mut().find(|b| &b.id == id) else {
+                continue;
+            };
+            b.x = x0 + i as i32 * step;
+            b.y = y0;
+            b.in_bar = to_bar;
+            // 层级由形态决定：胶囊靠父子关系、桌面盒默认进桌面层，
+            // 手动置顶的标记留着只会在切回来之后莫名其妙浮在最上层
+            b.topmost = false;
+            plan.push(b.clone());
+        }
+        store::save(&cfg);
+    }
+    if plan.is_empty() {
+        return;
+    }
+    if already {
+        // 形态没变：只把窗口挪到位（不进桌面层/任务栏，不需要重建）
+        let bar = taskbar_rect();
+        for b in &plan {
+            let _sg = switching_begin(&b.id);
+            let Some(w) = box_window(app, &b.id) else { continue };
+            let hwnd = hwnd_of(&w);
+            if to_bar {
+                let Some(bar) = bar else { continue };
+                let (bw, bh) = bar_box_size();
+                desktop::place_bar_box(hwnd, b.x, bar.y, bw, bh, true);
+            } else {
+                desktop::strip_chrome(
+                    hwnd,
+                    b.x,
+                    b.y,
+                    BOX_W as i32,
+                    BOX_W as i32,
+                    BOX_RADIUS,
+                    true,
+                );
+            }
+            let _ = app.emit(
+                "box:scale",
+                BoxScale {
+                    id: b.id.clone(),
+                    scale: desktop::scale_at(b.x + 1, b.y + 1),
+                },
+            );
+            notify_box_changed(app, &b.id);
+        }
+        return;
+    }
+    // 整团一次换完：所有成员的新窗口一起建、一起显示、一起销毁旧的。
+    // （逐个 rebuild 会让用户看到「一个一个挪进去」，见 rebuild_group_flashless）
+    rebuild_group_flashless(app, &plan);
+}
+
+/// 跟随线程的会话代号：新的一次拖动自增，旧线程看到代号变了就自行退出。
+static GROUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 拖动开始前调一次：把整团的偏移算好，并起一个**后台线程**负责跟手。
+///
+/// 必须**在** `start_dragging()` 之前完成（那个调用会进系统拖动循环，之后前端
+/// 再发指令也进不来了）。不是团成员就返回 false，前端照常单拖。
+///
+/// 为什么跟手放在独立线程里，而不是让前端每次 `onMoved` 发一次 invoke：
+/// 拖动期间主线程待在系统的窗口拖动模态循环里，这时从别处 `SetWindowPos` 到
+/// 主线程的窗口（不带 `SWP_ASYNCWINDOWPOS`）要 SendMessage 等它派发 —— 模态循环
+/// 只派发它关心的那几个窗口，请求永远等不到回应，整条链路吊死（用户实测：
+/// 「组合为胶囊团后一拖动就卡死」）。线程里只做 `GetWindowRect` + 异步 `SetWindowPos`，
+/// 既不碰 Tauri 的窗口表，也不发 IPC。
+#[tauri::command]
+async fn group_drag_begin(app: AppHandle, state: tauri::State<'_, State>, id: String) -> Result<bool, String> {
+    // 上一次拖动留下的「光标逃逸」标记不作数
+    DRAG_ESCAPED.lock().unwrap().retain(|x| x != &id);
+    let bar = taskbar_rect();
+    let bar_size = bar_box_size();
+    // (id, dx, dy) + 真正要摆的窗口
+    let mut members: Vec<(String, i32, i32)> = Vec::new();
+    let mut chips: Vec<FollowChip> = Vec::new();
+    {
+        let cfg = state.cfg.lock().unwrap();
+        let me = cfg.boxes.iter().find(|b| b.id == id).ok_or("盒子不存在")?;
+        let Some(gid) = me.group.clone() else {
+            *state.group_drag.lock().unwrap() = None;
+            return Ok(false);
+        };
+        let ar = live_rect(&app, me);
+        let ah = box_window(&app, &id).map(|w| hwnd_of(&w)).unwrap_or(0);
+        if ah != 0 {
+            for b in cfg.boxes.iter().filter(|b| b.id != id && b.group.as_deref() == Some(gid.as_str())) {
+                let r = live_rect(&app, b);
+                members.push((b.id.clone(), r.x - ar.x, r.y - ar.y));
+                // 窗口没了（Explorer 重启的僵尸）就先记下偏移，等收尾时按配置补位；
+                // 拖动途中没有 hwnd 可摆，跳过即可
+                if let Some(w) = box_window(&app, &b.id) {
+                    let h = hwnd_of(&w);
+                    if h != 0 {
+                        chips.push(FollowChip {
+                            hwnd: h,
+                            dx: r.x - ar.x,
+                            dy: r.y - ar.y,
+                            off: desktop::place_offset(h),
+                            in_bar: b.in_bar,
+                        });
+                    }
+                }
+            }
+            if !members.is_empty() {
+                let gen = GROUP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *state.group_drag.lock().unwrap() = Some(GroupDrag {
+                    anchor: id.clone(),
+                    anchor_hwnd: ah,
+                    members: members.clone(),
+                    chips,
+                    bar,
+                    bar_size,
+                    gen,
+                });
+                spawn_group_follow(app.clone(), gen);
+                return Ok(true);
+            }
+        }
+    }
+    *state.group_drag.lock().unwrap() = None;
+    Ok(false)
+}
+
+/// 拖动途中的跟手线程：每 8ms 读一次锚点窗口的真实位置，把成员摆到「锚点 + 偏移」。
+///
+/// 全程只用 Win32（`GetWindowRect` / 异步 `SetWindowPos`），不查 Tauri 的窗口表、
+/// 不锁 `cfg`、不发 IPC —— 这些都会和拖动模态循环抢主线程。松手（左键抬起）或会话
+/// 被收尾/替换后自行退出；真正的对齐与落盘由 `group_settle` 负责。
+fn spawn_group_follow(app: AppHandle, gen: u64) {
+    std::thread::spawn(move || {
+        let state = app.state::<State>();
+        // 会话在拖动期间是不变的，开局拷一份，循环里只核一下代号
+        let gd = {
+            let g = state.group_drag.lock().unwrap();
+            match g.as_ref() {
+                Some(s) if s.gen == gen => s.clone(),
+                _ => return,
+            }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            // 会话被收尾/替换了 → 立刻停手（此时窗口归 group_settle 摆）
+            {
+                let g = state.group_drag.lock().unwrap();
+                if !matches!(g.as_ref(), Some(s) if s.gen == gen) {
+                    return;
+                }
+            }
+            let Some(ar) = desktop::window_rect(gd.anchor_hwnd) else {
+                // 锚点窗口没了（Explorer 重启、被销毁）：会话作废，别再摆剩下的
+                let mut g = state.group_drag.lock().unwrap();
+                if matches!(g.as_ref(), Some(s) if s.gen == gen) {
+                    *g = None;
+                }
+                return;
+            };
+            for c in &gd.chips {
+                let (x, y) = if c.in_bar {
+                    let Some(bar) = gd.bar else { continue };
+                    let (ww, _) = gd.bar_size;
+                    (
+                        clamp_i(ar.x + c.dx, bar.x, (bar.right() - ww).max(bar.x)),
+                        bar.y,
+                    )
+                } else {
+                    (ar.x + c.dx, ar.y + c.dy)
+                };
+                // 屏幕坐标 → 父客户区坐标（偏移是开始拖时算的固定值）
+                desktop::move_box_window_place(c.hwnd, x + c.off.0, y + c.off.1);
+            }
+            if !left_down() {
+                // 松手了：剩下的对齐/落盘交给 group_settle（吸附那条路）或 group_end
+                return;
+            }
+        }
+    });
+}
+
+/// 拖动途中把成员摆一次（备用入口：前端不再逐帧调它，跟手走线程）。
+#[tauri::command]
+fn group_follow(app: AppHandle, state: tauri::State<'_, State>, id: String) -> bool {
+    let gd = {
+        let g = state.group_drag.lock().unwrap();
+        match g.as_ref() {
+            Some(s) if s.anchor == id => Some(s.clone()),
+            _ => None,
+        }
+    };
+    let Some(gd) = gd else { return false };
+    group_follow_with(&app, &state, &gd, false)
+}
+
+/// 「这次拖动没走吸附」的兜底。
+///
+/// 不能立刻收尾：松手后 100~400ms 才轮到 `snap_box` / `snap_bar`，而它们会先修正
+/// **锚点**的位置再调 `group_settle`。这里要是马上收尾，就会拿一个还没吸附的锚点位置
+/// 去对齐成员、把会话清掉，等锚点真跳过去时成员已经不在团里了（表现：吸好了但
+/// 整团散开一截）。所以延后 600ms：正常路径早就收过尾（会话没了 → 空操作），
+/// 只有「压根没吸附」时才轮到它。
+#[tauri::command]
+fn group_end(app: AppHandle, state: tauri::State<'_, State>, id: String) {
+    let gen = {
+        let g = state.group_drag.lock().unwrap();
+        match g.as_ref() {
+            Some(s) if s.anchor == id => Some(s.gen),
+            _ => None,
+        }
+    };
+    let Some(gen) = gen else { return };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let state = app.state::<State>();
+        // 600ms 内用户又拖了一次（会话换代）→ 别把新的那次提前收掉
+        let same = {
+            let g = state.group_drag.lock().unwrap();
+            matches!(g.as_ref(), Some(s) if s.gen == gen)
+        };
+        if same {
+            group_settle(&app, &state, &id);
+        }
+    });
+}
+
+/// 左 Ctrl 是否按着（物理键状态）。
+///
+/// 给面板的「Ctrl+点击多选」兜底：WebView2 在部分窗口状态下不给鼠标事件带
+/// 修饰键，`e.ctrlKey` 会是 false，`Ctrl+点击` 就退化成「点一下 = 打开程序」。
+/// 后端读的是系统级键状态，不受窗口焦点影响。
+fn ctrl_down_raw() -> bool {
+    let down = |vk: i32| unsafe { (win32::GetAsyncKeyState(vk) as u16) & 0x8000 != 0 };
+    // VK_CONTROL(0x11) 覆盖左右两个 Ctrl；顺带认 Windows 键（习惯用 Win 的少见，但无害）
+    down(0x11) || down(0x5B)
+}
+
+#[tauri::command]
+fn ctrl_down() -> bool {
+    ctrl_down_raw()
+}
+
+/// 把 Ctrl 的物理键状态**主动推**给前端（只在变化时发，40ms 一轮）。
+///
+/// 为什么不能只靠前端自己记：面板的多选要在 `pointerdown` 那一刻**同步**决定
+/// 「打开」还是「切选」，等一下 IPC 就来不及了。而 WebView2 在部分窗口状态下
+/// 鼠标事件不带修饰键（`e.ctrlKey` 恒 false），窗口没焦点时又收不到 keydown/keyup。
+/// 这里补上第三路：后端轮询系统级键状态并广播，前端拿到的就是一个随时可同步读的镜像。
+///
+/// 开销：每 40ms 两次 `GetAsyncKeyState`，只在状态翻转时发一次事件。
+fn start_ctrl_watch(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut last = ctrl_down_raw();
+        let _ = app.emit("ctrl:changed", last);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let now = ctrl_down_raw();
+            if now != last {
+                last = now;
+                let _ = app.emit("ctrl:changed", now);
+            }
+        }
+    });
 }
 
 /// 松手后按「是否压在任务栏上」决定要不要**自动嵌入任务栏**。
@@ -2294,7 +3383,29 @@ fn bar_free_x(bar: Rect, want_w: i32, nx0: i32, others: &[i32], snap: i32) -> i3
 fn embed_after_snap(app: &AppHandle, id: String) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let _guard = RELAY_LOCK.lock().unwrap();
+        // 团成员：整团一起嵌进去。判据和单个盒子一致，只是位置按锚点算，
+        // 落位交给 `group_switch_mode` 排成一整排（松手后调用，此时没有拖动循环）
+        let (grouped, anchor) = {
+            let st = app.state::<State>();
+            let cfg = st.cfg.lock().unwrap();
+            let grouped = group_members_of(&cfg, &id).is_some();
+            let anchor = cfg.boxes.iter().find(|b| b.id == id).map(|b| {
+                let size = (BOX_W
+                    * desktop::scale_at(b.x + BOX_W as i32 / 2, b.y + BOX_W as i32 / 2))
+                .round() as i32;
+                (b.x, b.y, size)
+            });
+            (grouped, anchor)
+        };
+        if grouped {
+            if let Some((bx, by, size)) = anchor {
+                if on_taskbar(bx, by, size) {
+                    group_switch_mode(&app, &id, true, bx + size / 2, by + size / 2);
+                }
+            }
+            return;
+        }
+        let Some(_guard) = lock_relay(8000) else { return };
         let _sg = switching_begin(&id);
         let st = app.state::<State>();
         let b = {
@@ -2337,6 +3448,8 @@ fn embed_after_snap(app: &AppHandle, id: String) {
             // 顺手清掉 —— 否则移出任务栏后它会莫名其妙还是浮在最上层。
             b.topmost = false;
             let b = b.clone();
+            // 形态变了，脱离原来的团（见 set_box_in_bar 的同款处理）
+            drop_from_group(&mut cfg, &id);
             store::save(&cfg);
             b
         };
@@ -2355,7 +3468,7 @@ fn embed_after_snap(app: &AppHandle, id: String) {
 fn unembed_at(app: &AppHandle, id: String, cx: i32, cy: i32) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let _guard = RELAY_LOCK.lock().unwrap();
+        let Some(_guard) = lock_relay(8000) else { return };
         // 从现在起这个盒子的坐标/层级都在变，snap / move_box 一律跳过
         let _sg = switching_begin(&id);
         let st = app.state::<State>();
@@ -2376,6 +3489,7 @@ fn unembed_at(app: &AppHandle, id: String, cx: i32, cy: i32) {
                 b.y = clamp_i(cy - size / 2, m.work.y, (m.work.y + m.work.h - size).max(m.work.y));
             }
             let b = b.clone();
+            drop_from_group(&mut cfg, &id);
             store::save(&cfg);
             b
         };
@@ -2421,15 +3535,18 @@ fn migrate_pressed_into_bar(boxes: &mut [BoxConfig]) -> bool {
 // ---------------- 拖动途中的悬停切换（不用松手） ----------------
 //
 // 用户要的两件事：
-//  ① 桌面上的盒子拖进任务栏、过半之后**停住 500ms**，就直接嵌入，不用等松手；
-//  ② 任务栏里的胶囊往桌面方向顶出去、顶住 500ms，就直接退回桌面。
+//  ① 桌面上的盒子拖进任务栏、过半之后**停住 HOVER_MS**，就直接嵌入，不用等松手；
+//  ② 任务栏里的胶囊往桌面方向顶出去、顶住 HOVER_MS，就直接退回桌面。
 //
 // 为什么判断依据是**光标**而不是窗口矩形：胶囊是 `Shell_TrayWnd` 的子窗口，系统拖动
 // 循环把它限制在任务栏那一条里 —— 窗口矩形永远出不去，光看它永远看不出「用户想拖出去」。
 // 光标不受这个限制，一直往上走就会离开任务栏上沿，那才是「在使劲往外拖」的信号。
 
 /// 悬停多久才切换（毫秒）。太短会误触（一扫而过就变了），太长用户觉得没反应。
-const HOVER_MS: u128 = 500;
+///
+/// 最初定的是 500ms，实测「延迟感有点大」→ 改成 300ms（用户要求试效果）。
+/// 拖入和拖出共用这一个值，要调就只改这里。
+const HOVER_MS: u128 = 300;
 /// 光标离任务栏上沿多少像素以内算「顶到上沿了」（防手抖，也给被裁剪的光标留余量）
 const BAR_UP_MARGIN: i32 = 2;
 /// 桌面盒子判定时，光标允许比任务栏上沿高多少（防止「盒子压着任务栏、光标却在屏幕上」误判）
@@ -2442,6 +3559,55 @@ struct HoverState {
 }
 
 static HOVER: Mutex<Option<HoverState>> = Mutex::new(None);
+
+/// 推进「同一条悬停条件已经持续多久」，到了 `HOVER_MS` 就返回 true。
+///
+/// `key` 区分是谁在悬停：单个盒子用盒子 id，胶囊团用 `group:<团id>` ——
+/// 团里哪个成员在轮询都算同一件事，不然成员之间会互相把计时清掉。
+/// 条件一断就清空计时（光标一荡出去，计时从头算）。
+fn hover_reached(key: &str, cond: bool) -> bool {
+    let mut hover = HOVER.lock().unwrap();
+    match hover.as_ref() {
+        Some(h) if h.id == key => {}
+        _ => {
+            *hover = Some(HoverState {
+                id: key.to_string(),
+                since: None,
+            });
+        }
+    }
+    if !cond {
+        if let Some(h) = hover.as_mut() {
+            h.since = None;
+        }
+        return false;
+    }
+    let since = match hover.as_ref().and_then(|h| h.since) {
+        Some(t) => t,
+        None => {
+            if let Some(h) = hover.as_mut() {
+                h.since = Some(std::time::Instant::now());
+            }
+            return false;
+        }
+    };
+    if since.elapsed().as_millis() < HOVER_MS {
+        return false;
+    }
+    *hover = None;
+    true
+}
+
+/// 拖动期间「光标真的离开过任务栏上沿」的盒子。
+///
+/// 只在 `bar_hover` 的拖动轮询里写入 —— 那是唯一能确定「用户正用手拖它」的时刻，
+/// 程序性摆窗口（改设置、重建、任务栏纠偏）不会污染它。
+///
+/// 用途：胶囊团的**整团**退出任务栏要等松手（拖动途中切形态会卡死），
+/// 而 `snap_bar` 里原来那套「光标在任务栏上方、且离胶囊不远」的判据范围很窄
+/// （只容得下往上顶一小段）；用户把团拖到屏幕中间时早就超了，会被误判成
+/// 「只是在任务栏里挪一下」。所以在拖动途中先把信号记下来，松手时直接认。
+static DRAG_ESCAPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn cursor_xy() -> Option<(i32, i32)> {
     let mut pt = win32::POINT::default();
@@ -2482,7 +3648,13 @@ fn end_drag(hwnd: isize) -> bool {
         if unsafe { win32::GetGUIThreadInfo(tid, &mut gi) } == 0 {
             return false;
         }
+        // 三个信号取「或」：系统拖动/缩放循环进行时 `hwndMoveSize` 就是被拖的窗口，
+        // 这比 flags 更直接；`hwndCapture` 是拖动循环必有的鼠标捕获。
+        // 原来只看 GUI_INMOVESIZE，个别环境拿不到这一位 → 误判「已经结束」，
+        // 于是主线程还卡在拖动循环里就去建新窗口，整个程序跟着一起卡死（用户实测）。
         gi.flags & win32::GUI_INMOVESIZE != 0
+            || gi.hwndMoveSize != 0
+            || (gi.hwndCapture != 0 && gi.hwndCapture == hwnd)
     };
     let wait = |ms: u64| {
         let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
@@ -2533,7 +3705,7 @@ fn switch_during_drag(app: &AppHandle, id: &str, to_bar: bool, cx: i32, cy: i32)
     let app = app.clone();
     let id = id.to_string();
     std::thread::spawn(move || {
-        let _guard = RELAY_LOCK.lock().unwrap();
+        let Some(_guard) = lock_relay(8000) else { return };
         // 拖动途中切换：坐标/层级都在变，这一段时间的 snap / move_box 必须让开
         let _sg = switching_begin(&id);
         let st = app.state::<State>();
@@ -2576,6 +3748,7 @@ fn switch_during_drag(app: &AppHandle, id: &str, to_bar: bool, cx: i32, cy: i32)
                 }
             }
             let b = b.clone();
+            drop_from_group(&mut cfg, &id);
             store::save(&cfg);
             b
         };
@@ -2625,19 +3798,63 @@ async fn bar_hover(
             return Ok(None);
         }
     };
+    // 胶囊团：拖动途中**也**允许「悬停 HOVER_MS → 整团换形态」。
+    //
+    // 单盒子的做法是 `switch_during_drag`（结束拖动循环 → 后台重建）。团多一步：
+    // 跟随线程正在按 8ms 的节奏摆成员窗口，必须**先让它收手**再拆窗口，
+    // 否则就是在别人手里抢椅子 —— 之前那次「拖出去一个、队友留着、接着卡死」
+    // 就是这么来的（当时干脆禁止了拖动途中切形态，只能等松手）。
+    if let Some(gid) = {
+        let cfg = state.cfg.lock().unwrap();
+        cfg.boxes
+            .iter()
+            .find(|b| b.id == id)
+            .and_then(|b| b.group.clone())
+    } {
+        if in_bar {
+            // 胶囊是 `Shell_TrayWnd` 的子窗口，系统的拖动循环会把光标**裁剪**在任务栏里。
+            // 单个胶囊在下面的 cond 分支里会把裁剪解掉；团成员走的是这条分支，
+            // 漏了这一句就会「整团拖不出任务栏，鼠标被卡在任务栏那一条上」。
+            unsafe { win32::ClipCursor(std::ptr::null()) };
+        }
+        if in_bar && cy < bar.y - BAR_UP_MIN {
+            // 松手兜底用：光标真的离开过任务栏上沿（`snap_bar` 认这个标记）
+            let mut v = DRAG_ESCAPED.lock().unwrap();
+            if !v.iter().any(|x| x == &id) {
+                v.push(id.clone());
+            }
+        }
+        let br = box_window(&app, &id).and_then(|w| rect_of(&w));
+        let cond = if in_bar {
+            cy <= bar.y + BAR_UP_MARGIN
+        } else {
+            match br {
+                Some(r) => on_taskbar(r.x, r.y, r.h.max(1)) && cy >= bar.y - BAR_UP_MIN,
+                None => false,
+            }
+        };
+        if !hover_reached(&format!("group:{gid}"), cond) {
+            return Ok(None);
+        }
+        // 计时到了，可以切。顺序是死的：先停跟随线程 → 再结束拖动循环 → 才动窗口。
+        *state.group_drag.lock().unwrap() = None;
+        // 跟随线程 8ms 一轮，25ms 足够它看见会话没了并自行退出
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let Some(w) = box_window(&app, &id) else {
+            return Ok(Some("idle".into()));
+        };
+        if !end_drag(hwnd_of(&w)) {
+            // 甩不掉拖动循环就什么都不做：宁可等用户松手走 `snap_bar` 的整团逻辑，
+            // 也不能在模态循环里拆窗口（那才是真的卡死）。
+            return Ok(Some("idle".into()));
+        }
+        // 形态这次就变完了，松手时别再让 `snap_bar` 拿「逃逸」再切一遍
+        DRAG_ESCAPED.lock().unwrap().retain(|x| x != &id);
+        group_switch_mode(&app, &id, !in_bar, cx, cy);
+        return Ok(Some(if in_bar { "unembed" } else { "embed" }.into()));
+    }
     // 拖动时的真实矩形（配置里的坐标在拖动途中是旧的）
     let br = box_window(&app, &id).and_then(|w| rect_of(&w));
-
-    let mut hover = HOVER.lock().unwrap();
-    match hover.as_ref() {
-        Some(h) if h.id == id => {}
-        _ => {
-            *hover = Some(HoverState {
-                id: id.clone(),
-                since: None,
-            });
-        }
-    }
 
     let cond = if in_bar {
         // 胶囊：光标顶到任务栏上沿（或更高）就算「要拖出去」。
@@ -2658,28 +3875,11 @@ async fn bar_hover(
         }
     };
 
-    if !cond {
-        if let Some(h) = hover.as_mut() {
-            h.since = None;
-        }
+    if !hover_reached(&id, cond) {
         return Ok(None);
     }
-    let since = match hover.as_ref().and_then(|h| h.since) {
-        Some(t) => t,
-        None => {
-            if let Some(h) = hover.as_mut() {
-                h.since = Some(std::time::Instant::now());
-            }
-            return Ok(None);
-        }
-    };
-    if since.elapsed().as_millis() < HOVER_MS {
-        return Ok(None);
-    }
-    *hover = None;
-    drop(hover);
 
-    // 条件维持够了 500ms → 切换。切换成功才告诉前端「别再问了」，
+    // 条件维持够了 HOVER_MS → 切换。切换成功才告诉前端「别再问了」，
     // 失败（拖动循环甩不掉）就当没发生过，让用户松手走原来的吸附逻辑。
     if switch_during_drag(&app, &id, !in_bar, cx, cy) {
         Ok(Some(if in_bar { "unembed" } else { "embed" }.into()))
@@ -2692,11 +3892,10 @@ async fn bar_hover(
 //
 // 规则（用户定义）：
 //
-//  * 面板：先看收纳盒是怎么排的。
-//      横排（多个盒子排在同一水平线上）→ 优先图标**上方**，上方放不下再放**下方**；
-//      竖排（多个盒子排在同一垂直线上）→ 优先图标**右侧**，右侧放不下再放**左侧**；
-//      杂乱摆放 → 先**上方**、再**右侧**，然后下方、左侧。
-//    目的：面板不去压住旁边的收纳盒。
+//  * 面板：**绝不压住自己这个收纳盒**（压住了用户就点不到它了，也看不出是哪个盒子的面板）；
+//      其他收纳盒「尽量」别压 —— 压到了只是不好看，不能为了躲它们把面板挤到屏外。
+//      同档候选里一律按「**上 → 左 → 下 → 右**」挑（用户明确要求的顺序：
+//      右下角的盒子往上开最自然，上方被邻居占了就往左边开）。
 //
 //  * 设置：图标在屏幕左半边 → 设置窗口开在图标**右侧**；在右半边 → 开在**左侧**。
 //    两边都放不下（屏幕太窄）就退回图标上/下方。始终不盖住图标，也不出工作区。
@@ -2884,15 +4083,45 @@ fn pick_spot(
     cands[0].0
 }
 
-/// 面板该摆哪儿。icon 是盒子图标窗口的矩形，others 是其他收纳盒的矩形（障碍物）。
+/// 面板该摆哪儿。icon 是盒子图标窗口的矩形，others 是其他收纳盒的矩形。
+///
+/// 分三档挑，越靠前越好：
+///  ① 自己和其他盒子都不压；
+///  ② 只保证不压自己（其他盒子让一步 —— 用户说「其他的可以覆盖」）；
+///  ③ 四个方向都躲不开自己（面板比可用空间还大的极端情况）→ 挑压得最少的。
+///
+/// 每档内部按 `order`（上 → 左 → 下 → 右）取第一个，所以「不压任何盒子」时
+/// 一定是上方优先、其次左侧。
 fn panel_origin(icon: &Rect, pw: i32, ph: i32, sc: f64, area: &Rect, layout: Arrangement, others: &[Rect]) -> Rect {
     let gap = (10.0 * sc).round() as i32;
+    // 上、左优先是死规矩；排布方向只在「下」和「右」之间调一下顺序：
+    // 竖排时同一个盒子上下的邻居最密，往右开比往下方开更不容易压到同列的盒子。
     let order: &[Side] = match layout {
-        Arrangement::Row => &[Side::Up, Side::Down, Side::Right, Side::Left],
-        Arrangement::Column => &[Side::Right, Side::Left, Side::Up, Side::Down],
-        Arrangement::Mixed => &[Side::Up, Side::Right, Side::Down, Side::Left],
+        Arrangement::Column => &[Side::Up, Side::Left, Side::Right, Side::Down],
+        _ => &[Side::Up, Side::Left, Side::Down, Side::Right],
     };
-    pick_spot(order, icon, pw, ph, gap, area, 8, others, &[])
+    let cands: Vec<Rect> = order
+        .iter()
+        .map(|s| spot_beside(*s, icon, pw, ph, gap, area, 8).0)
+        .collect();
+
+    if let Some(r) = cands.iter().find(|r| !r.hits(icon) && !r.hits_any(others)) {
+        return *r;
+    }
+    if let Some(r) = cands.iter().find(|r| !r.hits(icon)) {
+        return *r;
+    }
+    // 极端情况：宁可压住自己也不能跑到屏幕外 —— 那就压得最少的方向
+    let overlap = |r: &Rect| -> i64 {
+        let w = (r.right().min(icon.right()) - r.x.max(icon.x)).max(0) as i64;
+        let h = (r.bottom().min(icon.bottom()) - r.y.max(icon.y)).max(0) as i64;
+        w * h
+    };
+    cands
+        .iter()
+        .copied()
+        .min_by_key(|r| overlap(r))
+        .unwrap_or(cands[0])
 }
 
 /// 截图 + 模糊，存进 State 供前端 `panel_backdrop` 取用。
@@ -2952,9 +4181,15 @@ async fn present_panel(app: AppHandle, state: tauri::State<'_, State>, id: Strin
     *state.panel_target.lock().unwrap() = id.clone();
 
     if same && panel.is_visible().unwrap_or(false) {
-        // 已经开着同一个盒子：保持原样，只重新拉一遍数据（内容可能变了）
-        let _ = panel.emit("panel:target", PanelTarget { id, seq });
-        let _ = panel.set_focus();
+        // 同一个盒子再点一次 = **收起**（用户要求的开关式交互：点一次弹出，再点一次关闭）。
+        //
+        // 必须把 seq 再递增一次，作废还在路上的 `panel_ready` —— 否则刚 hide 又被它
+        // 显示回来（和 `close_panel` 同一个坑）。
+        {
+            let mut s = state.panel_seq.lock().unwrap();
+            *s = seq + 1;
+        }
+        let _ = panel.hide();
         return Ok(());
     }
 
@@ -3410,6 +4645,29 @@ fn cursor_in_panel(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
+fn cursor_on_box(app: AppHandle, state: tauri::State<'_, State>) -> bool {
+    let mut pt = win32::POINT::default();
+    if unsafe { win32::GetCursorPos(&mut pt) } == 0 {
+        return false;
+    }
+    let ids: Vec<String> = {
+        let cfg = state.cfg.lock().unwrap();
+        cfg.boxes.iter().map(|b| b.id.clone()).collect()
+    };
+    for id in ids {
+        let Some(w) = box_window(&app, &id) else { continue };
+        if !w.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let Some(r) = rect_of(&w) else { continue };
+        if pt.x >= r.x && pt.x < r.x + r.w && pt.y >= r.y && pt.y < r.y + r.h {
+            return true;
+        }
+    }
+    false
+}
+
+#[tauri::command]
 async fn close_panel(app: AppHandle, state: tauri::State<'_, State>) -> Result<(), String> {
     // 作废还在路上的 panel_ready，避免「刚关掉又被它显示出来」
     {
@@ -3427,10 +4685,20 @@ async fn close_panel(app: AppHandle, state: tauri::State<'_, State>) -> Result<(
 /// 在光标处弹出盒子右键菜单
 #[tauri::command]
 async fn show_box_menu(app: AppHandle, state: tauri::State<'_, State>, id: String) -> Result<(), String> {
-    let (name, topmost, in_bar, has_icon) = {
+    let (name, topmost, in_bar, has_icon, grouped, can_group) = {
         let cfg = state.cfg.lock().unwrap();
         let b = cfg.boxes.iter().find(|b| b.id == id).ok_or("盒子不存在")?;
-        (b.name.clone(), is_floating(b), b.in_bar, b.icon.is_some())
+        let grouped = b.group.is_some();
+        // 没成团时看周围有没有吸附在一起的邻居：至少两个才给「组合」这一项
+        let can_group = !grouped && cluster_of(&app, &cfg, &id).len() >= 2;
+        (
+            b.name.clone(),
+            is_floating(b),
+            b.in_bar,
+            b.icon.is_some(),
+            grouped,
+            can_group,
+        )
     };
     let count = store::count_items(&id);
     let win = app.get_webview_window("menu").ok_or("菜单窗口不存在")?;
@@ -3441,7 +4709,7 @@ async fn show_box_menu(app: AppHandle, state: tauri::State<'_, State>, id: Strin
     // 逻辑尺寸 → 物理尺寸（place_menu / set_size 用的都是物理像素）。
     // 按**光标所在显示器**换算：菜单跟着光标弹，光标在哪块屏就按哪块屏的缩放。
     let sc = desktop::scale_at(pt.x, pt.y);
-    let h = menu_height(count > 0, has_icon);
+    let h = menu_height(count > 0, has_icon, grouped || can_group);
     let (mw, mh) = ((MENU_W * sc).round() as i32, (h * sc).round() as i32);
     let (x, y) = place_menu(&app, pt.x, pt.y, mw, mh);
 
@@ -3451,7 +4719,7 @@ async fn show_box_menu(app: AppHandle, state: tauri::State<'_, State>, id: Strin
     *state.menu_target.lock().unwrap() = id.clone();
     let _ = win.emit(
         "menu:data",
-        MenuData { id, name, count, topmost, in_bar, has_icon },
+        MenuData { id, name, count, topmost, in_bar, has_icon, grouped, can_group },
     );
     win.show().map_err(|e| e.to_string())?;
     desktop::strip_chrome(hwnd_of(&win), x, y, MENU_W as i32, h as i32, MENU_RADIUS, true);
@@ -3501,19 +4769,24 @@ async fn fit_menu(app: AppHandle, state: tauri::State<'_, State>, height: f64) -
 
 /// 菜单窗口启动时拉一次数据（避免 show 早于页面加载、错过 menu:data 事件）
 #[tauri::command]
-fn get_menu_data(state: tauri::State<State>) -> Option<MenuData> {
+fn get_menu_data(app: AppHandle, state: tauri::State<State>) -> Option<MenuData> {
     let id = state.menu_target.lock().unwrap().clone();
     if id.is_empty() {
         return None;
     }
-    let (topmost, in_bar, has_icon) = {
+    let (name, topmost, in_bar, has_icon, grouped, can_group) = {
         let cfg = state.cfg.lock().unwrap();
         let b = cfg.boxes.iter().find(|b| b.id == id)?;
-        (is_floating(b), b.in_bar, b.icon.is_some())
-    };
-    let name = {
-        let cfg = state.cfg.lock().unwrap();
-        cfg.boxes.iter().find(|b| b.id == id).map(|b| b.name.clone()).unwrap_or_default()
+        let grouped = b.group.is_some();
+        let can_group = !grouped && cluster_of(&app, &cfg, &id).len() >= 2;
+        (
+            b.name.clone(),
+            is_floating(b),
+            b.in_bar,
+            b.icon.is_some(),
+            grouped,
+            can_group,
+        )
     };
     Some(MenuData {
         count: store::count_items(&id),
@@ -3522,6 +4795,8 @@ fn get_menu_data(state: tauri::State<State>) -> Option<MenuData> {
         topmost,
         in_bar,
         has_icon,
+        grouped,
+        can_group,
     })
 }
 
@@ -3780,6 +5055,7 @@ pub fn run() {
             pick_area: Mutex::new(None),
             pick_start: Mutex::new(None),
             pick_caller: Mutex::new(None),
+            group_drag: Mutex::new(None),
         })
         .setup(|app| {
             let handle = app.handle().clone();
@@ -3800,6 +5076,7 @@ pub fn run() {
                             in_bar: false,
                             icon: None,
                             order: Vec::new(),
+                            group: None,
                         });
                     }
                     store::save(&cfg);
@@ -3846,6 +5123,8 @@ pub fn run() {
                 eprintln!("创建系统托盘失败: {e}");
             }
             desktop::start_watchdog(handle.clone(), BOX_W as i32, BOX_RADIUS);
+            // Ctrl 物理键状态广播：面板的 Ctrl+点击多选要靠它同步判断（见 start_ctrl_watch）
+            start_ctrl_watch(handle.clone());
             // 显示配置（拔插屏 / 单屏双屏 / 分辨率 / 缩放）一变就把盒子摆回原位，
             // 否则 Progman 客户区原点一挪，所有盒子就整块平移出屏幕
             start_layout_watch(handle.clone());
@@ -3897,6 +5176,13 @@ pub fn run() {
             foreground_is_self,
             mouse_left_down,
             cursor_in_panel,
+            cursor_on_box,
+            ctrl_down,
+            group_boxes,
+            ungroup_box,
+            group_drag_begin,
+            group_follow,
+            group_end,
             close_panel,
             show_box_menu,
             hide_menu,
