@@ -11,6 +11,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 中文版本说明必须以 UTF-8 字节上传，否则 Gitee 会按 UTF-8 解析 GBK 字节，
+# 整段变成一片 "�"（v0.9.27 / v0.9.28 就这么坏的，v0.9.29 才正常）。
+# Python 在中文 Windows 下 stdout 默认 cp936，必须强制 UTF-8 模式。
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
@@ -108,6 +114,15 @@ UP=$(curl -sS -X POST "$API/releases/$RID/attach_files" \
     -F "file=@$EXE;filename=$NAME")
 URL=$(printf '%s' "$UP" | python -c "import json,sys;print(json.load(sys.stdin).get('browser_download_url',''))" 2>/dev/null || true)
 [ -n "$URL" ] || { echo "$UP"; die "上传失败（单文件需 <100 MB）"; }
+
+# 4) 回读校验：说明正文不该出现 U+FFFD（编码坏掉的标志）
+BAD=$(curl -sS "$API/releases/tags/$TAG?access_token=$GITEE_TOKEN" |
+    python -c "import json,sys;print((json.load(sys.stdin).get('body') or '').count('\ufffd'))" 2>/dev/null || echo 0)
+if [ "$BAD" != "0" ]; then
+    echo "⚠ 发行版说明里有 $BAD 个乱码字符（编码问题），跑 tools/fix_release_body.py 修"
+else
+    echo "· 说明正文编码正常"
+fi
 
 echo
 echo "✓ 发版完成"
