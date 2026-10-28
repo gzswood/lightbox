@@ -43,9 +43,9 @@ body,
 #root {
   margin: 0;
   height: 100%;
-  /* 窗口形状由 Win32 的 SetWindowRgn 裁成圆角，这里必须不透明地铺满，
-     否则 WebView 宿主的默认白底和窗口标题会透出来。 */
-  background: #f9fafd;
+  /* 不设默认底色：每个窗口形态都自己铺（面板/菜单/设置用自己的底色，
+     收纳盒要彻底透明）。这里留一个实色底，盒子窗口就会从最上面露出一条白边。 */
+  background: transparent;
   overflow: hidden;
   font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui,
     -apple-system, sans-serif;
@@ -78,23 +78,34 @@ html[data-mode="pick"] #root {
   background: transparent;
 }
 
-/* 收纳盒窗口：整窗铺底板色，圆角裁掉的那 1 像素台阶也不露白底 */
+/* 收纳盒窗口：**页面必须彻底透明**。
+ *
+ * 桌面盒子现在是顶层窗口（owner = Progman，见 desktop::pin_to_desktop），DWM 对它做
+ * 逐像素 alpha 合成，alpha=0 的像素真的透出壁纸。这里只要留一点底色，
+ * 整块盒子立刻又变成一块实色方块 —— 透明就没有了。
+ *
+ * 任务栏胶囊是 `Shell_TrayWnd` 的子窗口、**没有 alpha**，它的底板画在
+ * `.box-tile.bar` 上（见下），不靠这里。 */
 html[data-mode="box"],
 html[data-mode="box"] body,
 html[data-mode="box"] #root {
-  background: var(--tile-bg);
+  background: transparent;
 }
 
 /* ---------- 收纳盒 ----------
  *
- * 盒子是 Progman 的子窗口，**没有逐像素 alpha**，做不出真正的「透出壁纸」；
- * 之前用「把背后屏幕截图贴回窗口」硬凑透明，结果截图把桌面图标也一起带了进来
- * （图标画在 SHELLDLL_DefView 里），盒子里就出现一层「别的图片」，还和自己的名字叠在一起。
- * 现在回到最简单也最稳的做法：**实色底板**，颜色由设置里的「收纳盒」取色格决定，
- * 文字颜色按背景自动取深/浅（`--tile-text`，见 theme.ts）。
+ * 盒子**没有底板**：整个窗口只有图标和名字，底下直接就是壁纸。
  *
- * 尺寸跟着窗口走（100%），窗口边长是后端的 `BOX_W`=72；
- * 圆角 16 必须和 `BOX_RADIUS` 一致（窗口用 SetWindowRgn 硬裁，两个值对不上会露直角）。 */
+ * 老版本是实色底板（因为盒子当时是 Progman 的子窗口，没有逐像素 alpha，
+ * 想透明只能把背后的屏幕截图贴回来 —— 而截图会把桌面图标一起带进来，
+ * 盒子里出现一层「别的图片」和自己的名字叠在一起）。
+ * 现在窗口形态换了，透明是 DWM 真合成的，拖动时也实时跟随，不需要任何快照。
+ *
+ * 代价：名字不能再用「按底板亮度自动取反」那套（`--tile-text`），
+ * 改成白字 + 深色阴影，在深浅壁纸上都读得出来（和桌面图标同一思路）。
+ *
+ * 尺寸跟着窗口走（100%），窗口边长是后端的 `BOX_W`=80；
+ * 圆角 18 必须和 `BOX_RADIUS` 一致（窗口用 SetWindowRgn 硬裁，两个值对不上会露直角）。 */
 /* 盒子舞台：固定 80×80 逻辑像素，**不跟 viewport 走**。
  *
  * 盒子窗口的物理尺寸是 80 × 显示器缩放，而 WebView 的 DPR 在 tao 建窗口时就定死了、
@@ -118,7 +129,8 @@ html[data-mode="box"] #root {
   /* 80 高要装下「图标 46 + 一行名字」：内容 65.6 上下居中，余量约 7.2 */
   padding: 3px 4px;
   border-radius: 18px;
-  background: var(--tile-bg);
+  /* 没有底板：底下就是壁纸（胶囊在 .box-tile.bar 里单独给底色） */
+  background: transparent;
   border: none;
   box-shadow: none;
   display: flex;
@@ -135,11 +147,24 @@ html[data-mode="box"] #root {
   z-index: 1;
 }
 
-/* 悬停 / 拖动 / 拖入：比底色稍亮或稍暗一点（`--tile-hover-bg` 按背景明暗自动算） */
+/* 任务栏胶囊：舞台整块铺底色当兜底。
+ *
+ * 胶囊是 `Shell_TrayWnd` 的子窗口、没有逐像素 alpha，页面透明之后，
+ * 「窗口区域的圆角」和「CSS 的圆角」只要差 1 像素，四角就会露出白点。
+ * 舞台是直角铺满的，再让窗口区域把它裁成圆角 —— 干净圆角、零露白。 */
+.box-stage.bar {
+  background: var(--tile-bg);
+}
+
+/* 悬停 / 拖动 / 拖入：一层淡蓝蒙版。
+ *
+ * 没有底板了，不能再用 `--tile-hover-bg`（那是实色，一加就又成方块）；
+ * 也不能用纯白 —— 浅色壁纸上根本看不出来。淡蓝在明暗壁纸上都能分辨，
+ * 而且「蓝色 = 可交互」是桌面图标的通用语感。 */
 .box-tile:hover,
 .box-tile.dragging,
 .box-tile.drop {
-  background: var(--tile-hover-bg);
+  background: rgba(120, 165, 255, 0.22);
 }
 
 /* 名字颜色跟背景走（`--tile-text` 由 theme.ts 按对比度算），不用再区分悬停态 */
@@ -161,13 +186,23 @@ html[data-mode="box"] #root {
 }
 
 /* 嵌进任务栏的盒子：横向胶囊（高 = 任务栏厚度，约 40px）。
-   左边是盒子图标，右边两个汉字（名字的前两个字），像任务栏上的一个小按钮。 */
+   左边是盒子图标，右边两个汉字（名字的前两个字），像任务栏上的一个小按钮。
+   **底板留在这里**：胶囊是 Shell_TrayWnd 的子窗口，没有逐像素 alpha，
+   页面透明会让任务栏的背景从圆角外露出来（变白块），所以必须自己画实色底。 */
 .box-tile.bar {
   flex-direction: row;
   justify-content: flex-start;
   gap: 1px;
   padding: 0 2px 0 0;
   border-radius: 8px;
+  background: var(--tile-bg);
+}
+
+/* 胶囊保留原来的「比底色稍亮/稍暗」悬停，不用那层淡蓝蒙版 */
+.box-tile.bar:hover,
+.box-tile.bar.dragging,
+.box-tile.bar.drop {
+  background: var(--tile-hover-bg);
 }
 
 .box-tile.bar .box-name {
@@ -260,15 +295,48 @@ html[data-mode="box"] #root {
   /* 盒子 80 宽、左右各留 4 → 一行最多 72px；字号固定 12px 不随盒子缩放 */
   max-width: 72px;
   font-size: 12px;
-  /* 中文名用微软雅黑，字形比 Segoe UI 更「方正」，小字号下也清楚 */
-  font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  /* 中文名用「Microsoft YaHei UI」：这是系统界面（含 Win10 桌面图标标签）在用的那个
+   * 变体，和普通「Microsoft YaHei」同一套字形，但字间距和度量按 UI 场景调过，
+   * 同字号下笔画观感更轻、更接近系统原生的那行字。 */
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+  /* 常规字重，不加粗 —— Win10 桌面图标就是 Regular。 */
+  font-weight: 400;
   line-height: 1.22;
-  /* 有实色底板了：字色跟背景明暗走（theme.ts 算好的 --tile-text） */
-  color: var(--tile-text);
+  /* 没有底板了，名字直接压在壁纸上 → 照抄桌面图标的画法：
+   * **深底白字 + 黑阴影 / 浅底黑字 + 白阴影**（浅色那套见下面的 `.label-dark`）。
+   *
+   * 这个「反差色阴影」不是拍脑袋定的，是量 Win10 桌面图标量出来的
+   * （tools/probe_icon_label.py）：深底白字周围存在**纯黑**像素（背景 107，
+   * 抗锯齿不可能降到 0）；浅底黑字周围存在**纯白**像素（背景 220，不可能升到 255）。
+   *
+   * 三条硬规则（都是量像素量出来的）：
+   *  1. 阴影必须**整块让开**字形（往下 1px）。`0 0 Npx` 那种零偏移模糊会把笔画
+   *     相邻的像素一起压暗，12px 的中文看过去就是一整片灰。
+   *  2. **不加描边**。Chromium 的 `text-stroke` 是居中画在字形轮廓上的，等于给每笔
+   *     套一圈皮 —— 12px 中文笔画本来只有 1 个多像素宽，一描就成了「粗体」。
+   *     深色描边会把白字掺灰（实测平均亮度只有 182、纯白像素不到 16%），
+   *     换成同色描边则是把字撑粗，两条路都不对。所以这里直接不用描边，
+   *     可读性交给下面那层 1px 反差阴影 —— Win10 桌面图标本身也没有描边。
+   *  3. 不加 `-webkit-font-smoothing` 之类的把戏，Windows 上没这玩意。 */
+  color: #fff;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.9);
   text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 浅色壁纸：名字改成深色字 + **白色**阴影 —— 和桌面图标完全同构
+ * （亮度由后端 `label.rs` 采样盒子四周的屏幕像素后传上来，见 BoxView 里的轮询）。
+ *
+ * 为什么不能靠「把黑描边加粗」硬扛：12px 的中文，笔画间隙只有 1~2 像素，
+ * 白字 + 深描边 + 模糊阴影在白底上就是一团灰 ——
+ * 用户实测白色壁纸下「冷宫」两个字看不清，就是这个原因。
+ * 深色字把角色对调：字是深的、阴影是浅的，白底上干净，
+ * 浅灰 / 浅色照片上靠这圈白光也能压出层次（Windows 也是这么干的）。 */
+.box-tile.label-dark .box-name {
+  color: #000;
+  text-shadow: 0 1px 1px rgba(255, 255, 255, 0.95);
 }
 
 /* 盒子改名：复用「右键菜单」窗口，缩成 80×22 盖在名字那一行上。

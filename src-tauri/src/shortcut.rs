@@ -357,3 +357,95 @@ fn shell_exec(file: &str, args: &str, workdir: Option<&str>) -> bool {
         r as isize > 32
     }
 }
+
+// ---------------- 图标右键菜单里的两项系统功能 ----------------
+//
+// 这两个都刻意「借系统的实现」，不自己造轮子：
+// 用户在资源管理器里右键看到的是什么效果，这里就该是什么效果。
+
+/// 「打开文件所在位置」：在资源管理器里定位这个文件并选中它。
+///
+/// `.lnk` 要跳到它**指向的程序**所在目录（和系统右键那个菜单项的语义一致）。
+/// 解析不出来、或者目标已经被卸载，就退回打开快捷方式自己所在的文件夹
+/// （也就是 `boxes\{盒子id}\`），至少让用户能看到文件本体。
+pub fn reveal(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err("文件已不存在".into());
+    }
+
+    let mut target = path.to_string();
+    if let Some(sc) = resolve_lnk(p) {
+        if !sc.target.is_empty() && Path::new(&sc.target).exists() {
+            target = sc.target;
+        }
+    }
+
+    unsafe {
+        let hr = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let uninit = hr >= 0;
+
+        let mut pidl: *mut c_void = std::ptr::null_mut();
+        let w = wide(&target);
+        let parsed = SHParseDisplayName(
+            w.as_ptr(),
+            std::ptr::null_mut(),
+            &mut pidl,
+            0,
+            std::ptr::null_mut(),
+        ) == S_OK
+            && !pidl.is_null();
+
+        let mut ok = false;
+        if parsed {
+            // cidl = 0：pidl 是绝对 PIDL，shell 自己找父文件夹打开并高亮这一项
+            ok = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0) == S_OK;
+            CoTaskMemFree(pidl);
+        }
+        if uninit {
+            CoUninitialize();
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err("打开所在位置失败".into())
+        }
+    }
+}
+
+/// 「属性」：弹出和系统右键完全一致的属性对话框。
+///
+/// 这个对话框是**模态**的，`ShellExecuteExW` 会一直阻塞到用户把它关掉才返回，
+/// 所以这里必须丢到独立线程 —— 直接在命令线程上调会把整个程序的 UI 冻住。
+/// `owner` 传面板窗口句柄，否则对话框可能被盒子窗口压在后面。
+pub fn properties(path: &str, owner: HWND) -> Result<(), String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err("文件已不存在".into());
+    }
+    let file = path.to_string();
+    std::thread::spawn(move || unsafe {
+        let hr = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+        let uninit = hr >= 0;
+
+        let verb = wide("properties");
+        let f = wide(&file);
+        let mut sei = SHELLEXECUTEINFOW::default();
+        sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        // INVOKEIDLIST = 让 shell 调 .lnk 的属性页处理程序；
+        // NOASYNC = 整个操作在本次调用内走完，不指望调用线程之后还泵消息
+        sei.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC;
+        sei.hwnd = owner;
+        sei.lpVerb = verb.as_ptr();
+        sei.lpFile = f.as_ptr();
+        sei.nShow = SW_SHOWNORMAL as i32;
+
+        if ShellExecuteExW(&mut sei) == 0 {
+            eprintln!("打开属性失败（错误码 {}）", GetLastError());
+        }
+        if uninit {
+            CoUninitialize();
+        }
+    });
+    Ok(())
+}

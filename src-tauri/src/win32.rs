@@ -14,6 +14,10 @@ pub const GWL_EXSTYLE: i32 = -20;
 /// 对**顶层**窗口来说这个索引设的是「owner」（被拥有的窗口永远压在 owner 之上），
 /// 对子窗口才是 parent。Win11 的贴条靠它常驻任务栏之上（见 desktop::pin_to_taskbar）。
 pub const GWLP_HWNDPARENT: i32 = -8;
+/// 子类化时替换窗口过程用
+pub const GWLP_WNDPROC: i32 = -4;
+/// 计算非客户区大小。wParam != 0 时直接返回 0 = 「客户区就是整个窗口矩形」
+pub const WM_NCCALCSIZE: u32 = 0x0083;
 /// GetWindow 的 uCmd：取 owner 窗口
 pub const GW_OWNER: u32 = 4;
 
@@ -123,6 +127,39 @@ impl Default for SHFILEINFOW {
     }
 }
 
+/// `ShellExecuteExW` 的参数结构（64 位下 112 字节）。
+///
+/// 存在的理由只有一条：**「属性」对话框必须走它**。
+/// `ShellExecuteW` 没有 `lpVerb="properties"` 这条路径，拿不到
+/// 「快捷方式 / 兼容性 / 详细信息」那几页，只能看到普通文件属性。
+///
+/// `hIcon` / `hProcess` 在头文件里是 union，这里按句柄宽度摆 flat 字段即可
+/// —— 我们只用 `lpVerb` / `lpFile` / `fMask` / `hwnd` 四个，其余保持 0。
+#[repr(C)]
+pub struct SHELLEXECUTEINFOW {
+    pub cbSize: u32,
+    pub fMask: u32,
+    pub hwnd: HWND,
+    pub lpVerb: *const u16,
+    pub lpFile: *const u16,
+    pub lpParameters: *const u16,
+    pub lpDirectory: *const u16,
+    pub nShow: i32,
+    pub hInstApp: isize,
+    pub lpIDList: *mut c_void,
+    pub lpClass: *const u16,
+    pub hkeyClass: HKEY,
+    pub dwHotKey: u32,
+    pub hIcon: isize,
+    pub hProcess: isize,
+}
+
+impl Default for SHELLEXECUTEINFOW {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 // FOLDERID_Desktop = {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
 pub const FOLDERID_DESKTOP: GUID = GUID {
     data1: 0xB4BF_CC3A,
@@ -166,6 +203,15 @@ extern "system" {
     ) -> i32;
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
+    /// 子类化窗口过程之后，把消息转给被换下来的原过程
+    pub fn CallWindowProcW(
+        lpPrevWndFunc: isize,
+        hWnd: HWND,
+        Msg: u32,
+        wParam: usize,
+        lParam: isize,
+    ) -> isize;
+    pub fn DefWindowProcW(hWnd: HWND, Msg: u32, wParam: usize, lParam: isize) -> isize;
     /// 把窗口裁成任意形状：成功后 rgn 归系统所有，不要自己 DeleteObject
     pub fn SetWindowRgn(hWnd: HWND, hRgn: isize, bRedraw: i32) -> i32;
     /// 读窗口当前的裁剪区域（会**拷贝**进 hRgn，这个副本用完要 DeleteObject）
@@ -671,6 +717,19 @@ extern "system" {
         dwItem1: *const c_void,
         dwItem2: *const c_void,
     );
+    /// 打开某个 shell 项所在的文件夹并选中它。
+    ///
+    /// 资源管理器右键「打开文件所在位置」内部走的就是它：不新起 explorer 进程、
+    /// 优先复用已经开着的窗口，所以不会闪任务栏黑框。
+    /// `cidl = 0` 时 `pidlFolder` 当成绝对 PIDL 用，函数自己找父文件夹。
+    pub fn SHOpenFolderAndSelectItems(
+        pidlFolder: *const c_void,
+        cidl: u32,
+        apidl: *const *const c_void,
+        dwFlags: u32,
+    ) -> i32;
+    /// 带 verb 的执行入口（`properties` 只能从这里进）
+    pub fn ShellExecuteExW(psei: *mut SHELLEXECUTEINFOW) -> i32;
 }
 
 pub const SHCNE_CREATE: i32 = 0x0000_0001;
@@ -678,6 +737,14 @@ pub const SHCNE_DELETE: i32 = 0x0000_0002;
 /// 整个目录内容变了（比逐条 DELETE 更强，Explorer 会重新枚举该目录）
 pub const SHCNE_UPDATEDIR: i32 = 0x0000_1000;
 pub const SHCNF_PATHW: u32 = 0x0005;
+
+/// 通过 shell 的 IDList 通道调用 verb。
+/// 不加这个，`lpVerb = "properties"` 只会落到「文件属性」的兜底实现上，
+/// `.lnk` 就拿不到「快捷方式 / 兼容性」那几页。
+pub const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
+/// 整个执行过程在本次调用内完成，不依赖调用线程之后还泵消息。
+/// 属性对话框会在里面一直阻塞到用户关掉 —— 调用方必须放在独立线程。
+pub const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
 
 #[link(name = "ole32")]
 extern "system" {

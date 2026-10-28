@@ -5,6 +5,7 @@ mod glass;
 mod http;
 mod iconpick;
 mod icons;
+mod label;
 mod pick;
 mod shortcut;
 mod store;
@@ -596,7 +597,7 @@ fn spawn_box_window(
     } else {
         (BOX_W, BOX_W)
     };
-    let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("LightBox")
         .inner_size(logical_w, logical_h)
         .decorations(false)
@@ -607,9 +608,23 @@ fn spawn_box_window(
         .minimizable(false)
         .skip_taskbar(true)
         .always_on_top(is_floating(b))
-        .visible(false)
-        .build()
-        .map_err(|e| e.to_string())?;
+        .visible(false);
+    // 桌面盒子真透明必须走 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition。
+    //
+    // 默认的 `transparent(true)` 在 tao 里是 `DwmEnableBlurBehindWindow(空区域)`
+    // （tao-0.37.1 window.rs:1204-1216）：DWM 会把这个窗口当成「玻璃窗」，
+    // 于是**重新接管非客户区绘制**，在窗口顶部画一条约 20px 的标题栏
+    // （浅灰底 + 窗口标题），页面背景一透明它就露出来了。
+    // 这也是为什么 ExtendFrameIntoClientArea(0)、NCRENDERING_POLICY、
+    // WM_NCCALCSIZE 全部无效 —— 它们都没碰 blur-behind 这条路。
+    //
+    // 带上这个标志后，tao 会跳过整个 blur-behind 分支，窗口没有重定向表面，
+    // 由 WebView2 的 DComp 直接合成，alpha=0 的像素真正透出壁纸，且没有标题栏。
+    // 只对桌面盒子用；任务栏胶囊是 Shell_TrayWnd 的子窗口，本来就没有非客户区。
+    if !b.in_bar {
+        builder = builder.no_redirection_bitmap(true);
+    }
+    let win = builder.build().map_err(|e| e.to_string())?;
 
     let hwnd = hwnd_of(&win);
     if b.in_bar {
@@ -622,8 +637,20 @@ fn spawn_box_window(
     } else {
         // 浮起来的盒子（手动置顶 / 压在任务栏上）是**顶层窗口**，不进桌面层 ——
         // 进了桌面层就会被任务栏盖住，压在任务栏上也看不见。
-        if !is_floating(b) {
-            desktop::pin_to_desktop(hwnd);
+        if !is_floating(b) && !desktop::pin_to_desktop(hwnd) {
+            // Progman 这会儿拿不到（Explorer 正在重启）。盒子此刻是个普通顶层窗口，
+            // 会浮在所有窗口之上 —— 先沉到最底藏起来，守护线程拿到 owner 后会把它提回来。
+            unsafe {
+                win32::SetWindowPos(
+                    hwnd,
+                    win32::HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_NOACTIVATE,
+                );
+            }
         }
         // 先规范一次（去掉标题栏/边框、定尺寸、裁圆角）
         desktop::strip_chrome(hwnd, b.x, b.y, BOX_W as i32, BOX_W as i32, BOX_RADIUS, false);
@@ -671,7 +698,7 @@ fn reinforce_region(hwnd: isize) {
         return;
     }
     std::thread::spawn(move || {
-        for delay in [260u64, 340u64] {
+        for delay in [60u64, 260u64, 340u64] {
             std::thread::sleep(std::time::Duration::from_millis(delay));
             if unsafe { win32::IsWindow(hwnd) } == 0 {
                 return;
@@ -1354,6 +1381,31 @@ async fn import_paths(app: AppHandle, id: String, paths: Vec<String>) -> ImportR
 #[tauri::command]
 async fn open_item(path: String) -> Result<(), String> {
     shortcut::open(&path)
+}
+
+/// 在资源管理器里定位这个图标并选中（面板右键「打开文件所在位置」）。
+///
+/// `.lnk` 跳它指向的程序所在目录，目标已卸载就退回盒子目录。
+/// 解析 PIDL / 打开文件夹都会碰磁盘，扔进阻塞线程池，别占 runtime 的异步线程。
+#[tauri::command]
+async fn reveal_item(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || shortcut::reveal(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 弹出系统的「属性」对话框（面板右键「属性」）。
+///
+/// 属性框是模态的、内部会阻塞到用户关掉，所以 shortcut::properties 里已经
+/// 丢到独立线程，这个命令立刻就能返回，不会冻住界面。
+#[tauri::command]
+async fn item_properties(app: AppHandle, path: String) -> Result<(), String> {
+    // owner 用面板窗口：不传 owner 的话属性框可能被盒子窗口压在后面
+    let owner = app
+        .get_webview_window("panel")
+        .map(|w| hwnd_of(&w))
+        .unwrap_or(0);
+    shortcut::properties(&path, owner)
 }
 
 #[tauri::command]
@@ -2128,7 +2180,7 @@ async fn snap_bar(
         };
         // 团成员：整团一起退回桌面（不能只把这一个拿出来，那样整团会散架）
         if grouped {
-            group_switch_mode(&app, &id, false, cx, cy);
+            group_switch_mode(&app, &id, false, cx, cy, false);
         } else {
             unembed_at(&app, id.clone(), cx, cy);
         }
@@ -2187,6 +2239,18 @@ fn box_scale(app: AppHandle, id: String) -> Result<f64, String> {
     let bw = box_window(&app, &id).ok_or("盒子窗口不存在")?;
     let r = rect_of(&bw).ok_or("读不到盒子位置")?;
     Ok(desktop::scale_at(r.x + r.w / 2, r.y + r.h / 2))
+}
+
+/// 盒子附近壁纸的亮度（0.0 纯黑 ~ 1.0 纯白），名字据此决定用白字还是深色字。
+///
+/// 没有底板之后，白字 + 深色描边在浅色壁纸上会糊成一团（用户实测白色壁纸下
+/// 盒子名看不清），桌面图标是同一套问题的官方解法：字色跟着壁纸亮度走。
+/// 判断放在前端（带滞回，避免亮度在阈值附近时来回跳），后端只负责报亮度。
+#[tauri::command]
+fn label_luma(app: AppHandle, id: String) -> Option<f64> {
+    let bw = box_window(&app, &id)?;
+    let r = rect_of(&bw)?;
+    label::bg_luma(&r)
 }
 
 /// 等窗口真正从 Tauri 的窗口表里消失（destroy 是投递到主线程执行的）
@@ -2328,7 +2392,7 @@ async fn set_box_in_bar(
             let Some(r) = r else {
                 return Err("盒子不存在".into());
             };
-            group_switch_mode(&app, &id, on, r.x + r.w / 2, r.y + r.h / 2);
+            group_switch_mode(&app, &id, on, r.x + r.w / 2, r.y + r.h / 2, on);
             return Ok(());
         }
     }
@@ -2346,13 +2410,16 @@ async fn set_box_in_bar(
         if on {
             let bar = taskbar_rect()
                 .ok_or("检测不到任务栏（需要任务栏在屏幕底部、未自动隐藏）")?;
-            // 横向尽量留在原位（用户看着哪个位置就嵌到哪个位置），越界就夹回来；
-            // 压到已有胶囊就挪到离它最近的空位，绝不覆盖别人
+            // 排到现有胶囊队列的末尾（队尾放不下就排队首），**不按盒子在桌面上的
+            // 水平位置落位** —— 那样会正好压住盒子正下方的任务栏按钮（用户反馈）。
+            // 也绝不越过托盘左沿，托盘图标 / 时钟不能被盖住。见 `bar_append_x`。
             let size = (BOX_W * desktop::scale_at(b.x + BOX_W as i32 / 2, b.y + BOX_W as i32 / 2))
                 .round() as i32;
             let (want_w, _) = bar_box_size();
             let snap = (SNAP_DIST * desktop::scale_at(b.x + size / 2, bar.y + bar.h / 2)).round() as i32;
-            let x = bar_free_x(bar, want_w, b.x + size / 2 - want_w / 2, &others, snap);
+            let x = bar_append_x(bar, want_w, want_w, &others).unwrap_or_else(|| {
+                bar_free_x(bar, want_w, b.x + size / 2 - want_w / 2, &others, snap)
+            });
             b.x = x;
             b.y = bar.y;
             b.in_bar = true;
@@ -2495,6 +2562,54 @@ fn bar_free_x(bar: Rect, want_w: i32, nx0: i32, others: &[i32], snap: i32) -> i3
     }
     // ④ 整条任务栏都塞满了（极罕见）：只能原地放着，总比飞到别处强
     best.map(|(_, x)| x).unwrap_or(target)
+}
+
+/// 「嵌入任务栏」这个**动作**该把胶囊插到哪：排到现有胶囊队列的末尾。
+///
+/// 用户反馈：以前按盒子在桌面上的水平位置落位，盒子在哪儿，胶囊就落在它正下方的
+/// 任务栏坐标上 —— 那一片往往是任务按钮的位置，等于把正在用的程序按钮盖住了。
+///
+/// 规则（用户给定）：
+///  1. 优先贴到**队尾** —— 现有胶囊里最靠右那个的右边，紧挨着排；
+///  2. 队尾放不下（越过托盘左边界）就贴到**队首** —— 最靠左那个的左边；
+///  3. 一个胶囊都没有时，直接贴到任务栏右端（托盘左边），也就是「队尾」该在的地方；
+///  4. 两头都放不下才退回 `bar_free_x` 的「找最近空位」，绝不重叠。
+///
+/// 右边界一律取 `TrayNotifyWnd` 的左沿：托盘图标、输入法、时钟、显示桌面按钮
+/// 全在那一块里，压上去就是遮住它们。留 4px 缝隙，和任务栏自己的按钮间距对得上。
+///
+/// `span_w` 是整排的宽度（单个胶囊 = `unit_w`；整团 = `unit_w × 成员数`），
+/// `others` 是**队外**胶囊的横坐标（同宽同高，只看 x）。
+///
+/// 返回 `None` = 队尾、队首都被占满（极罕见），调用方自己去「找最近空位」兜底。
+fn bar_append_x(bar: Rect, span_w: i32, unit_w: i32, others: &[i32]) -> Option<i32> {
+    let lo = bar.x;
+    let right_limit = desktop::taskbar_tray_left().unwrap_or(bar.right()) - 4;
+    // 「最右的合法起点」：再往右就压到托盘了
+    let max_start = (right_limit - span_w).max(lo);
+
+    let mut sorted: Vec<i32> = others.to_vec();
+    sorted.sort_unstable();
+
+    // ① 队尾：紧贴最右那个胶囊
+    if let Some(&max_x) = sorted.last() {
+        let x = max_x + unit_w;
+        if x >= lo && x <= max_start {
+            return Some(x);
+        }
+    }
+    // ② 队首：整排塞进最左那个胶囊的左边
+    if let Some(&min_x) = sorted.first() {
+        let x = min_x - span_w;
+        if x >= lo {
+            return Some(x);
+        }
+    }
+    // ③ 一个胶囊都没有：直接贴右端（就是「队尾」该在的位置）
+    if sorted.is_empty() {
+        return Some(max_start);
+    }
+    None
 }
 
 /// 桌面盒子的「找空位」：盒子落到别人**身上**时，推去离它最近的、不压任何人的位置。
@@ -2941,9 +3056,20 @@ fn bar_free_span(bar: Rect, unit_w: i32, n: i32, nx0: i32, others: &[i32]) -> i3
 /// `anchor` 是被用户拖动的那个盒子，`cx/cy` 是落点（屏幕坐标，物理像素）：
 /// 它落到光标处，其余成员按原来的左右顺序紧挨着排在它旁边。
 ///
+/// `append` = 这次切换是**菜单「嵌入任务栏」触发的**，不是拖过去的：位置不再
+/// 由落点决定，而是整排排到现有胶囊的队尾（见 `bar_append_x`）。两条路的区别在
+/// 用户意图上 —— 拖过去是「我要它待在这儿」，点菜单是「收进任务栏去」。
+///
 /// 只能在**松手之后**调：一次要重建 N 个窗口（每个几百毫秒），手还按着的时候做
 /// 这件事既慢又容易和系统拖动循环互锁。
-fn group_switch_mode(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i32) {
+fn group_switch_mode(
+    app: &AppHandle,
+    anchor: &str,
+    to_bar: bool,
+    cx: i32,
+    cy: i32,
+    append: bool,
+) {
     // 同一个团同一时刻只允许一次切换。
     //
     // 一次「拖出去松手」会被两处同时看到：`snap_bar` 的松手分支，以及被打上
@@ -2969,7 +3095,7 @@ fn group_switch_mode(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i
     let app = app.clone();
     let anchor = anchor.to_string();
     std::thread::spawn(move || {
-        do_group_switch(&app, &anchor, to_bar, cx, cy);
+        do_group_switch(&app, &anchor, to_bar, cx, cy, append);
         GROUP_SWITCHING.lock().unwrap().retain(|g| g != &gid);
     });
 }
@@ -3043,7 +3169,14 @@ fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) {
     }
 }
 
-fn do_group_switch(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i32) {
+fn do_group_switch(
+    app: &AppHandle,
+    anchor: &str,
+    to_bar: bool,
+    cx: i32,
+    cy: i32,
+    append: bool,
+) {
     let Some(_guard) = lock_relay(8000) else { return };
     let st = app.state::<State>();
     // 拖动留下的偏移会话到此为止：坐标要整体重排，旧偏移没有意义
@@ -3095,9 +3228,17 @@ fn do_group_switch(app: &AppHandle, anchor: &str, to_bar: bool, cx: i32, cy: i32
             let bar = bar.unwrap();
             let (unit_w, _) = bar_box_size();
             let n = order.len() as i32;
-            // 锚点在整排里的位置决定整排起点：它中心对着光标
-            let want = cx - unit_w * (ai as i32) - unit_w / 2;
-            (bar_free_span(bar, unit_w, n, want, &taken), bar.y, unit_w)
+            let span = unit_w * n;
+            let x = if append {
+                // 菜单嵌入：整排排到队尾（放不下就队首），不理会落点
+                bar_append_x(bar, span, unit_w, &taken)
+                    .unwrap_or_else(|| bar_free_span(bar, unit_w, n, bar.right(), &taken))
+            } else {
+                // 拖进任务栏：锚点中心对着光标，队友按原顺序排在两边
+                let want = cx - unit_w * (ai as i32) - unit_w / 2;
+                bar_free_span(bar, unit_w, n, want, &taken)
+            };
+            (x, bar.y, unit_w)
         } else {
             // 桌面盒之间是无缝贴紧（SNAP_GAP = 0），整排夹进工作区
             let n = order.len() as i32;
@@ -3400,7 +3541,7 @@ fn embed_after_snap(app: &AppHandle, id: String) {
         if grouped {
             if let Some((bx, by, size)) = anchor {
                 if on_taskbar(bx, by, size) {
-                    group_switch_mode(&app, &id, true, bx + size / 2, by + size / 2);
+                    group_switch_mode(&app, &id, true, bx + size / 2, by + size / 2, false);
                 }
             }
             return;
@@ -3850,7 +3991,7 @@ async fn bar_hover(
         }
         // 形态这次就变完了，松手时别再让 `snap_bar` 拿「逃逸」再切一遍
         DRAG_ESCAPED.lock().unwrap().retain(|x| x != &id);
-        group_switch_mode(&app, &id, !in_bar, cx, cy);
+        group_switch_mode(&app, &id, !in_bar, cx, cy, false);
         return Ok(Some(if in_bar { "unembed" } else { "embed" }.into()));
     }
     // 拖动时的真实矩形（配置里的坐标在拖动途中是旧的）
@@ -5144,6 +5285,8 @@ pub fn run() {
             reorder_items,
             import_paths,
             open_item,
+            reveal_item,
+            item_properties,
             restore_item,
             remove_item,
             restore_items,
@@ -5158,6 +5301,7 @@ pub fn run() {
             snap_bar,
             bar_hover,
             box_scale,
+            label_luma,
             set_box_topmost,
             set_box_in_bar,
             open_panel,

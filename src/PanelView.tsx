@@ -921,7 +921,17 @@ export default function PanelView() {
             style={{
               width: MENU_W,
               left: Math.min(menu.x, 432 - MENU_W - 8),
-              top: Math.min(menu.y, 480 - (menu.kind === "header" ? 110 : 130)),
+              // 高度要按实际项数估：单选比多选多「打开文件所在位置 / 属性」两项
+              // 和两条分隔线，沿用旧的 130 会把最下面几项裁在窗口外。
+              top: Math.min(
+                menu.y,
+                480 -
+                  (menu.kind === "header"
+                    ? 110
+                    : menu.files.length === 1
+                      ? 190
+                      : 110),
+              ),
             }}
           >
             {menu.kind === "header" ? (
@@ -963,6 +973,26 @@ export default function PanelView() {
                 >
                   {menu.files.length > 1 ? `打开全部（${menu.files.length}）` : "打开"}
                 </div>
+                {/* 系统的「打开文件所在位置」：.lnk 会跳到它指向的程序所在目录。
+                    只对单个图标有意义（多选时没有「哪一个」的概念）。 */}
+                {menu.files.length === 1 && (
+                  <div
+                    className="ctx-item"
+                    onClick={async () => {
+                      const it = items.find((x) => x.file === menu.files[0]);
+                      setMenu(null);
+                      if (!it) return;
+                      try {
+                        await api.reveal(it.path);
+                      } catch (e) {
+                        showToast(String(e));
+                      }
+                    }}
+                  >
+                    打开文件所在位置
+                  </div>
+                )}
+                <div className="ctx-sep" />
                 <div
                   className="ctx-item"
                   onClick={async () => {
@@ -995,6 +1025,28 @@ export default function PanelView() {
                 >
                   {menu.files.length > 1 ? `从盒子移除（${menu.files.length}）` : "从盒子移除"}
                 </div>
+                {/* 系统的「属性」：走 ShellExecuteEx 的 properties verb，
+                    弹出来和资源管理器右键完全一致（快捷方式 / 兼容性 / 详细信息）。 */}
+                {menu.files.length === 1 && (
+                  <>
+                    <div className="ctx-sep" />
+                    <div
+                      className="ctx-item"
+                      onClick={async () => {
+                        const it = items.find((x) => x.file === menu.files[0]);
+                        setMenu(null);
+                        if (!it) return;
+                        try {
+                          await api.properties(it.path);
+                        } catch (e) {
+                          showToast(String(e));
+                        }
+                      }}
+                    >
+                      属性
+                    </div>
+                  </>
+                )}
               </>
             )}
           </div>
