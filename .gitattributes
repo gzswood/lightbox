@@ -6,6 +6,10 @@
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
 
+# Shell 脚本必须保持 LF：Windows 上 core.autocrlf=true 时，
+# 检出的 .sh 若带 CRLF，Git Bash 会报 $'\r': command not found（别人 clone 下来直接跑不了）
+*.sh text eol=lf
+
 # 二进制文件不做任何转换
 *.png binary
 *.jpg binary
