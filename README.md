@@ -12,9 +12,16 @@
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
-[下载最新版](https://gitee.com/gathon/lightbox/releases) · [功能](#功能) · [使用](#使用) · [构建](#构建) · [常见问题](#常见问题) · [更新记录](docs/version_list.md)
+[下载最新版](https://gitee.com/gathon/lightbox/releases) · [功能](#功能) · [使用](#使用) · [构建](#构建) · [常见问题](#常见问题) · [更新记录](docs/version_list.md) · [GitHub 镜像](https://github.com/gzswood/lightbox)
 
 </div>
+
+***
+
+> **下载与自动更新都以 Gitee 为准。** 代码同时镜像在
+> [GitHub](https://github.com/gzswood/lightbox)，但安装包只发布在 Gitee ——
+> exe 里的检查更新地址是编译期写死的（`src-tauri/update-url.txt`），
+> 存量的旧版本全部指向 Gitee，换地址会让它们永久检查不到更新。
 
 ***
 
@@ -155,7 +162,8 @@ LightBox 解决一个很小但很麻烦的问题：桌面图标越堆越多，�
 要求：Windows 10/11 x64、**Node 18+**、**Rust 1.77+（MSVC 工具链）**、WebView2 运行时。
 
 ```bash
-git clone https://gitee.com/gathon/lightbox.git
+git clone https://gitee.com/gathon/lightbox.git          # 国内访问更快
+# 镜像：git clone https://github.com/gzswood/lightbox.git
 cd lightbox
 
 npm install
@@ -331,7 +339,8 @@ Copyright (C) 2026 Gathon
 
 ## 更多
 
-- 仓库：<https://gitee.com/gathon/lightbox>
+- 仓库（主）：<https://gitee.com/gathon/lightbox>
+- 代码镜像：<https://github.com/gzswood/lightbox>（只托管代码，不发布安装包）
 - 版本下载：<https://gitee.com/gathon/lightbox/releases>
 - 问题反馈：<https://gitee.com/gathon/lightbox/issues>
 - 更新记录：[docs/version_list.md](docs/version_list.md)

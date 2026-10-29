@@ -130,3 +130,10 @@ echo "  发行版页面 : https://gitee.com/$OWNER/$REPO/releases/tag/$TAG"
 echo "  直链       : $URL"
 echo
 echo "（可选）把直链填进 update-site/version.json 的 download 字段，或直接改站点首页按钮"
+
+# 5) 代码镜像：配了 github remote 就顺手同步一份（GitHub 只是代码托管，发版仍在 Gitee）
+if git remote get-url github >/dev/null 2>&1; then
+    echo
+    echo "· 同步代码镜像到 GitHub…"
+    ./tools/push-github.sh || echo "⚠ GitHub 镜像同步失败（不影响 Gitee 发版，可稍后单独跑 tools/push-github.sh）"
+fi
