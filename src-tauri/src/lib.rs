@@ -5,7 +5,6 @@ mod glass;
 mod http;
 mod iconpick;
 mod icons;
-mod label;
 mod pick;
 mod shortcut;
 mod store;
@@ -597,7 +596,7 @@ fn spawn_box_window(
     } else {
         (BOX_W, BOX_W)
     };
-    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+    let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("LightBox")
         .inner_size(logical_w, logical_h)
         .decorations(false)
@@ -608,23 +607,9 @@ fn spawn_box_window(
         .minimizable(false)
         .skip_taskbar(true)
         .always_on_top(is_floating(b))
-        .visible(false);
-    // 桌面盒子真透明必须走 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition。
-    //
-    // 默认的 `transparent(true)` 在 tao 里是 `DwmEnableBlurBehindWindow(空区域)`
-    // （tao-0.37.1 window.rs:1204-1216）：DWM 会把这个窗口当成「玻璃窗」，
-    // 于是**重新接管非客户区绘制**，在窗口顶部画一条约 20px 的标题栏
-    // （浅灰底 + 窗口标题），页面背景一透明它就露出来了。
-    // 这也是为什么 ExtendFrameIntoClientArea(0)、NCRENDERING_POLICY、
-    // WM_NCCALCSIZE 全部无效 —— 它们都没碰 blur-behind 这条路。
-    //
-    // 带上这个标志后，tao 会跳过整个 blur-behind 分支，窗口没有重定向表面，
-    // 由 WebView2 的 DComp 直接合成，alpha=0 的像素真正透出壁纸，且没有标题栏。
-    // 只对桌面盒子用；任务栏胶囊是 Shell_TrayWnd 的子窗口，本来就没有非客户区。
-    if !b.in_bar {
-        builder = builder.no_redirection_bitmap(true);
-    }
-    let win = builder.build().map_err(|e| e.to_string())?;
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())?;
 
     let hwnd = hwnd_of(&win);
     if b.in_bar {
@@ -637,20 +622,8 @@ fn spawn_box_window(
     } else {
         // 浮起来的盒子（手动置顶 / 压在任务栏上）是**顶层窗口**，不进桌面层 ——
         // 进了桌面层就会被任务栏盖住，压在任务栏上也看不见。
-        if !is_floating(b) && !desktop::pin_to_desktop(hwnd) {
-            // Progman 这会儿拿不到（Explorer 正在重启）。盒子此刻是个普通顶层窗口，
-            // 会浮在所有窗口之上 —— 先沉到最底藏起来，守护线程拿到 owner 后会把它提回来。
-            unsafe {
-                win32::SetWindowPos(
-                    hwnd,
-                    win32::HWND_BOTTOM,
-                    0,
-                    0,
-                    0,
-                    0,
-                    win32::SWP_NOMOVE | win32::SWP_NOSIZE | win32::SWP_NOACTIVATE,
-                );
-            }
+        if !is_floating(b) {
+            desktop::pin_to_desktop(hwnd);
         }
         // 先规范一次（去掉标题栏/边框、定尺寸、裁圆角）
         desktop::strip_chrome(hwnd, b.x, b.y, BOX_W as i32, BOX_W as i32, BOX_RADIUS, false);
@@ -1114,6 +1087,8 @@ fn build_tray(app: &AppHandle) -> Result<(), String> {
                     // 先删托盘图标再退出：否则 Explorer 会留一个幽灵图标，
                     // 要等鼠标晃过才回收（RunEvent::Exit 里还会再兜一次）
                     destroy_tray();
+                    // 先销毁窗口再退出，让 WebView2 干净注销（见 shutdown_cleanup）
+                    shutdown_cleanup(&app);
                     app.exit(0);
                 }
                 _ => {}
@@ -1380,7 +1355,11 @@ async fn import_paths(app: AppHandle, id: String, paths: Vec<String>) -> ImportR
 /// 会在初始化阶段直接退出，表现就是「点了没反应」——这一条就是治它的。
 #[tauri::command]
 async fn open_item(path: String) -> Result<(), String> {
-    shortcut::open(&path)
+    // 解析 .lnk / ShellExecuteW 会碰磁盘和 COM，目标是 .url、网络盘、OneDrive 等
+    // 时可能阻塞好几秒——必须扔进阻塞线程池，否则会冻住整个 IPC 命令线程。
+    tauri::async_runtime::spawn_blocking(move || shortcut::open(&path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// 在资源管理器里定位这个图标并选中（面板右键「打开文件所在位置」）。
@@ -2239,18 +2218,6 @@ fn box_scale(app: AppHandle, id: String) -> Result<f64, String> {
     let bw = box_window(&app, &id).ok_or("盒子窗口不存在")?;
     let r = rect_of(&bw).ok_or("读不到盒子位置")?;
     Ok(desktop::scale_at(r.x + r.w / 2, r.y + r.h / 2))
-}
-
-/// 盒子附近壁纸的亮度（0.0 纯黑 ~ 1.0 纯白），名字据此决定用白字还是深色字。
-///
-/// 没有底板之后，白字 + 深色描边在浅色壁纸上会糊成一团（用户实测白色壁纸下
-/// 盒子名看不清），桌面图标是同一套问题的官方解法：字色跟着壁纸亮度走。
-/// 判断放在前端（带滞回，避免亮度在阈值附近时来回跳），后端只负责报亮度。
-#[tauri::command]
-fn label_luma(app: AppHandle, id: String) -> Option<f64> {
-    let bw = box_window(&app, &id)?;
-    let r = rect_of(&bw)?;
-    label::bg_luma(&r)
 }
 
 /// 等窗口真正从 Tauri 的窗口表里消失（destroy 是投递到主线程执行的）
@@ -5116,7 +5083,30 @@ fn hide_update(app: AppHandle) {
 
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    // 先销毁所有窗口、再 exit：destroy 和 exit 都是投递到同一个事件循环队列，
+    // 按 FIFO 顺序处理，窗口销毁（WebView2 关闭）一定在进程退出之前完成。
+    shutdown_cleanup(&app);
     app.exit(0);
+}
+
+/// 退出前把还活着的窗口都显式销毁，让 WebView2 走完它自己的清理流程。
+///
+/// 直接 `app.exit(0)` 的话，Chromium 的窗口类 `Chrome_WidgetWin_0` 来不及从系统
+/// 注销（日志里的 `Failed to unregister class Chrome_WidgetWin_0. Error = 1412`），
+/// 残留的状态 + user data 目录锁没释放，下一次启动的 WebView2 要收拾烂摊子，
+/// 表现就是「启动慢、运行卡顿」。
+///
+/// `w.destroy()` 是异步投递（`Message::Window(Destroy)`），`app.exit` 也是异步投递
+/// （`Message::RequestExit`），两者进同一事件循环队列按顺序处理，所以「先 destroy
+/// 再 exit」能保证 WebView2 在进程退出前完成注销。
+fn shutdown_cleanup(app: &AppHandle) {
+    for (_, w) in app.webview_windows() {
+        // 僵尸条目（hwnd 已经没了）跳过，销毁它会卡在窗口表上
+        let h = hwnd_of(&w);
+        if h != 0 && unsafe { win32::IsWindow(h) } != 0 {
+            let _ = w.destroy();
+        }
+    }
 }
 
 /// `lightbox.exe --fix-bar` 的实体：把所有「嵌入任务栏」的盒子复位回桌面。
@@ -5147,6 +5137,41 @@ fn fix_bar_boxes() {
     println!("已把 {n} 个收纳盒从任务栏移回桌面");
 }
 
+/// 把 stderr 重定向到 `<根目录>/lightbox.log`（追加模式）。
+///
+/// LightBox 是 `windows_subsystem="windows"` 的 GUI 程序，没有控制台，
+/// 所有 `eprintln!` 本来都写进虚空 —— 出了事什么都看不到。这里在启动早期
+/// 把 stderr 接到日志文件上，后续任何 `eprintln!`（创建窗口失败、重建盒子失败、
+/// 打开属性失败……）都会落盘，排障时直接看这个文件。
+///
+/// 只动 stderr，不动 stdout：`--version` / `--check-update` 等 CLI 输出
+/// 仍走控制台（那些分支在本函数之前就已经 return 了）。
+fn init_log() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::windows::io::AsRawHandle;
+
+    let path = store::root_dir().join("lightbox.log");
+    // 单进程单实例，直接开一次拿句柄；失败就静默放弃（不能让日志把程序带崩）。
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    // SetStdHandle 后由进程接管这个句柄，不能再让 File 的 Drop 把它关掉。
+    let handle = file.as_raw_handle() as isize;
+    std::mem::forget(file);
+    // SAFETY: handle 是刚打开、已 forget（不会二次关闭）的合法文件句柄，交给进程标准句柄接管。
+    unsafe {
+        win32::SetStdHandle(win32::STD_ERROR_HANDLE, handle);
+    }
+    // 写入一行启动分隔线，方便多段运行之间切分
+    let _ = writeln!(
+        std::io::stderr(),
+        "=== LightBox {} 启动 ===",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 pub fn run() {
     // `lightbox.exe --version`：只打印版本号就退出（排障 / 脚本读取用）。
     // 必须在单实例判断之前 —— 已经开着 LightBox 时也要能查版本。
@@ -5173,6 +5198,8 @@ pub fn run() {
         }
         return;
     }
+    // 先把 stderr 接到日志文件，后面的所有 eprintln! 才能落盘（见 init_log）
+    init_log();
     // 读配置之前先留一份快照（见 store::snapshot）
     store::snapshot();
     if fix_bar {
@@ -5301,7 +5328,6 @@ pub fn run() {
             snap_bar,
             bar_hover,
             box_scale,
-            label_luma,
             set_box_topmost,
             set_box_in_bar,
             open_panel,

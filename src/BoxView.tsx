@@ -56,10 +56,6 @@ export default function BoxView({ id }: { id: string }) {
   // 直接把 80×80 的舞台缩放到「80 × scale 物理像素」，和窗口尺寸、区域三者对齐。
   const [monScale, setMonScale] = useState(1);
   const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1);
-  /** 名字要不要用深色字（盒子底下那块壁纸是浅色）。见下面 labelLuma 那段说明。 */
-  const [labelDark, setLabelDark] = useState(false);
-  /** 重新测一次背景亮度：拖动落位后立刻调，不用等 3 秒的轮询 */
-  const lumaTick = useRef<() => void>(() => {});
 
   // 背景色由全局设置决定；盒子窗口是独立 webview，靠 theme:changed 广播同步
   useTheme();
@@ -82,47 +78,6 @@ export default function BoxView({ id }: { id: string }) {
       alive = false;
       un?.();
       window.removeEventListener("resize", onResize);
-    };
-  }, [id]);
-
-  // 名字颜色跟着壁纸走 —— 和桌面图标一样。
-  //
-  // 盒子没有底板，名字直接压在壁纸上：白字 + 深色描边在深色壁纸 / 照片上很清楚，
-  // 但在浅色（尤其是纯白）壁纸上，白字和背景一样亮，只剩一圈模糊的深色描边，
-  // 12px 的中文就是一团灰（用户实测白色壁纸下「冷宫」两个字看不清）。
-  // 桌面图标是同一问题的官方解法：**壁纸亮就用深色字**。这里抄这个思路。
-  //
-  // 采样在**后端**做（要读屏幕像素，页面里拿不到背后的壁纸），前端只做两件事：
-  //  1. 定时问（1.5 秒）——拖动落位、换壁纸、换屏、Explorer 重启重建窗口，
-  //     一个轮询口子全罩住，比给每个触发点加钩子省事，开销是几个 GetPixel；
-  //     间隔原来是 3 秒，换壁纸后最多要等三秒才变字色（用户反馈「有点延迟」），
-  //     采样成本可以忽略，就压到 1.5 秒。
-  //  2. **带滞回**地决定：亮度卡在阈值附近时，一点点变化就会让字黑白来回闪。
-  //     已经是深色字就得更亮一些（0.62）才切回白字，反过来只要暗到 0.52 就切。
-  useEffect(() => {
-    let alive = true;
-    let prev = false;
-    const tick = () => {
-      api
-        .labelLuma(id)
-        .then((l) => {
-          // null = 读不到（窗口刚销毁 / 采样点全在屏幕外）：保持现状
-          if (!alive || l === null) return;
-          const next = prev ? l > 0.52 : l > 0.62;
-          if (next !== prev) {
-            prev = next;
-            setLabelDark(next);
-          }
-        })
-        .catch(() => {});
-    };
-    lumaTick.current = tick;
-    tick();
-    const timer = window.setInterval(tick, 1500);
-    return () => {
-      alive = false;
-      lumaTick.current = () => {};
-      window.clearInterval(timer);
     };
   }, [id]);
 
@@ -269,9 +224,6 @@ export default function BoxView({ id }: { id: string }) {
         fallback = window.setTimeout(() => {
           // 位置由后端用 Win32 读：payload 是父客户区坐标，直接存会把配置写坏
           api.moveBox(id).catch(() => {});
-          // 换了地方 → 底下那块壁纸的明暗可能也变了，名字颜色立刻重判一次，
-          // 不用等 3 秒的轮询（拖到白色区域松手，字要马上变深）
-          lumaTick.current();
         }, 400);
 
         window.clearTimeout(timer);
@@ -436,8 +388,6 @@ export default function BoxView({ id }: { id: string }) {
           "box-tile" +
           (inBar ? " bar" : "") +
           (barSolo ? " solo" : "") +
-          // 浅色壁纸 → 深色字（胶囊有自己的底色，不受影响）
-          (!inBar && labelDark ? " label-dark" : "") +
           (over ? " drop" : "") +
           (dragging ? " dragging" : "")
         }

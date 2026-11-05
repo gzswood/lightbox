@@ -504,6 +504,9 @@ extern "system" {
     pub fn CloseHandle(h: isize) -> i32;
     pub fn WaitForSingleObject(h: isize, ms: u32) -> u32;
     pub fn GetExitCodeProcess(h: isize, code: *mut u32) -> i32;
+    /// 把进程的标准句柄换成我们打开的文件（stderr 重定向到 lightbox.log 用）。
+    /// 设完后 std::io::stderr() 会经 GetStdHandle 拿到新句柄，eprintln! 就落盘了。
+    pub fn SetStdHandle(nStdHandle: u32, hHandle: isize) -> i32;
 }
 
 #[repr(C)]
@@ -555,6 +558,8 @@ pub const SW_SHOWNORMAL: u16 = 1;
 /// CreateProcess 需要管理员权限时的错误码
 pub const ERROR_ELEVATION_REQUIRED: u32 = 740;
 pub const STILL_ACTIVE: u32 = 259;
+/// SetStdHandle 的目标：标准错误输出
+pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
 #[link(name = "gdi32")]
 extern "system" {

@@ -127,9 +127,6 @@ export const api = {
   moveBox: (id: string) => invoke<void>("move_box", { id }),
   /** 盒子所在显示器的缩放系数（100% = 1.0）。页面用它把 80×80 的舞台缩到正确物理尺寸。 */
   boxScale: (id: string) => invoke<number>("box_scale", { id }),
-  /** 盒子附近壁纸的亮度（0 = 纯黑，1 = 纯白）。名字据此在白字 / 深色字之间切换，
-   *  和桌面图标一样「字色跟着壁纸走」。null = 读不到（窗口刚销毁 / 点全在屏幕外）。 */
-  labelLuma: (id: string) => invoke<number | null>("label_luma", { id }),
   /** 拖动松手后吸附（贴屏幕边 / 贴别的盒子）并落盘坐标。
    *  null = 鼠标还按着（稍后再问）；true = 吸了（要重截背景）；false = 不用动。 */
   snapBox: (id: string) => invoke<boolean | null>("snap_box", { id }),

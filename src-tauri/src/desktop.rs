@@ -378,31 +378,14 @@ pub fn heal_bar_box(hwnd: isize) -> bool {
 }
 
 
-/// 把窗口摆到桌面层：壁纸之上、桌面图标之上、普通窗口之下。
-///
-/// **老做法是 `SetParent(hwnd, Progman)`** —— 真嵌进桌面里，层级关系天然正确，
-/// Explorer 怎么提层都盖不住它。代价写在 Win32 的合成模型里：**子窗口没有逐像素 alpha**。
-/// 页面里 alpha=0 的像素在子窗口上没有「底下」可露，露出来的是窗口类背景刷（白底），
-/// 所以盒子只能画实色底板 —— 这就是「做不到真透明」的根因，不是实现偷懒。
-///
-/// 现在改成**顶层窗口 + owner = 桌面宿主**：
-///  · 顶层窗口 → DWM 逐像素合成，alpha=0 的像素真的透出壁纸（和面板同一套机制）；
-///  · 被 owned 的窗口永远压在 owner 之上 → 盒子仍在壁纸和桌面图标之上，
-///    桌面重绘、按 F5、换壁纸都刷不掉它；
-///  · owner 取 Progman 而不是 `HWND_TOPMOST` → 普通窗口照样盖住盒子，
-///    保持「盒子是桌面的一部分」这个层级观感。
-///
-/// 这招不是新发明的，Win11 的任务栏贴条就是靠同一套 owner 关系常驻任务栏之上
-/// （见 `pin_to_taskbar`），那边已经跑了很多个版本。
-///
-/// 顺带的好处：Explorer 重启会销毁 Progman 但**不会**销毁 owned window，
-/// 盒子不再跟着一起死（以前要靠守护线程每 3 秒补建）。
+/// 把窗口挂到桌面层：真嵌成 Progman 的子窗口，层级关系天然正确，
+/// Explorer 怎么提层都盖不住它。代价是子窗口没有逐像素 alpha，
+/// 盒子只能画实色底板（真透明做不到，见 styles.css 里的说明）。
 pub fn pin_to_desktop(hwnd: isize) -> bool {
     if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
         return false;
     }
     // Progman 在系统刚启动 / Explorer 正在重启时可能暂时找不到，等一小会儿
-    // （退化成普通顶层窗口会浮在所有窗口之上，绝不能就这么留着）
     let mut host = desktop_host();
     for _ in 0..20 {
         if host != 0 {
@@ -416,18 +399,12 @@ pub fn pin_to_desktop(hwnd: isize) -> bool {
     }
     unsafe {
         set_toolwindow(hwnd);
-        // 点盒子不能把前台窗口抢走（现在顶层窗口了，没有 Progman 兜着）
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        if ex & WS_EX_NOACTIVATE == 0 {
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE);
-        }
-        // 万一这个 hwnd 还是旧形态的子窗口（切换中途留下的），先摘成顶层
-        if GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow() {
-            SetParent(hwnd, 0);
-        }
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, host);
-        // 设完 owner 系统会自己把窗口排到 owner 之上；这里再提一次是为了
-        // 压过桌面图标那一层（SysListView32 是 owner 的子窗口）
+        // 注意：这里**不要**用 AttachThreadInput 去挂到 explorer 的输入队列。
+        // 一旦 explorer 或本进程任一方在等对方，两边会互相卡住（表现为整个桌面像死机）。
+        // 实测同权限级别下直接 SetParent 就能成功，跨进程 attach 属于纯粹的风险来源。
+        SetParent(hwnd, host);
+
+        // 提到同级窗口最上层（压在桌面图标之上）
         SetWindowPos(
             hwnd,
             HWND_TOP,
@@ -438,7 +415,7 @@ pub fn pin_to_desktop(hwnd: isize) -> bool {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
 
-        if GetWindow(hwnd, GW_OWNER) == host {
+        if GetAncestor(hwnd, GA_PARENT) == host {
             register(hwnd);
             true
         } else {
@@ -451,8 +428,6 @@ pub fn pin_to_desktop(hwnd: isize) -> bool {
 pub fn unpin(hwnd: isize) {
     unsafe {
         SetParent(hwnd, 0);
-        // 断开桌面层 owner，否则它仍然被 Progman 的所有权关系压在桌面附近
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !WS_EX_TOOLWINDOW);
         let mut list = PINNED.lock().unwrap();
@@ -743,14 +718,6 @@ pub fn strip_chrome(hwnd: isize, x: i32, y: i32, w: i32, h: i32, radius: i32, sh
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
         let mut new_style = style
             & !(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-        // 无边框顶层窗口**必须**带 WS_POPUP（和 WS_CHILD 互斥）。
-        // 少了它 Windows 会把窗口当成「重叠窗口」。
-        // 注意：这不是顶部那条 "LightBox" 横幅的原因（那是 tao 的 blur-behind
-        // 让 DWM 重画非客户区，见 lib.rs 里 no_redirection_bitmap 的说明），
-        // 这里只是给窗口补上正确的窗口类型。
-        if new_style & WS_CHILD == 0 {
-            new_style |= WS_POPUP;
-        }
         new_style |= WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
         if show {
             new_style |= WS_VISIBLE;
@@ -812,6 +779,16 @@ pub fn strip_chrome(hwnd: isize, x: i32, y: i32, w: i32, h: i32, radius: i32, sh
             .map(|r| (r.w, r.h))
             .unwrap_or((pw, ph));
         set_region(hwnd, fw, fh, px(lr, sc_final));
+        // 上面被 DWM 拒绝（子窗口没有独立合成）时这两句是无害的兜底
+        let policy: u32 = DWMNCRP_DISABLED;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &policy as *const u32 as *const c_void,
+            4,
+        );
+        let none = MARGINS { cxLeftWidth: 0, cxRightWidth: 0, cyTopHeight: 0, cyBottomHeight: 0 };
+        DwmExtendFrameIntoClientArea(hwnd, &none);
     }
 }
 
@@ -981,7 +958,7 @@ pub fn start_watchdog(app: tauri::AppHandle, box_size: i32, box_radius: i32) {
             if unsafe { IsWindow(hwnd) } == 0 {
                 continue;
             }
-            if unsafe { GetWindow(hwnd, GW_OWNER) } != host {
+            if unsafe { GetAncestor(hwnd, GA_PARENT) } != host {
                 need.push(hwnd);
             } else {
                 geom.push(hwnd);
@@ -1006,11 +983,9 @@ pub fn start_watchdog(app: tauri::AppHandle, box_size: i32, box_radius: i32) {
     });
 }
 
-/// 补挂 owner 关系，不动尺寸和样式（避免和用户拖动打架）。
-///
-/// Explorer 重启（系统更新、换壁纸、崩溃后被拉起）会重建 Progman：老的那个被销毁，
-/// 盒子的 owner 变成空，于是它退化成普通顶层窗口 —— 浮在所有窗口之上，像个钉子户。
-/// 守护线程发现 owner 不对就调这里重设一次。窗口本身不会被销毁，画面也不会重建。
+/// Explorer 重启后 Progman 会被重建，父关系失效 —— 后台守护线程负责检测，
+/// 真正的 SetParent 必须回到**创建窗口的那个线程**（主线程）执行，
+/// 在子线程里跨线程改窗口父级是未定义行为，也是之前「程序整体卡死」的元凶之一。
 pub fn repin(hwnd: isize) {
     if hwnd == 0 || unsafe { IsWindow(hwnd) } == 0 {
         return;
@@ -1020,10 +995,7 @@ pub fn repin(hwnd: isize) {
         return;
     }
     unsafe {
-        if GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow() {
-            SetParent(hwnd, 0);
-        }
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, host);
+        SetParent(hwnd, host);
         SetWindowPos(
             hwnd,
             HWND_TOP,
