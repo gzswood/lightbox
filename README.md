@@ -6,7 +6,7 @@
 
 单文件 exe，绿色免安装，约 3.9 MB。盒子可以贴在桌面层，也可以嵌入任务栏。
 
-[![版本](https://img.shields.io/badge/version-0.9.30-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
+[![版本](https://img.shields.io/badge/version-0.9.31-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
 [![平台](https://img.shields.io/badge/platform-Windows%2010-0078D6?style=flat-square&logo=windows&logoColor=white)](#系统要求)
 [![协议](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app/)
