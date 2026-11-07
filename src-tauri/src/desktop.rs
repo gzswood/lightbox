@@ -84,6 +84,36 @@ pub fn taskbar_tray_left() -> Option<i32> {
     }
 }
 
+/// 任务栏里「胶囊能贴的最左边界」（避开左侧的开始按钮 / 固定图标）。
+///
+/// Win10：任务栏是传统子窗口结构，`ReBarWindow32` 里的 `MSTaskSwWClass` 是
+/// 「正在运行的程序按钮区」，它的左沿正好是「开始按钮 + 固定图标」的右边界。
+/// 胶囊排到它左边就会盖住开始菜单。Win11 的 XAML 任务栏没有这套子窗口，
+/// 拿不到就返回 `None`（调用方退回 `bar.x`，Win11 开始按钮居中、左侧基本没有固定图标，
+/// 贴到 bar.x 是安全的）。
+pub fn taskbar_left_limit() -> Option<i32> {
+    unsafe {
+        let tb = taskbar();
+        if tb == 0 {
+            return None;
+        }
+        // MSTaskSwWClass 挂在 ReBarWindow32 下面，不在 Shell_TrayWnd 直接子窗口里，
+        // 先找到 ReBarWindow32 再往下找。
+        let cls_bar = w("ReBarWindow32");
+        let rebar = FindWindowExW(tb, 0, cls_bar.as_ptr(), std::ptr::null());
+        if rebar != 0 {
+            let cls_task = w("MSTaskSwWClass");
+            let h = FindWindowExW(rebar, 0, cls_task.as_ptr(), std::ptr::null());
+            if h != 0 && IsWindowVisible(h) != 0 {
+                if let Some(r) = window_rect(h) {
+                    return Some(r.x);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// 是不是 Windows 11（build >= 22000）。结果缓存，进程内只查一次。
 ///
 /// 这个判断决定了「嵌入任务栏」到底怎么实现 —— 两个系统上任务栏根本不是同一种东西：

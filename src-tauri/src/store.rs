@@ -33,6 +33,28 @@ pub struct BoxConfig {
     /// 形态切换（嵌入/移出任务栏）、自动排序、删除盒子都会把成员摘出去。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 团内顺序（0 起）。团成员的左右/上下顺序本靠 x/y 隐含，但切屏后绝对坐标失效、
+    /// 顺序就跟着乱，所以这里**持久化**一份顺序：成员排序时优先用它，缺失才退回
+    /// x/y（兼容老配置）。由 `assign_group_pos` 在团形成 / 拖动落定后按最终坐标固化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_pos: Option<i32>,
+}
+
+/// 盒子坐标是「在哪块显示器布局下记下来的」的参照系（**物理像素**）。
+///
+/// 配置里的 x/y 一直是绝对屏幕坐标，可两台屏的工作区高度、缩放都不一样：
+/// 笔记本屏（1920×1200 @125%、盒边 100、工作区底 1150）上贴着任务栏上沿的 y=1050，
+/// 到外接 1920×1080 @100%（盒边 80、工作区底 1040）就成了整排压进任务栏里。
+/// 记下当时的「工作区矩形 + 缩放」，显示配置一变就按它把坐标整体换算过去。
+/// 见 lib.rs 的 `apply_layout_ref`。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutRef {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// 缩放 ×100（125% → 125）。存整数，避免浮点比较抖动导致反复重排。
+    pub scale_100: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,6 +87,10 @@ pub struct Config {
     /// 默认**关闭** = 显示两个汉字（横向胶囊）。
     #[serde(default = "default_bar_hide_label")]
     pub bar_hide_label: bool,
+    /// 上一次记下 boxes 坐标时的显示器参照系。老配置没有这一项 → 首次运行写入当前值，
+    /// 从下一次切屏开始生效（见 lib.rs 的 `apply_layout_ref`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_ref: Option<LayoutRef>,
 }
 
 pub fn default_transparency() -> f32 {
@@ -137,6 +163,7 @@ impl Default for Config {
             panel_acrylic: default_acrylic(),
             panel_radius: false,
             bar_hide_label: default_bar_hide_label(),
+            layout_ref: None,
         }
     }
 }

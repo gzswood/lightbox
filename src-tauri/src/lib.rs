@@ -487,9 +487,366 @@ fn dedupe(boxes: &mut Vec<BoxConfig>, scale: f64) -> bool {
     changed
 }
 
+/// 在 `area`（一块屏幕的**工作区**，物理像素，已排除任务栏）里找一个
+/// 「不与 `occupied` 里任何矩形相交、且完全落在工作区内」的空位。
+///
+/// 从工作区左上角起按网格扫（步进 = 盒子边长 + 16px 间隙），返回第一个空位；
+/// 找不到就返回 `None`（调用方保持原位，硬挪只会更乱）。
+fn spot_in_area(area: &Rect, size: i32, occupied: &[Rect]) -> Option<(i32, i32)> {
+    let step = size + 16;
+    let mut y = area.y;
+    while y + size <= area.bottom() {
+        let mut x = area.x;
+        while x + size <= area.right() {
+            let cand = Rect { x, y, w: size, h: size };
+            if !cand.hits_any(occupied) {
+                return Some((x, y));
+            }
+            x += step;
+        }
+        y += step;
+    }
+    None
+}
+
+/// 检测并排开「矩形相交」的盒子（典型场景：笔记本从双屏切单屏后，副屏上的盒子
+/// 被夹回主屏，和主屏上的盒子压在一起）。
+///
+/// 和 `dedupe` 的区别：`dedupe` 只处理「坐标几乎完全一致」的历史重复（阈值 32px），
+/// 这里处理的是**部分重叠**——两个合法盒子在显示器切换后互相压住。
+/// 按配置顺序逐个处理：每个盒子先夹回屏幕工作区（复用 `clamp_box_into_screen`，
+/// 内部已排除任务栏、也处理「故意压在任务栏上」的例外），再检测它和已就位盒子是否
+/// 相交，相交就挪到它所在屏工作区里的第一个空位（不越屏、不压任务栏托盘）。
+/// 返回是否有盒子被挪动过。
+fn resolve_overlaps(boxes: &mut Vec<BoxConfig>) -> bool {
+    let mut changed = false;
+    let mut placed: Vec<Rect> = Vec::new();
+    for b in boxes.iter_mut() {
+        // 任务栏盒子贴任务栏上沿、有自己的位置规则，不参与排开
+        if b.in_bar {
+            continue;
+        }
+        // 属于某个团的盒子交给 `reflow_desktop_groups` 团级重排，这里跳过 ——
+        // 否则团成员会被当成独立盒子散落（尤其被 spot_in_area 从左上角 (0,0) 排开）。
+        if b.group.is_some() {
+            continue;
+        }
+        // 先夹回屏幕：把可能跑出屏幕的盒子拉进工作区（保证最终不越界、不压任务栏）
+        let _ = clamp_box_into_screen(b);
+        let size =
+            (BOX_W * desktop::scale_at(b.x + BOX_W as i32 / 2, b.y + BOX_W as i32 / 2)).round()
+                as i32;
+        let r = Rect { x: b.x, y: b.y, w: size, h: size };
+        if r.hits_any(&placed) {
+            let area = desktop::monitor_at(b.x + size / 2, b.y + size / 2)
+                .map(|m| m.work)
+                .unwrap_or(Rect { x: 0, y: 0, w: 1920, h: 1080 });
+            if let Some((nx, ny)) = spot_in_area(&area, size, &placed) {
+                b.x = nx;
+                b.y = ny;
+                changed = true;
+            }
+        }
+        placed.push(Rect { x: b.x, y: b.y, w: size, h: size });
+    }
+    changed
+}
+
+/// 重新排布桌面上的收纳盒团（显示配置变化 / 启动时）。
+///
+/// 和任务栏胶囊团同一个问题：桌面团的成员坐标是「当时那块屏」下的绝对屏幕坐标，
+/// 切屏后失效。之前桌面团没有团级重排，被 `resolve_overlaps` 当**独立盒子**逐个夹回 +
+/// 从工作区左上角 (0,0) 起扫空位，结果成员散落（用户实测「切屏后两个盒子跑到屏幕
+/// 左上角」）。
+///
+/// 规则：以团内**最左/最上**的成员为基准，其余成员按顺序依次紧贴（间距 = 盒子边长），
+/// 整团作为一个整体夹进工作区，绝不越界、绝不压任务栏。
+///
+/// 关键：必须在 `resolve_overlaps` **之前**调用 —— 此时成员 x/y 还是切屏前的正确值，
+/// 按它排序顺序才不乱；等 `resolve_overlaps` 把坐标写坏（排到左上角）就来不及了。
+/// 返回是否有盒子被挪动过。
+fn reflow_desktop_groups(boxes: &mut Vec<BoxConfig>) -> bool {
+    // 收集所有「含桌面成员的团」的团 id
+    let mut gids: Vec<String> = boxes
+        .iter()
+        .filter(|b| !b.in_bar)
+        .filter_map(|b| b.group.clone())
+        .collect();
+    gids.sort();
+    gids.dedup();
+
+    let mut changed = false;
+
+    for gid in &gids {
+        let mut members: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.in_bar && b.group.as_deref() == Some(gid.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        // 判断排列方向：横坐标跨度大 → 横排；否则纵排
+        let min_x = members.iter().map(|&i| boxes[i].x).min().unwrap();
+        let max_x = members.iter().map(|&i| boxes[i].x).max().unwrap();
+        let min_y = members.iter().map(|&i| boxes[i].y).min().unwrap();
+        let max_y = members.iter().map(|&i| boxes[i].y).max().unwrap();
+        let horizontal = (max_x - min_x) >= (max_y - min_y);
+        // 顺序优先用持久化的 group_pos（切屏后 x/y 会乱但 group_pos 不乱）；
+        // 老配置没有 group_pos 时退回坐标排序。
+        members.sort_by_key(|&i| {
+            boxes[i]
+                .group_pos
+                .unwrap_or(if horizontal { boxes[i].x } else { boxes[i].y } * 1000)
+        });
+
+        // 锚点 = 最左/最上的成员；盒子边长按锚点所在屏缩放算
+        let anchor = members[0];
+        let sc = desktop::scale_at(
+            boxes[anchor].x + BOX_W as i32 / 2,
+            boxes[anchor].y + BOX_W as i32 / 2,
+        );
+        let size = (BOX_W * sc).round() as i32;
+        let n = members.len() as i32;
+        let span = size * n;
+
+        // 先夹锚点回工作区（保证它不越界、不压任务栏），再据此排整团
+        let _ = clamp_box_into_screen(&mut boxes[anchor]);
+        let ax = boxes[anchor].x;
+        let ay = boxes[anchor].y;
+        let work = desktop::monitor_at(ax + size / 2, ay + size / 2)
+            .map(|m| m.work)
+            .unwrap_or(Rect { x: 0, y: 0, w: 1920, h: 1080 });
+
+        // 整团作为一个整体夹进工作区（放不下就向左/上收，但绝不越出工作区）。
+        // 横排也要夹 y、竖排也要夹 x：切屏后锚点可能整块压在任务栏里
+        // （`clamp_box_into_screen` 为兼容「故意压在任务栏上」的旧盒子会放行），
+        // 不夹这一下的话整团就「跑到任务栏后面」被盖住了。
+        let max_x = if horizontal { work.x + work.w - span } else { work.x + work.w - size };
+        let max_y = if horizontal { work.y + work.h - size } else { work.y + work.h - span };
+        let base_x = clamp_i(ax, work.x, max_x.max(work.x));
+        let base_y = clamp_i(ay, work.y, max_y.max(work.y));
+
+        for (k, &i) in members.iter().enumerate() {
+            let (nx, ny) = if horizontal {
+                (base_x + k as i32 * size, base_y)
+            } else {
+                (base_x, base_y + k as i32 * size)
+            };
+            if boxes[i].x != nx || boxes[i].y != ny {
+                boxes[i].x = nx;
+                boxes[i].y = ny;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 重新排布任务栏里的胶囊团（显示配置变化 / 启动时）。
+///
+/// 背景：盒子嵌进任务栏后，x/y 是「当时那块屏任务栏」下的绝对屏幕坐标。切换显示器
+/// （笔记本 ↔ 外接、双屏 ↔ 单屏）后任务栏宽度/原点变了，这些坐标就失效：团内成员
+/// 要么离散出缝，要么被逐个夹回任务栏边界、跑到最左盖住开始按钮或托盘图标。
+///
+/// 规则（用户给定）：以团内**最左**的盒子为基准，其余成员依次向右紧贴（每个占
+/// `unit_w` 宽），整团作为一个整体夹进任务栏范围；右边界 = 托盘左沿 - 4，绝不越界、
+/// 绝不压托盘。团外独立的胶囊同样单独夹回范围。
+/// 返回是否有盒子被挪动过。
+fn reflow_bar_groups(boxes: &mut Vec<BoxConfig>) -> bool {
+    let bar = match taskbar_rect() {
+        Some(r) => r,
+        None => return false,
+    };
+    let (unit_w, _) = bar_box_size();
+    let right_limit = desktop::taskbar_tray_left().unwrap_or(bar.right()) - 4;
+    // 左边界避开开始按钮 / 固定图标（Win10 有效，Win11 退回 bar.x）
+    let left_limit = desktop::taskbar_left_limit().unwrap_or(bar.x);
+    let mut changed = false;
+
+    // 收集所有「含任务栏成员的团」的团 id
+    let mut gids: Vec<String> = boxes
+        .iter()
+        .filter(|b| b.in_bar)
+        .filter_map(|b| b.group.clone())
+        .collect();
+    gids.sort();
+    gids.dedup();
+
+    // 已处理过的盒子 id（团成员），后面给「独立胶囊」兜底时跳过
+    let mut handled: Vec<String> = Vec::new();
+
+    for gid in &gids {
+        let mut members: Vec<usize> = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.in_bar && b.group.as_deref() == Some(gid.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        // 左右顺序：优先用持久化的 group_pos（切屏后 x 会乱但 group_pos 不乱），
+        // 老配置没有时退回 x 排序
+        members.sort_by_key(|&i| boxes[i].group_pos.unwrap_or(boxes[i].x * 1000));
+        let n = members.len() as i32;
+        let span = unit_w * n;
+        // 以最左盒子为基准；整排放不下就把基准向左收到「托盘左沿 - 整排宽」处，
+        // 但绝不越过开始按钮的左边界
+        let lo = left_limit;
+        let hi = (right_limit - span).max(lo);
+        let base_x = clamp_i(boxes[members[0]].x, lo, hi);
+        for (k, &i) in members.iter().enumerate() {
+            let nx = base_x + k as i32 * unit_w;
+            if boxes[i].x != nx || boxes[i].y != bar.y {
+                boxes[i].x = nx;
+                boxes[i].y = bar.y;
+                changed = true;
+            }
+            handled.push(boxes[i].id.clone());
+        }
+    }
+
+    // 团外的独立胶囊：单独夹回任务栏范围（不压托盘、不压开始按钮）
+    for b in boxes.iter_mut() {
+        if !b.in_bar || handled.iter().any(|id| id == &b.id) {
+            continue;
+        }
+        let nx = clamp_i(b.x, left_limit, (right_limit - unit_w).max(left_limit));
+        if b.x != nx || b.y != bar.y {
+            b.x = nx;
+            b.y = bar.y;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 当前盒子坐标所处的「显示器参照系」：取所有桌面盒子外接矩形的中心落在哪块屏，
+/// 就用那块屏的工作区 + 缩放。桌面盒子通常成团待在同一块屏上，用一块屏的几何做
+/// 整体换算最稳；`MonitorFromPoint(..NEAREST)` 还能在副屏被拔掉时自动落到最近的屏上
+/// （顺便把虚拟屏幕原点变化带来的整块平移一起算进去）。
+fn current_layout_ref(boxes: &[BoxConfig]) -> Option<store::LayoutRef> {
+    let desk: Vec<&BoxConfig> = boxes.iter().filter(|b| !b.in_bar).collect();
+    let (cx, cy) = if desk.is_empty() {
+        // 全是任务栏胶囊：它们有自己的任务栏参照系，这里给主屏即可
+        (0, 0)
+    } else {
+        let min_x = desk.iter().map(|b| b.x).min().unwrap_or(0);
+        let min_y = desk.iter().map(|b| b.y).min().unwrap_or(0);
+        let max_x = desk.iter().map(|b| b.x).max().unwrap_or(0);
+        let max_y = desk.iter().map(|b| b.y).max().unwrap_or(0);
+        ((min_x + max_x + BOX_W as i32) / 2, (min_y + max_y + BOX_W as i32) / 2)
+    };
+    let m = desktop::monitor_at(cx, cy).or_else(desktop::primary_monitor)?;
+    Some(store::LayoutRef {
+        x: m.work.x,
+        y: m.work.y,
+        w: m.work.w,
+        h: m.work.h,
+        scale_100: (m.scale * 100.0).round() as i32,
+    })
+}
+
+/// 显示布局变了：把桌面盒子的**绝对坐标**从旧参照系换算到新参照系。
+///
+/// 根因：配置里的 y 是上一次摆放时那块屏的物理像素。笔记本屏（1920×1200 @125%、
+/// 盒边 100、工作区底 1150）上贴着任务栏上沿的 y=1050，到外接 1920×1080 @100%
+/// （盒边 80、工作区底 1040）就整排压进任务栏；反过来切回去时，被夹过的 y=1000
+/// 又离任务栏差一大截 —— 用户看到的「跑到任务栏后面 / 跑到上方」。
+///
+/// 做法：按「贴哪条边就继续贴哪条边」求一个**统一平移量**（不是逐盒缩放），作用到
+/// 所有桌面盒子上：
+///  - 整排贴近下沿 → 保持「距工作区下沿的空隙」，换屏后仍贴着任务栏上沿；
+///  - 贴近右沿 → 保持距右沿的空隙；否则保持距左/上沿的空隙。
+///  - 盒子边长随缩放变（100 ↔ 80），所以下/右锚定要额外补 `旧边长 - 新边长`。
+///
+/// 统一平移很关键：团成员的间距、几个独立盒子的相对位置都不变，A→B→A 往返能精确
+/// 回到原坐标；团内间距改成新边长由后面的 `reflow_desktop_groups` 负责。
+/// 任务栏胶囊不参与（x/y 由 `reflow_bar_groups` 按任务栏矩形重算）。
+///
+/// 返回 true 表示配置被改过（含首次写入参照系），调用方需要落盘。
+fn apply_layout_ref(cfg: &mut Config) -> bool {
+    let now = match current_layout_ref(&cfg.boxes) {
+        Some(r) => r,
+        None => return false, // 显示器信息暂不可用（切屏瞬间），等下一轮
+    };
+    let old = match cfg.layout_ref {
+        Some(o) => o,
+        None => {
+            // 老配置没有参照系：记下当前值，不做换算（不知道旧几何，硬猜只会乱挪）。
+            // 从下一次切屏开始生效；本次被任务栏盖住的盒子由团级重排 / 夹回工作区兜底。
+            cfg.layout_ref = Some(now);
+            return true;
+        }
+    };
+    if old == now {
+        return false;
+    }
+    let old_size = (BOX_W as f64 * old.scale_100 as f64 / 100.0).round() as i32;
+    let new_size = (BOX_W as f64 * now.scale_100 as f64 / 100.0).round() as i32;
+    let (dx, dy) = {
+        let desk: Vec<&BoxConfig> = cfg.boxes.iter().filter(|b| !b.in_bar).collect();
+        if desk.is_empty() {
+            cfg.layout_ref = Some(now);
+            return true;
+        }
+        let min_x = desk.iter().map(|b| b.x).min().unwrap();
+        let min_y = desk.iter().map(|b| b.y).min().unwrap();
+        let max_x = desk.iter().map(|b| b.x).max().unwrap();
+        let max_y = desk.iter().map(|b| b.y).max().unwrap();
+        let left_gap = min_x - old.x;
+        let top_gap = min_y - old.y;
+        let right_gap = (old.x + old.w) - (max_x + old_size);
+        let bottom_gap = (old.y + old.h) - (max_y + old_size);
+        // 只有「明显贴着右/下边缘」才改用那一边做锚点：否则两屏等宽时，盒边 100→80
+        // 会让整排被补的那 20px 推着横移，看着像位置自己跑了。
+        let anchor_right = right_gap < left_gap && right_gap <= old_size * 2;
+        let anchor_bottom = bottom_gap < top_gap && bottom_gap <= old_size * 2;
+        let dx = if anchor_right {
+            (now.x + now.w) - (old.x + old.w) + (old_size - new_size)
+        } else {
+            now.x - old.x
+        };
+        let dy = if anchor_bottom {
+            (now.y + now.h) - (old.y + old.h) + (old_size - new_size)
+        } else {
+            now.y - old.y
+        };
+        (dx, dy)
+    };
+    // 切屏换算留一行日志：用户反馈位置偏移时可直接看 lightbox.log 里的参照系和平移量
+    eprintln!("[layout] {old:?} -> {now:?}  桌面盒子平移 dx={dx} dy={dy}");
+    if dx != 0 || dy != 0 {
+        for b in cfg.boxes.iter_mut().filter(|b| !b.in_bar) {
+            b.x += dx;
+            b.y += dy;
+        }
+    }
+    cfg.layout_ref = Some(now);
+    true
+}
+
 /// 显示器布局的「指纹」：只要它变了，就说明用户动了显示设置
 /// （拔插屏、切换扩展/复制/仅某屏、改分辨率、改缩放、旋转屏幕）。
-fn layout_sig() -> (i32, i32, i32, i32, i32) {
+///
+/// 除了虚拟屏幕几何，还带上**任务栏矩形**（x/y/w/h）：
+/// 切屏（笔记本 ↔ 外接）时，任务栏厚度/位置会变（厚度 40 ↔ 50），而 `unit_w`（每个
+/// 胶囊的宽度）直接由厚度决定。如果只看虚拟屏幕几何，厚度变化发生在虚拟屏幕已经
+/// 稳定的那一步之后，`layout_sig` 不再变、不会再触发 reflow —— 结果胶囊按**旧的
+/// unit_w** 排出来的坐标（间距 89）和新屏窗口实际宽度（71）对不上，看起来就离散了。
+/// 把任务栏矩形也纳入指纹，任务栏一稳定就会再触发一轮 reflow 用正确厚度重排。
+fn layout_sig() -> (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) {
+    let (bar_x, bar_y, bar_w, bar_h) = match taskbar_rect() {
+        Some(r) => (r.x, r.y, r.w, r.h),
+        None => (-1, -1, -1, -1),
+    };
+    // 只改缩放、不动分辨率时虚拟屏幕的物理尺寸可能不变，盒子边长却变了，
+    // 所以把主屏缩放也纳入指纹，保证一定要走一轮 `apply_layout_ref`。
+    let scale_100 = desktop::primary_monitor()
+        .map(|m| (m.scale * 100.0).round() as i32)
+        .unwrap_or(-1);
     unsafe {
         (
             win32::GetSystemMetrics(win32::SM_XVIRTUALSCREEN),
@@ -497,6 +854,11 @@ fn layout_sig() -> (i32, i32, i32, i32, i32) {
             win32::GetSystemMetrics(win32::SM_CXVIRTUALSCREEN),
             win32::GetSystemMetrics(win32::SM_CYVIRTUALSCREEN),
             win32::GetSystemMetrics(win32::SM_CMONITORS),
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            scale_100,
         )
     }
 }
@@ -507,21 +869,48 @@ fn layout_sig() -> (i32, i32, i32, i32, i32) {
 /// 「仅屏幕2」，原点从 -1920 变成 0），所有子窗口的屏幕位置就整体平移了。所以必须
 /// 用 `strip_chrome` 重新换算一次父客户区坐标，盒子才会回到原来的位置。
 ///
-/// 注意坐标**只夹不存**：夹出来的位置只用于「这次显示」，配置文件里仍是用户摆的原坐标。
-/// 这样拔掉副屏时盒子临时落到主屏上，副屏插回来它会自己回到原来那块屏；
-/// 如果这里直接落盘，一次临时拔线就把用户的布局永久改掉了。
+/// 坐标换算 / 夹回 / 排开的结果都会**落盘**：切屏后旧绝对坐标已经失效，不写回去的话
+/// 下一轮轮询、下次启动还会拿旧坐标重算，位置就会来回跳。换算用的是「贴哪条边」的
+/// 统一平移（见 apply_layout_ref），A→B→A 能精确回到原坐标，所以不会把临时拔线
+/// 变成永久改布局。
 fn reflow_boxes(app: &AppHandle) {
     let st = app.state::<State>();
     let boxes = {
-        let cfg = st.cfg.lock().unwrap();
-        cfg.boxes
-            .iter()
-            .map(|b| {
-                let mut t = b.clone();
-                clamp_box_into_screen(&mut t);
-                t
-            })
-            .collect::<Vec<BoxConfig>>()
+        let mut cfg = st.cfg.lock().unwrap();
+        // 只 clone，**不在这里对任务栏盒子调 clamp**：`clamp_box_into_screen` 在任务栏
+        // 暂时不可用时（切屏瞬间 Shell_TrayWnd 还没在新屏上重建）会把 in_bar 盒子改成
+        // `in_bar = false`，随后被 `resolve_overlaps` 当普通盒子排到屏幕左上角 (0,0)，
+        // 坐标就此写坏（用户实测「切屏后两个盒子跑到任务栏最左、覆盖图标」）。
+        // 普通盒子的 clamp 由 `resolve_overlaps` 内部负责；任务栏盒子由 `reflow_bar_groups`
+        // 负责（它拿到 taskbar_rect() 为 None 时直接 return，保持原样，等任务栏稳定再排）。
+        //
+        // 先按「旧屏 → 新屏」把桌面盒子的绝对坐标整体换算一次（贴任务栏上沿的仍贴着，
+        // 见 apply_layout_ref）。必须在 clone / 团级重排之前：重排会把成员间距改成新边长，
+        // 那时再换算就分不清哪些是用户摆的、哪些是算法排的了。
+        let layout_changed = apply_layout_ref(&mut *cfg);
+        let mut boxes: Vec<BoxConfig> = cfg.boxes.iter().cloned().collect();
+        // 桌面收纳盒团：切屏后成员坐标失效、被散落到左上角。必须在 resolve_overlaps
+        // **之前**团级重排（此时 x/y 还是切屏前的正确值，顺序才不乱），并**写回**配置。
+        let group_changed = reflow_desktop_groups(&mut boxes);
+        let mut changed = layout_changed || group_changed;
+        // 普通盒子（非团成员）：夹回屏幕 + 排开重叠，并**写回**配置。
+        // 这和「只夹不存」不矛盾：夹回是临时的、副屏插回来就恢复原位；排开是两个
+        // 盒子不能同时占一个位置，属于持久修正，得落盘，否则下次启动还是重叠。
+        if resolve_overlaps(&mut boxes) {
+            changed = true;
+        }
+        // 任务栏里的胶囊团：切屏后团内成员离散/被夹到最左盖图标，见 reflow_bar_groups。
+        if reflow_bar_groups(&mut boxes) {
+            changed = true;
+        }
+        if changed {
+            for (cfg_b, tmp) in cfg.boxes.iter_mut().zip(boxes.iter()) {
+                cfg_b.x = tmp.x;
+                cfg_b.y = tmp.y;
+            }
+            store::save(&cfg);
+        }
+        boxes
     };
     for b in &boxes {
         let w = match box_window(app, &b.id) {
@@ -567,10 +956,15 @@ fn start_layout_watch(app: AppHandle) {
             if now == last {
                 continue;
             }
-            // 立刻按新布局摆一次；系统切模式时可能连着改几次配置，900ms 后再兜一次
+            // 切屏是渐进过程：旧任务栏先销毁、新屏的任务栏要隔几百毫秒才重建好。
+            // 任务栏还没就位的那几次 reflow 里，`reflow_bar_groups` 拿到 taskbar_rect()
+            // 为 None 会直接跳过（保持原样、不写坏坐标）；所以这里多兜几轮，等任务栏
+            // 稳定后再排一次，避免「切屏后胶囊一直离散/跑到最左」。
             reflow_boxes(&app);
-            std::thread::sleep(std::time::Duration::from_millis(900));
-            reflow_boxes(&app);
+            for delay in [600u64, 1500u64] {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                reflow_boxes(&app);
+            }
             last = layout_sig();
         }
     });
@@ -1546,6 +1940,7 @@ async fn create_box_inner(app: &AppHandle, name: String) -> Result<BoxConfig, St
             icon: None,
             order: Vec::new(),
             group: None,
+            group_pos: None,
         };
         cfg.boxes.push(b.clone());
         store::save(&cfg);
@@ -2901,6 +3296,15 @@ fn group_settle(app: &AppHandle, state: &State, id: &str) {
             );
         }
         if changed {
+            // 拖动落定后坐标是对的，趁机把团内顺序固化到 group_pos（切屏重排靠它）
+            if let Some(gid) = cfg
+                .boxes
+                .iter()
+                .find(|b| b.id == id)
+                .and_then(|b| b.group.clone())
+            {
+                assign_group_pos(&mut cfg, &gid);
+            }
             store::save(&cfg);
         }
     }
@@ -2926,6 +3330,8 @@ async fn group_boxes(app: AppHandle, state: tauri::State<'_, State>, id: String)
                 b.group = Some(gid.clone());
             }
         }
+        // 组合那一刻坐标是对的，趁机把顺序固化到 group_pos（切屏重排靠它）
+        assign_group_pos(&mut cfg, &gid);
         store::save(&cfg);
     }
     for m in &members {
@@ -2973,9 +3379,41 @@ fn group_members_of(cfg: &Config, id: &str) -> Option<Vec<String>> {
     if ids.len() < 2 {
         return None;
     }
-    // 左右顺序按当前横坐标定：切换形态后「谁在谁旁边」和用户看到的一致
-    ids.sort_by_key(|i| cfg.boxes.iter().find(|b| &b.id == i).map(|b| b.x).unwrap_or(0));
+    // 优先用持久化的 `group_pos` 定顺序（切屏后 x/y 会乱，但 group_pos 不乱）；
+    // 老配置没这个字段时退回 x 排序（行为与旧版一致）。
+    ids.sort_by_key(|i| {
+        let b = cfg.boxes.iter().find(|b| &b.id == i);
+        b.and_then(|b| b.group_pos)
+            .unwrap_or_else(|| b.map(|b| b.x).unwrap_or(0) * 1000)
+    });
     Some(ids)
+}
+
+/// 把某个团成员的顺序按**当前坐标**固化到 `group_pos`（0 起）。
+///
+/// 团内顺序本靠 x/y 隐含，但切屏后绝对坐标失效、顺序跟着乱，所以要在「坐标还正确
+/// 的时刻」（组合、拖动落定后）把顺序固化下来。缺失 group_pos 的成员（老配置）也会
+/// 被补上，这样切屏重排时才有可靠的顺序可用。
+fn assign_group_pos(cfg: &mut Config, gid: &str) {
+    // 先按当前坐标排出顺序，再按顺序写 0..n
+    let mut members: Vec<String> = cfg
+        .boxes
+        .iter()
+        .filter(|b| b.group.as_deref() == Some(gid))
+        .map(|b| b.id.clone())
+        .collect();
+    if members.len() < 2 {
+        return;
+    }
+    members.sort_by_key(|i| {
+        let b = cfg.boxes.iter().find(|b| &b.id == i);
+        (b.map(|b| b.y).unwrap_or(0), b.map(|b| b.x).unwrap_or(0))
+    });
+    for (k, id) in members.iter().enumerate() {
+        if let Some(b) = cfg.boxes.iter_mut().find(|b| &b.id == id) {
+            b.group_pos = Some(k as i32);
+        }
+    }
 }
 
 /// `group_members_of` 的加锁版：这个盒子是不是某个团的成员。
@@ -5225,7 +5663,7 @@ pub fn run() {
             pick_caller: Mutex::new(None),
             group_drag: Mutex::new(None),
         })
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             let scale = app_scale(&handle);
             let boxes = {
@@ -5245,14 +5683,36 @@ pub fn run() {
                             icon: None,
                             order: Vec::new(),
                             group: None,
+                            group_pos: None,
                         });
                     }
                     store::save(&cfg);
                 } else if dedupe(&mut cfg.boxes, scale) {
                     store::save(&cfg);
                 }
+                // 关机期间换过显示器 / 改过缩放：启动时也要按旧参照系把绝对坐标
+                // 换算一次（见 apply_layout_ref），否则贴着任务栏上沿的盒子会压进任务栏。
+                // 老配置没有参照系时这里只记下当前值，不猜旧几何。
+                let layout_changed = apply_layout_ref(&mut *cfg);
+                // 启动时重排桌面收纳盒团：以最左/最上为基准依次紧贴、整团夹进工作区，
+                // 修掉「切屏后团成员被散落到左上角」的遗留（见 reflow_desktop_groups）。
+                // 必须在 resolve_overlaps 之前（那时 x/y 还没被写坏，顺序才不乱）。
+                let group_changed = reflow_desktop_groups(&mut cfg.boxes);
+                if layout_changed || group_changed {
+                    store::save(&cfg);
+                }
+                // 启动时排开「部分重叠」的盒子（双屏切单屏后盒子压在一起的遗留问题）：
+                // dedupe 只治「坐标几乎一致」的历史重复，管不到这种合法的部分重叠。
+                if resolve_overlaps(&mut cfg.boxes) {
+                    store::save(&cfg);
+                }
                 // 老配置修正：「压在任务栏上一半以上」= 嵌入任务栏（见 migrate_pressed_into_bar）
                 if migrate_pressed_into_bar(&mut cfg.boxes) {
+                    store::save(&cfg);
+                }
+                // 启动时重排任务栏里的胶囊团：以最左为基准依次紧贴、整团夹进任务栏，
+                // 修掉「切屏后团内成员离散 / 跑到最左盖图标」的遗留（见 reflow_bar_groups）。
+                if reflow_bar_groups(&mut cfg.boxes) {
                     store::save(&cfg);
                 }
                 // 落点：跑到屏幕外的盒子（上次在副屏上、副屏这次没插）先临时夹回可见区域。

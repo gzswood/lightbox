@@ -613,12 +613,17 @@ export default function PanelView() {
     }
     if (!d || d.mode !== "reflow") return;
     setSort(null);
-    // 落回自己那一格 = 抖了一下的点击，照旧让它冒泡成 click（打开程序）
+    // 落回自己那一格：这里已经进入过 reflow 态（位移 ≥ 6px），说明是「拖了一下又放回」，
+    // 不是点击 —— 绝不能让它冒泡成 click 把程序打开。以前这里 `return` 让 click 冒泡，
+    // 表现就是「拖动一小段距离再放回原位，程序被打开了」。
     if (d.to === d.from) {
       const r = d.rect;
       const inside =
         d.lx >= r.l - 2 && d.lx <= r.r + 2 && d.ly >= r.t - 2 && d.ly <= r.b + 2;
-      if (inside) return;
+      if (inside) {
+        suppress(250); // 拖动了，吃掉紧随其后的 click
+        return;
+      }
     }
     // 拖动过就吃掉紧随其后的 click。
     // 以前只在「落点变了」时才抑制，于是「拖到空白处松手」漏了：空白处被
