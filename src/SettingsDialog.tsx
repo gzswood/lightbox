@@ -20,6 +20,10 @@ type Props = {
   onClose: () => void;
   /** 内容实际高度（逻辑像素）：外层拿去把窗口改成都高，不用滚动 */
   onHeight: (h: number) => void;
+  /** 当前打开的「取色弹窗」在改哪个色块（null = 没开）。状态放外层，
+   *  Esc 才能先关弹窗、再关设置窗口（见 SettingsView 的 keydown） */
+  colorTarget: "box" | "panel" | null;
+  onColorTarget: (t: "box" | "panel" | null) => void;
 };
 
 /** 设置窗口的内容：名称、外观（透明度/背景色/毛玻璃）、置顶、开机自启、存储目录
@@ -40,6 +44,8 @@ export default function SettingsDialog({
   onChanged,
   onClose,
   onHeight,
+  colorTarget,
+  onColorTarget,
 }: Props) {
   // 窗口高度跟着内容走：量 .dlg 自己（它是 height: fill-content，不受窗口高度影响）
   const rootRef = useRef<HTMLDivElement>(null);
@@ -58,8 +64,6 @@ export default function SettingsDialog({
 
   const [n, setN] = useState(name);
   const [onTop, setOnTop] = useState(topmost);
-  /** 当前展开调色板的是哪个色块（null = 都收着） */
-  const [edit, setEdit] = useState<"box" | "panel" | null>(null);
   const [auto, setAuto] = useState<boolean | null>(null);
   const [version, setVersion] = useState("");
   const [exe, setExe] = useState("");
@@ -256,34 +260,15 @@ export default function SettingsDialog({
             <Swatch
               label="收纳盒"
               value={theme.box_bg}
-              active={edit === "box"}
-              onClick={() => setEdit(edit === "box" ? null : "box")}
+              active={colorTarget === "box"}
+              onClick={() => onColorTarget(colorTarget === "box" ? null : "box")}
             />
             <Swatch
               label="弹出窗口"
               value={theme.panel_bg}
-              active={edit === "panel"}
-              onClick={() => setEdit(edit === "panel" ? null : "panel")}
+              active={colorTarget === "panel"}
+              onClick={() => onColorTarget(colorTarget === "panel" ? null : "panel")}
             />
-          </div>
-          {edit && (
-            <ColorPop
-              value={edit === "box" ? theme.box_bg : theme.panel_bg}
-              onChange={(v) => onTheme(edit === "box" ? { box_bg: v } : { panel_bg: v })}
-              onClose={() => setEdit(null)}
-              // 点吸管这一刻锁定目标色块：pick:done 回来时只认这个，
-              // 不受后续状态/重订阅影响（之前会填到上一次改的那个色块上）
-              onPick={() => {
-                pickTarget.current = edit;
-                api.beginPick().catch(() => {
-                  pickTarget.current = null;
-                });
-              }}
-            />
-          )}
-          <div className="dlg-desc">
-            文字颜色按背景自动取深/浅。「收纳盒」是桌面上那些小格子的底板色。
-            调色板里的小画笔是吸管，可以从屏幕上任意位置取色
           </div>
         </div>
 
@@ -414,11 +399,51 @@ export default function SettingsDialog({
           </button>
           <span className="dlg-hint">作者:Gathon 微信:gzswood</span>
         </div>
+
+      {/* 取色弹窗：模态浮层铺满设置窗口。调色板和「文字颜色按背景自动取…」说明
+          都从上面的「背景颜色」区搬到这里，设置页本体只留两个色块按钮。
+          用 fixed 而不是 absolute：不受 .dlg 的 overflow-y:auto 裁剪。 */}
+      {colorTarget && (
+        <div
+          className="dlg-modal"
+          onPointerDown={(e) => {
+            if (e.target === e.currentTarget) onColorTarget(null);
+          }}
+        >
+          <div className="dlg-modal-card" onContextMenu={(e) => e.preventDefault()}>
+            <div className="dlg-modal-title">
+              <span>{colorTarget === "box" ? "收纳盒" : "弹出窗口"}背景色</span>
+              <button className="dlg-x" title="关闭" onClick={() => onColorTarget(null)}>
+                ✕
+              </button>
+            </div>
+            <ColorPop
+              value={colorTarget === "box" ? theme.box_bg : theme.panel_bg}
+              onChange={(v) =>
+                onTheme(colorTarget === "box" ? { box_bg: v } : { panel_bg: v })
+              }
+              onClose={() => onColorTarget(null)}
+              // 点吸管这一刻锁定目标色块：pick:done 回来时只认这个，
+              // 不受后续状态/重订阅影响（之前会填到上一次改的那个色块上）
+              onPick={() => {
+                pickTarget.current = colorTarget;
+                api.beginPick().catch(() => {
+                  pickTarget.current = null;
+                });
+              }}
+            />
+            <div className="dlg-modal-note">
+              文字颜色按背景自动取深/浅。「收纳盒」是桌面上那些小格子的底板色。
+              调色板里的小画笔是吸管，可以从屏幕上任意位置取色
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-/** 一个颜色格：点一下在下面展开自绘调色板（不再用 <input type="color"> 的系统对话框） */
+/** 一个颜色格：点一下打开取色弹窗（不再用 <input type="color"> 的系统对话框） */
 function Swatch({
   label,
   value,
@@ -529,6 +554,8 @@ function Pipette() {
  * 系统对话框是个普通顶层窗口，会被 always_on_top 的设置窗口整个压在下面 ——
  * 用户看到的就是「点了没反应」，换台机器还不一样。自己画就没有这些问题。
  *
+ * 现在整块放在设置窗口的 `.dlg-modal` 弹窗里，不再嵌在「背景颜色」那一行下面，
+ * 设置页本体因此只留两个色块按钮。
  * 布局：常用色 → 饱和/明度方块 → 色相条 → hex + 吸管。吸管走后端开全屏取色器，
  * 取到的颜色由 `pick:done` 事件送回（监听在 SettingsDialog 里）。
  */
@@ -657,7 +684,7 @@ function ColorPop({
           <Pipette />
         </button>
         <button type="button" className="dlg-link" onClick={onClose}>
-          收起
+          完成
         </button>
       </div>
     </div>

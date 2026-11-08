@@ -59,13 +59,15 @@ const SET_W: f64 = 372.0;
 /// 设置窗口的初始高度。页面加载完后会调 `fit_settings` 按内容高度改一次，
 /// 所以这个值只是「还没量到内容之前」的占位。
 const SET_H: f64 = 460.0;
-/// 设置窗口固定直角（0 = 不裁剪）。小窗口带圆角在这套「窗口区域裁剪」方案下
-/// 只能得到 1 像素台阶，看着不如直角干净；面板的圆角由设置里的开关单独控制。
-const SET_RADIUS: i32 = 0;
-/// 更新提示窗口：比设置窗口宽一点（要放更新说明），尺寸固定、内容超出才滚动。
+/// 设置窗口 / 更新提示窗口**都不再有独立的圆角常量**：和面板共用
+/// `panel_radius(app)`，也就是设置里那个「圆角窗口」开关。以前固定直角
+/// （小窗口硬裁圆角只有 1 像素台阶），但圆角模式下直角方窗夹在圆角面板 /
+/// 菜单中间很突兀 —— 现在开关一开，设置页和版本更新页一起变圆。
+/// 前端 `.dlg` 的 border-radius 必须用同一个 `--panel-radius`，两边对不上会露白；
+/// 这两个窗口的页面也都必须调 `useTheme()`，否则拿不到用户自定义的卡片底色。
+/// 更新窗口比设置窗口宽一点（要放更新说明），尺寸固定、内容超出才滚动。
 const UPD_W: f64 = 420.0;
 const UPD_H: f64 = 440.0;
-const UPD_RADIUS: i32 = 0;
 
 /// 为什么所有窗口都要 `SetWindowRgn` 裁圆角（而不是交给 CSS）：
 ///
@@ -187,19 +189,20 @@ fn box_ready(id: String) {
 }
 
 /// 右键菜单高度（逻辑像素）。结构对应 MenuView.tsx：
-/// padding 6×2 + 头 28 + 边框 2 + 固定 7 项（新建/重命名/设置图标/置顶/
-/// 设置.../删除收纳盒/退出）× 30 + 两处 sep × 9 + 2px 余量。
-/// 非空盒子多一行提示；自定义过图标的多一项「恢复默认图标」。
+/// padding 6×2 + 头 28 + 边框 2 + 固定 9 项（新建/重命名/设置图标/置顶/
+/// 嵌入任务栏/设置.../解散或删除收纳盒/检查更新.../退出）× 30
+/// + 两处 sep × 9 + 2px 余量。
+/// 自定义过图标的多一项「恢复默认图标」；能成团的多一行团操作。
+/// 错误提示是偶发的（菜单不再按「非空」常驻提示），由 `fit_menu` 即时补高，估值不预留。
 ///
 /// 这只是**首次显示的估值**——菜单内容条件渲染复杂，估值难免有偏差，
 /// 前端渲染后会测量真实高度回报 `fit_menu` 做修正，两者配合才不会裁掉底部。
-fn menu_height(show_hint: bool, has_icon: bool, group_row: bool) -> f64 {
+/// **每加一条菜单项这里必须 +30**：估值偏小会把最底下的「退出 LightBox」裁掉
+/// （v0.9.11 加「全部图标移回桌面」就踩过）。
+fn menu_height(has_icon: bool, group_row: bool) -> f64 {
     // 基准含：标题 / 新建 / 重命名 / 设置图标 / 置顶 / 嵌入任务栏 / 设置...
-    // + 两条分割线 + 删除 + 退出。前端渲染完还会回报真实高度修正（fit_menu）。
-    let mut h = 302.0;
-    if show_hint {
-        h += 22.0;
-    }
+    // + 两条分割线 + 解散/删除 + 检查更新... + 退出。前端渲染完还会回报真实高度修正（fit_menu）。
+    let mut h = 332.0;
     if has_icon {
         h += 30.0;
     }
@@ -221,7 +224,9 @@ fn acquire_single_instance() -> bool {
 }
 
 /// 找一个不与现有盒子重叠的落点（按网格扫，留 24px 间隙）
-/// 面板圆角：配置里关掉「圆角」时返回 0（方形窗口）。
+/// 弹出窗口圆角：配置里关掉「圆角」时返回 0（方形窗口）。
+/// **面板和设置页共用这一个值**（前端 `--panel-radius` 也是它），保证「圆角窗口」
+/// 开关一开，所有弹出窗口一起变圆。右键菜单是固定 `MENU_RADIUS`，不跟这个开关。
 fn panel_radius(app: &AppHandle) -> i32 {
     let round = app.state::<State>().cfg.lock().unwrap().panel_radius;
     if round {
@@ -1028,6 +1033,77 @@ fn spawn_box_window(
     Ok(win)
 }
 
+/// 建一个盒子窗口的超时上限（毫秒）。
+///
+/// 正常只要几百毫秒（Tauri 建窗 + 复用进程内已有的 WebView2 环境）。超过这个
+/// 时间基本可以断定主线程或 Explorer 不响应了，继续等只会让用户看到
+/// 「进程还活着但整个程序卡死」。
+const SPAWN_TIMEOUT_MS: u64 = 3500;
+
+/// `lightbox.log` 里用的时间戳（本地 UTC+8，不引第三方依赖）。
+fn stamp() -> String {
+    let s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let t = (s + 8 * 3600) % 86400;
+    format!("{:02}:{:02}:{:02}", t / 3600, (t / 60) % 60, t % 60)
+}
+
+/// 带「看门狗」地建一个盒子窗口：调用方最多等 `timeout_ms`，等不到就放弃。
+///
+/// 为什么需要它：`spawn_box_window` 里有两步会向**别的线程**发同步消息 ——
+///  - Tauri 建窗把 `CreateWindow` 投给主线程后 `rx.recv()` 等回执
+///    （tauri-runtime-wry 明确要求从非主线程调用，所以**反而不能**把建窗搬到主线程）；
+///  - Win10 下 `pin_to_taskbar` 的 `SetParent` 要和 Explorer 线程来回。
+/// 主线程被系统拖动模态循环占着、或 Explorer 正在重启时，任一步都可能永远不返回。
+/// 原来整团切换在**一个后台线程里连做 N 次**这种调用，还一直握着 `RELAY_LOCK`，
+/// 一次挂住后面所有「嵌入/移出任务栏」就全部排队等死 —— 2026-11-07 用户实测的
+/// 「桌面消失、盒子全不见、进程僵而不死」就是这么来的。
+///
+/// 改成：建窗丢进独立工作线程，调用方只等超时；工作线程**不持有任何全局锁**，
+/// 它挂着也不会拖住别的操作。超时后把 `alive` 置 false，工作线程万一后来
+/// 成功了会自己把新窗口销毁，不会留下隐藏的幽灵窗口。
+fn spawn_box_window_watched(
+    app: &AppHandle,
+    b: &BoxConfig,
+    alive: std::sync::Arc<AtomicBool>,
+    timeout_ms: u64,
+) -> Result<(tauri::WebviewWindow, u64), String> {
+    let app = app.clone();
+    let b = b.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let alive_worker = alive.clone();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let r = spawn_box_window(&app, &b, false);
+        let ms = t0.elapsed().as_millis() as u64;
+        match r {
+            Ok(w) => {
+                if !alive_worker.load(Ordering::Relaxed) {
+                    // 这一批已经放弃：立刻收掉，别在系统里留一个隐藏窗口
+                    desktop::forget(hwnd_of(&w));
+                    let _ = w.destroy();
+                    let _ = tx.send(Err("本次切换已放弃，新窗口已收掉".into()));
+                    return;
+                }
+                let _ = tx.send(Ok((w, ms)));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        }
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            alive.store(false, Ordering::Relaxed);
+            Err(format!("建窗超时 {timeout_ms}ms（主线程或 Explorer 未响应）"))
+        }
+    }
+}
+
 /// 显示盒子窗口。
 ///
 /// **不要用 tao 的 `win.show()`**：它在 Windows 上会重新套一遍窗口样式，
@@ -1254,7 +1330,7 @@ fn spawn_settings(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     .visible(false)
     .build()
     .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), 0, 0, SET_W as i32, SET_H as i32, SET_RADIUS, false);
+    desktop::strip_chrome(hwnd_of(&win), 0, 0, SET_W as i32, SET_H as i32, panel_radius(&app), false);
     Ok(win)
 }
 
@@ -1279,7 +1355,7 @@ fn spawn_gsettings(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     .visible(false)
     .build()
     .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), 0, 0, SET_W as i32, SET_H as i32, SET_RADIUS, false);
+    desktop::strip_chrome(hwnd_of(&win), 0, 0, SET_W as i32, SET_H as i32, panel_radius(&app), false);
     Ok(win)
 }
 
@@ -1305,7 +1381,7 @@ fn spawn_update(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     .visible(false)
     .build()
     .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), 0, 0, UPD_W as i32, UPD_H as i32, UPD_RADIUS, false);
+    desktop::strip_chrome(hwnd_of(&win), 0, 0, UPD_W as i32, UPD_H as i32, panel_radius(app), false);
     Ok(win)
 }
 
@@ -1346,7 +1422,7 @@ pub(crate) async fn open_update_window_inner(app: &AppHandle) -> Result<(), Stri
     let (x, y) = centered_origin(app, UPD_W, UPD_H);
     win.set_position(PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), x, y, UPD_W as i32, UPD_H as i32, UPD_RADIUS, true);
+    desktop::strip_chrome(hwnd_of(&win), x, y, UPD_W as i32, UPD_H as i32, panel_radius(app), true);
     let _ = win.set_skip_taskbar(true);
     win.show().map_err(|e| e.to_string())?;
     let _ = win.set_focus();
@@ -1391,7 +1467,7 @@ async fn open_global_settings_inner(app: &AppHandle) -> Result<(), String> {
     win.set_position(PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())?;
     win.show().map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, SET_RADIUS, true);
+    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, panel_radius(&app), true);
     let _ = win.set_skip_taskbar(true);
     let _ = win.set_focus();
     // 设置窗口是复用的（页面只挂载一次），每次亮出来补推一次更新状态 ——
@@ -1503,7 +1579,7 @@ fn build_tray(app: &AppHandle) -> Result<(), String> {
 fn spawn_menu(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let win = WebviewWindowBuilder::new(app, "menu", WebviewUrl::App("index.html?mode=menu".into()))
         .title("LightBox")
-        .inner_size(MENU_W, menu_height(false, false, false))
+        .inner_size(MENU_W, menu_height(false, false))
         .decorations(false)
         .transparent(true)
         .shadow(false)
@@ -1515,7 +1591,7 @@ fn spawn_menu(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
         .visible(false)
         .build()
         .map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), 0, 0, MENU_W as i32, menu_height(false, false, false) as i32, MENU_RADIUS, false);
+    desktop::strip_chrome(hwnd_of(&win), 0, 0, MENU_W as i32, menu_height(false, false) as i32, MENU_RADIUS, false);
     Ok(win)
 }
 /// 菜单贴着光标弹出，并保证整块留在光标所在那块屏幕里
@@ -2207,8 +2283,10 @@ async fn begin_box_rename(
     Ok(())
 }
 
-/// 删除收纳盒。**非空一律拒绝**：删盒子不能顺手把用户的快捷方式弄丢，
-/// 也不做「自动放回桌面」这种自作主张的动作，交给用户自己先移出去。
+/// 删除收纳盒。**非空一律拒绝（兜底）**：正常路径下右键菜单在非空时显示
+/// 「解散收纳盒」，先走 `restore_all_items` 把图标放回桌面、盒子留成空盒，
+/// 空盒才走这里。保留这道校验是挡住菜单数据过期之类的竞态 ——
+/// 删盒子绝不能顺手把用户的快捷方式弄丢。
 #[tauri::command]
 async fn delete_box(app: AppHandle, state: tauri::State<'_, State>, id: String) -> Result<(), String> {
     let count = store::count_items(&id);
@@ -2650,7 +2728,9 @@ fn rebuild_box_flashless(app: &AppHandle, b: &BoxConfig) -> Result<(), String> {
     // 整团切换被两处同时触发时（松手吸附 + 某个成员自己的 snap_bar），会各建一个窗口，
     // 只销毁一个就漏下一个 —— 用户看到的就是「同一个收纳盒被复制了一个」。
     let old = box_windows_all(app, &b.id);
-    let new_win = spawn_box_window(app, b, false)?;
+    let alive = std::sync::Arc::new(AtomicBool::new(true));
+    let (new_win, ms) = spawn_box_window_watched(app, b, alive, SPAWN_TIMEOUT_MS)?;
+    eprintln!("[{}] [box-rebuild] {} 建窗完成 {}ms", stamp(), b.name, ms);
     let keep = new_win.label().to_string();
     wait_box_ready(&b.id, 900);
     show_box(&new_win, b);
@@ -3481,15 +3561,45 @@ fn group_switch_mode(
     // `DRAG_ESCAPED` 之后某个成员自己那一轮的 `snap_bar`。两处各起一个线程，
     // 就会把同一批窗口重建两遍，中间那一下会留下两个同 id 的窗口 ——
     // 用户看到的就是「收纳盒被复制了一个」。这里用团 id 加一道闸，第二次直接忽略。
-    let gid = {
+    let (gid, members) = {
         let st = app.state::<State>();
         let cfg = st.cfg.lock().unwrap();
-        cfg.boxes
+        let gid = cfg
+            .boxes
             .iter()
             .find(|b| b.id == anchor)
-            .and_then(|b| b.group.clone())
+            .and_then(|b| b.group.clone());
+        let members: Vec<String> = match &gid {
+            Some(g) => cfg
+                .boxes
+                .iter()
+                .filter(|b| b.group.as_deref() == Some(g.as_str()))
+                .map(|b| b.id.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        (gid, members)
     };
     let Some(gid) = gid else { return };
+
+    // 开工前先确认系统拖动模态循环已经退出。
+    //
+    // 建窗 / 挂任务栏都要主线程配合，而 `HTCAPTION` 的模态拖动循环正占着主线程；
+    // 这时候开工就是「后台线程等主线程建窗、主线程等拖动结束」，进程僵而不死。
+    // 松手触发的路径一般已经退出，这里兜住「刚拖完就点菜单」这类竞态。
+    // `end_drag` 在没按键、没进循环时立刻返回 true，正常点击没有额外延迟。
+    for id in &members {
+        if let Some(w) = box_window(app, id) {
+            if !end_drag(hwnd_of(&w)) {
+                eprintln!(
+                    "[{}] [group-switch] 放弃：{id} 仍在系统拖动循环里，等松手后重试",
+                    stamp()
+                );
+                return;
+            }
+        }
+    }
+
     {
         let mut list = GROUP_SWITCHING.lock().unwrap();
         if list.iter().any(|g| g == &gid) {
@@ -3509,34 +3619,80 @@ fn group_switch_mode(
 static GROUP_SWITCHING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// 整团**一次性**换形态：先把所有新窗口隐藏着建好、等首帧，再同一轮全部显示，
-/// 最后统一销毁旧窗口。
+/// 最后统一销毁旧窗口。建窗阶段带看门狗（见 `spawn_box_window_watched`）。
 ///
 /// 为什么不直接循环调 `rebuild_box_flashless`：那是一个盒子一个盒子地
 /// 「建 → 等首帧 → 显示 → 睡 140ms → 销毁旧的」，一个成员 300~500ms，
 /// 三个成员就要一秒多 —— 用户看到的就是「一个一个挪进/挪出任务栏」。
-/// 整团的意义是一次动完，所以把等待合并：新窗口并行建、并行等首帧，
-/// 顺序只影响建窗口那几十毫秒，显示和销毁都落在同一帧里。
-fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) {
+/// 整团的意义是一次动完：**显示和销毁仍在同一轮**，这里只把建窗拆开做。
+///
+/// 建窗改成串行 + 每次独立超时 + 建完让主线程喘一拍（30ms）：连续 N 次跨线程
+/// `SetParent` 撞上主线程忙 / Explorer 重启是这次卡死的诱因，看门狗保证任何
+/// 一次挂住都只会「放弃这一批」，不会拖着 `RELAY_LOCK` 让后续操作排队等死。
+fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) -> Result<(), String> {
     if plan.is_empty() {
-        return;
+        return Ok(());
     }
+    let t0 = std::time::Instant::now();
+    let n = plan.len();
+    let alive = std::sync::Arc::new(AtomicBool::new(true));
+    eprintln!(
+        "[{}] [group-switch] 开始 n={} to_bar={}",
+        stamp(),
+        n,
+        plan[0].in_bar
+    );
     // 新旧交替这段时间里，这一批盒子都不许被 snap / move_box / 守护线程碰。
     // 不同 id 的 guard 互不干扰（见 switching_begin 的说明），放一个 Vec 里一起活着。
     let _guards: Vec<SwitchGuard> = plan.iter().map(|b| switching_begin(&b.id)).collect();
 
-    let mut olds: Vec<Vec<tauri::WebviewWindow>> = Vec::with_capacity(plan.len());
-    let mut news: Vec<(BoxConfig, tauri::WebviewWindow)> = Vec::with_capacity(plan.len());
-    for b in plan {
+    let mut olds: Vec<Vec<tauri::WebviewWindow>> = Vec::with_capacity(n);
+    let mut news: Vec<(BoxConfig, tauri::WebviewWindow)> = Vec::with_capacity(n);
+    for (i, b) in plan.iter().enumerate() {
         mark_box_not_ready(&b.id);
         // 同一 id 名下所有旧窗口都要收掉（整团切换被两处触发过会留下两个）
         olds.push(box_windows_all(app, &b.id));
-        match spawn_box_window(app, b, false) {
-            Ok(w) => news.push((b.clone(), w)),
-            Err(e) => eprintln!("胶囊团切换形态失败（{}）：{e}", b.id),
+        match spawn_box_window_watched(app, b, alive.clone(), SPAWN_TIMEOUT_MS) {
+            Ok((w, ms)) => {
+                eprintln!(
+                    "[{}] [group-switch] 建窗 {}/{} {} {}ms",
+                    stamp(),
+                    i + 1,
+                    n,
+                    b.name,
+                    ms
+                );
+                news.push((b.clone(), w));
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] [group-switch] 中止 {}/{} {}：{}",
+                    stamp(),
+                    i + 1,
+                    n,
+                    b.name,
+                    e
+                );
+                // 整批放弃：已建好的新窗口收掉，旧窗口一个都不动（用户看到的
+                // 还是原来的团），调用方负责把配置也退回去。
+                // 清理也丢到独立线程：`w.destroy()` 要主线程配合，而这次中止
+                // 多半正是主线程不响应 —— 不能在这里再等它一次。
+                alive.store(false, Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    for (_, w) in news {
+                        desktop::forget(hwnd_of(&w));
+                        let _ = w.destroy();
+                    }
+                });
+                return Err(e);
+            }
         }
+        // WebView2 建完会往主线程消息队列里塞一堆初始化消息，让它消化一拍再
+        // 去挂下一个窗口，别让下一次 SetParent 正好撞上主线程忙线。
+        std::thread::sleep(std::time::Duration::from_millis(30));
     }
     if news.is_empty() {
-        return;
+        return Err("没有任何新窗口建成".into());
     }
     // 新窗口是并行画的：第一个等得久一点，后面的基本已经画完了，瞬间返回
     for (b, _) in &news {
@@ -3546,12 +3702,13 @@ fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) {
     for (b, w) in &news {
         show_box(w, b);
     }
+    eprintln!("[{}] [group-switch] 整批已显示", stamp());
     // 等新窗口都稳定出帧，屏幕上已经有整排新盒子盖在旧盒子上面了
     std::thread::sleep(std::time::Duration::from_millis(140));
     let mut stale: Vec<String> = Vec::new();
     for ws in olds {
         for w in ws {
-            if news.iter().any(|(_, n)| n.label() == w.label()) {
+            if news.iter().any(|(_, nw)| nw.label() == w.label()) {
                 continue;
             }
             // 先摘掉守护登记：窗口马上销毁，别让守护线程再去碰它
@@ -3572,6 +3729,12 @@ fn rebuild_group_flashless(app: &AppHandle, plan: &[BoxConfig]) {
     for b in plan {
         notify_box_changed(app, &b.id);
     }
+    eprintln!(
+        "[{}] [group-switch] 完成 总耗时 {}ms",
+        stamp(),
+        t0.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 fn do_group_switch(
@@ -3582,7 +3745,14 @@ fn do_group_switch(
     cy: i32,
     append: bool,
 ) {
-    let Some(_guard) = lock_relay(8000) else { return };
+    eprintln!(
+        "[{}] [group-switch] 请求 to_bar={} anchor={} append={}",
+        stamp(), to_bar, anchor, append
+    );
+    let Some(_guard) = lock_relay(8000) else {
+        eprintln!("[{}] [group-switch] 放弃：重建闸 8s 没拿到", stamp());
+        return;
+    };
     let st = app.state::<State>();
     // 拖动留下的偏移会话到此为止：坐标要整体重排，旧偏移没有意义
     *st.group_drag.lock().unwrap() = None;
@@ -3606,6 +3776,14 @@ fn do_group_switch(
             None => return,
         }
     };
+    // 切换前的形态快照：建窗失败时把配置原样退回去（那时窗口一个都没动）。
+    let before: Vec<(String, i32, i32, bool, bool)> = {
+        let cfg = st.cfg.lock().unwrap();
+        cfg.boxes
+            .iter()
+            .map(|b| (b.id.clone(), b.x, b.y, b.in_bar, b.topmost))
+            .collect()
+    };
     let ai = match order.iter().position(|i| i == anchor) {
         Some(i) => i,
         None => return,
@@ -3627,6 +3805,7 @@ fn do_group_switch(
             .collect();
         let bar = taskbar_rect();
         if to_bar && bar.is_none() {
+            eprintln!("[{}] [group-switch] 放弃：检测不到任务栏", stamp());
             return; // 任务栏不在底部（或自动隐藏）：没法嵌，保持原样
         }
         let (x0, y0, step) = if to_bar {
@@ -3671,6 +3850,7 @@ fn do_group_switch(
         return;
     }
     if already {
+        eprintln!("[{}] [group-switch] 形态已对，仅摆位（不重建窗口）", stamp());
         // 形态没变：只把窗口挪到位（不进桌面层/任务栏，不需要重建）
         let bar = taskbar_rect();
         for b in &plan {
@@ -3705,7 +3885,27 @@ fn do_group_switch(
     }
     // 整团一次换完：所有成员的新窗口一起建、一起显示、一起销毁旧的。
     // （逐个 rebuild 会让用户看到「一个一个挪进去」，见 rebuild_group_flashless）
-    rebuild_group_flashless(app, &plan);
+    //
+    // 建窗失败（超时 / 主线程或 Explorer 不响应）时一个窗口都没换过，把配置
+    // 也退回切换前，保证「屏幕上看到的」和「配置里记的」是同一个形态 ——
+    // 否则守护线程之后会按新配置，把好端端的旧窗口当成半成品重建一遍。
+    if let Err(e) = rebuild_group_flashless(app, &plan) {
+        eprintln!("[{}] [group-switch] 已回滚配置：{e}", stamp());
+        let mut cfg = st.cfg.lock().unwrap();
+        for (id, x, y, in_bar, topmost) in &before {
+            if let Some(b) = cfg.boxes.iter_mut().find(|b| &b.id == id) {
+                b.x = *x;
+                b.y = *y;
+                b.in_bar = *in_bar;
+                b.topmost = *topmost;
+            }
+        }
+        store::save(&cfg);
+        drop(cfg);
+        for id in &order {
+            notify_box_changed(app, id);
+        }
+    }
 }
 
 /// 跟随线程的会话代号：新的一次拖动自增，旧线程看到代号变了就自行退出。
@@ -4907,7 +5107,7 @@ async fn fit_settings(app: AppHandle, state: tauri::State<'_, State>, height: f6
         if w.is_visible().unwrap_or(false) {
             *state.gsettings_height.lock().unwrap() = h;
             let (x, y) = gsettings_origin(&app, h);
-            desktop::strip_chrome(hwnd_of(&w), x, y, SET_W as i32, h as i32, SET_RADIUS, true);
+            desktop::strip_chrome(hwnd_of(&w), x, y, SET_W as i32, h as i32, panel_radius(&app), true);
             let _ = w.set_skip_taskbar(true);
             return Ok(());
         }
@@ -4934,7 +5134,7 @@ async fn fit_settings(app: AppHandle, state: tauri::State<'_, State>, height: f6
             y = pos.y;
         }
     }
-    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, SET_RADIUS, true);
+    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, panel_radius(&app), true);
     let _ = win.set_skip_taskbar(true);
     Ok(())
 }
@@ -4959,7 +5159,7 @@ async fn open_settings(app: AppHandle, state: tauri::State<'_, State>, id: Strin
     win.set_position(PhysicalPosition::new(x, y))
         .map_err(|e| e.to_string())?;
     win.show().map_err(|e| e.to_string())?;
-    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, SET_RADIUS, true);
+    desktop::strip_chrome(hwnd_of(&win), x, y, SET_W as i32, h as i32, panel_radius(&app), true);
     let _ = win.set_skip_taskbar(true);
     // 页面要重新拉一次这个盒子的数据（窗口是复用的，id 可能变了）
     *state.settings_target.lock().unwrap() = id.clone();
@@ -5107,15 +5307,27 @@ async fn set_theme(app: AppHandle, state: tauri::State<'_, State>, theme: Theme)
         theme_of(&cfg)
     };
     set_bar_hide_label(hide_label);
-    // 圆角是窗口区域决定的（不只是 CSS），改完要立刻重设，不然要等下次开面板
+    // 圆角是窗口区域决定的（不只是 CSS），改完要立刻重设，不然要等下次开窗口。
+    // 设置页此刻就在眼前（开关正是在它里面点的），必须一起重裁 —— 否则用户点完
+    // 开关要关掉再打开才看得到效果。reclip 会按窗口真实尺寸算，尺寸只是兜底。
+    let r = if radius { PANEL_RADIUS } else { 0 };
     if let Some(p) = app.get_webview_window("panel") {
         if p.is_visible().unwrap_or(false) {
-            desktop::reclip(
-                hwnd_of(&p),
-                PANEL_W as i32,
-                PANEL_H as i32,
-                if radius { PANEL_RADIUS } else { 0 },
-            );
+            desktop::reclip(hwnd_of(&p), PANEL_W as i32, PANEL_H as i32, r);
+        }
+    }
+    // 版本更新窗口复用同一套 .dlg 骨架、后端也按同一半径裁，所以一起重裁：
+    // 开关正是在设置页里点的，两个窗口可能同时开着，不能让更新页停在旧形状。
+    // reclip 按窗口真实尺寸算，这里的 w/h 只是拿不到尺寸时的兜底。
+    for (label, w, h) in [
+        ("settings", SET_W as i32, SET_H as i32),
+        ("gsettings", SET_W as i32, SET_H as i32),
+        ("update", UPD_W as i32, UPD_H as i32),
+    ] {
+        if let Some(win) = app.get_webview_window(label) {
+            if win.is_visible().unwrap_or(false) {
+                desktop::reclip(hwnd_of(&win), w, h, r);
+            }
         }
     }
     let _ = app.emit("theme:changed", next);
@@ -5255,7 +5467,7 @@ async fn show_box_menu(app: AppHandle, state: tauri::State<'_, State>, id: Strin
     // 逻辑尺寸 → 物理尺寸（place_menu / set_size 用的都是物理像素）。
     // 按**光标所在显示器**换算：菜单跟着光标弹，光标在哪块屏就按哪块屏的缩放。
     let sc = desktop::scale_at(pt.x, pt.y);
-    let h = menu_height(count > 0, has_icon, grouped || can_group);
+    let h = menu_height(has_icon, grouped || can_group);
     let (mw, mh) = ((MENU_W * sc).round() as i32, (h * sc).round() as i32);
     let (x, y) = place_menu(&app, pt.x, pt.y, mw, mh);
 

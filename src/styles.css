@@ -55,11 +55,10 @@ body,
   cursor: default;
 }
 
-/* 面板 / 菜单 / 设置：这三种顶层窗口**不再用 SetWindowRgn 裁圆角**。
-   DWM 对它们的合成是逐像素 alpha 的（实测 50% 透明度时像素值 = 0.5×底色 + 0.5×桌面），
-   所以圆角可以放心交给 CSS 的 border-radius —— Chromium 会画抗锯齿，比
-   CreateRoundRectRgn 的 1 像素台阶细腻得多。代价是页面背景必须彻底透明，
-   否则圆角外面会露出一层底色。盒子（Progman 子窗口）没有 alpha，仍然靠窗口区域硬裁。 */
+/* 面板 / 菜单 / 设置 / 版本更新：这几个顶层窗口的 html/body/#root 必须彻底透明。
+   DWM 对它们是逐像素 alpha 合成，圆角交给 CSS 的 border-radius 画抗锯齿，
+   后端同时按同一个半径 SetWindowRgn 兜底裁掉四角；只要页面自己铺了不透明底色，
+   圆角外面就会露出一层方形底板。盒子（Progman 子窗口）没有 alpha，只靠区域硬裁。 */
 html[data-mode="panel"],
 html[data-mode="panel"] body,
 html[data-mode="panel"] #root,
@@ -443,6 +442,28 @@ html[data-mode="box"] #root {
   color: var(--text);
 }
 
+/* 面板标题栏的「有更新」：直接借用更新提示页主按钮的配色（.upd-btn.primary），
+   只把尺寸压到 46px 高的标题栏里。仅在 has_update 时出现，位置在「更多」左边。 */
+.panel-updbtn {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+/* 形状 / hover 沿用 .upd-btn.primary，颜色单独定死成「蓝底白字」：
+   --panel-accent 在深灰底板（#5A606B）上算出来是浅蓝 #9EC3FF，配白字几乎看不清。
+   选择器带两级是为了压过 .upd-btn.primary 的同名声明。 */
+.upd-btn.primary.panel-updbtn {
+  background: #2f6feb;
+  color: #fff;
+}
+
+.upd-btn.primary.panel-updbtn:hover {
+  filter: brightness(1.12);
+}
+
 .grid {
   flex: 1;
   overflow-y: auto;
@@ -776,23 +797,28 @@ html[data-mode="menu"] #root {
 
 .dlg-win-empty {
   height: 100%;
+  border-radius: var(--panel-radius, 0px);
   background: var(--card-bg);
 }
 
-/* 设置窗口是直角（后端 SET_RADIUS = 0），这里也不能有圆角，否则窗口矩形里会留出
-   四个透明的角。高度由内容决定（height: fit-content），前端量完再让后端把窗口
-   改成一样高，所以正常情况不会出现滚动条；只有内容比屏幕还高时才滚。 */
+/* 高度由内容决定（height: fit-content），前端量完再让后端把窗口改成一样高，
+   所以正常情况不会出现滚动条；只有内容比屏幕还高时才滚。 */
 .dlg {
   width: 100%;
   height: fit-content;
   max-height: 100%;
   overflow-y: auto;
   padding: 14px 18px 10px;
-  border-radius: 0;
+  border-radius: var(--panel-radius, 0px);
   background: var(--card-bg);
   border: 1px solid var(--card-border);
   color: var(--panel-text);
 }
+
+/* .dlg 只用于**设置页**和**版本更新页**：两者的后端窗口都按 panel_radius(app)
+   裁同一半径，前端必须用同一个 --panel-radius，否则圆角外会露出没裁掉的玻璃矩形；
+   关掉开关时是 0px，回到直角方窗。背景走同一个 --card-bg，两个页面都必须调
+   useTheme() 才会拿到用户自定义的面板色（更新页以前漏了，一直是默认深灰）。 */
 
 .dlg::-webkit-scrollbar {
   width: 8px;
@@ -999,6 +1025,75 @@ html[data-mode="menu"] #root {
 .sw.on {
   border-color: var(--panel-accent);
   box-shadow: inset 0 0 0 1px var(--panel-accent);
+}
+
+/* ---------- 取色弹窗（设置窗口内的模态层） ----------
+   点「收纳盒 / 弹出窗口」色块后弹出，调色板和说明文字都搬进这里，设置页本体
+   只留两个色块按钮。用 fixed 铺满 webview 视口；不新建系统窗口，吸管取色时
+   随设置窗口一起 hide/show，回来弹窗还在，颜色由 pick:done 事件填回去。 */
+.dlg-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.dlg-modal-card {
+  width: 100%;
+  max-width: 336px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--card-border);
+  background: var(--card-bg);
+  color: var(--panel-text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+}
+
+.dlg-modal-title {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 0 30px 10px 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* .dlg-x 默认按设置页那 40px 高的标题栏定位，弹窗标题栏只有 26px，重摆一下 */
+.dlg-modal-title .dlg-x {
+  top: -1px;
+  right: -4px;
+}
+
+.dlg-modal-note {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--panel-dim);
+}
+
+/* 外壳已经是卡片了，调色板自己那层边框/底色收掉，避免套两层 */
+.dlg-modal-card .sw-pop {
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.dlg-modal-card::-webkit-scrollbar {
+  width: 6px;
+}
+
+.dlg-modal-card::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 3px;
 }
 
 /* ---------- 自绘调色板 ---------- */
@@ -1347,7 +1442,7 @@ html[data-mode="menu"] #root {
 
 /* ---------- 版本更新窗口 ----------
  *
- * 和设置窗口同一套 .dlg 骨架（直角、无边框、标题栏可拖），
+ * 和设置窗口同一套 .dlg 骨架：圆角、卡片底色、字色全部共用（见 .dlg 规则），
  * 只是内容换成「版本对比 + 更新说明 + 下载」。
  * 窗口是固定尺寸（后端 UPD_W × UPD_H），内容少了也要铺满整块矩形，
  * 否则 transparent 窗口会露出后面桌面的颜色，所以给 min-height: 100%。

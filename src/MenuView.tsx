@@ -20,6 +20,8 @@ export default function MenuView() {
   const renameRef = useRef<{ id: string; name: string } | null>(null);
   const focused = useRef(false);
   const busy = useRef(false);
+  /** 「解散 / 删除」执行中：菜单要等命令返回才收起，挡住连点重复执行 */
+  const deleting = useRef(false);
   /** 正在切换「置顶」：盒子窗口会重建，这段时间内的失焦不收起菜单 */
   const switchingTop = useRef(false);
   /** 免收起的时间戳（切换置顶期间 + 之后一小段，等重建窗口的激活消息消化掉） */
@@ -152,17 +154,25 @@ export default function MenuView() {
     api.hideMenu().catch(() => {});
   };
 
+  /**
+   * 「解散 / 删除收纳盒」：非空时把图标全部放回桌面（盒子留着变空盒，和面板里的
+   * 「解散收纳盒」同一个命令、同一个语义），空盒才真正删除。
+   * 点一下不会连盒子一起没掉，也不再需要「收纳盒非空，不能删除」的置灰提示。
+   */
   const del = async () => {
-    if (!data) return;
-    if (data.count > 0) {
-      setErr(`还有 ${data.count} 个快捷方式，请先移出再删除`);
-      return;
-    }
+    if (!data || deleting.current) return;
+    deleting.current = true;
     try {
-      await api.deleteBox(data.id);
+      if (data.count > 0) {
+        await api.restoreAll(data.id);
+      } else {
+        await api.deleteBox(data.id);
+      }
       hide();
     } catch (e) {
       setErr(String(e));
+    } finally {
+      deleting.current = false;
     }
   };
 
@@ -308,26 +318,34 @@ export default function MenuView() {
 
       <div className="menu-sep" />
 
+      {/* 非空 = 解散（图标回到桌面，盒子留成空盒）；空盒 = 删除。
+          解散不丢数据，所以不标红；只有真删除才用 danger 样式。
+          不再置灰，也不再提示「收纳盒非空，不能删除」。 */}
       <div
-        className={"menu-item danger" + (data.count > 0 ? " disabled" : "")}
-        onClick={() => {
-          if (data.count > 0) {
-            setErr(`还有 ${data.count} 个快捷方式，请先移出再删除`);
-            return;
-          }
-          del();
-        }}
+        className={"menu-item" + (data.count > 0 ? "" : " danger")}
+        onClick={del}
       >
-        删除收纳盒
+        {data.count > 0 ? "解散收纳盒" : "删除收纳盒"}
       </div>
 
-      {(data.count > 0 || err) && (
-        <div className={"menu-hint" + (err ? " bad" : "")}>
-          {err || `收纳盒非空，不能删除`}
-        </div>
-      )}
+      {/* 只剩真出错时才提示（解散 / 删除失败），错误文字会让 fitMenu 补高 */}
+      {err && <div className="menu-hint bad">{err}</div>}
 
       <div className="menu-sep" />
+
+      {/* 和托盘「检查更新…」一致：先把更新窗口亮出来（页面立刻显示「正在检查…」），
+          再联网。菜单先由 run 收起，免得和更新窗口抢焦点。 */}
+      <div
+        className="menu-item"
+        onClick={() =>
+          run(async () => {
+            await api.openUpdateWindow();
+            await api.checkUpdate();
+          })
+        }
+      >
+        检查更新...
+      </div>
 
       <div className="menu-item" onClick={() => run(() => api.quit())}>
         退出 LightBox

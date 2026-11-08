@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { api, BoxView as BoxViewData, Item, PanelTarget } from "./api";
+import type { UpdateState } from "./api";
 import { useTheme } from "./theme";
 
 type MenuState =
@@ -24,6 +25,31 @@ export default function PanelView() {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [toast, setToast] = useState("");
   const [over, setOver] = useState(false);
+  /** 更新状态：面板窗口是复用的、页面只挂载一次，所以「有更新」不能靠挂载时读一次，
+   *  要挂 update:data 事件（和设置页页脚同一条数据源）。 */
+  const [upd, setUpd] = useState<UpdateState | null>(null);
+  useEffect(() => {
+    let alive = true;
+    let un: (() => void) | undefined;
+    api
+      .updateState()
+      .then((v) => {
+        if (alive) setUpd(v);
+      })
+      .catch(() => {});
+    listen<UpdateState>("update:data", (e) => {
+      if (alive) setUpd(e.payload);
+    })
+      .then((f) => {
+        if (alive) un = f;
+        else f();
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+      un?.();
+    };
+  }, []);
   /** 毛玻璃底图：面板背后那块屏幕的模糊快照（后端在窗口显示前截好） */
   const [backdrop, setBackdrop] = useState<string | null>(null);
   /** 多选（Ctrl+点击 / 空白处框选）的文件名；右键菜单对选中集生效 */
@@ -800,6 +826,16 @@ export default function PanelView() {
         )}
         <div className="panel-count">{items.length}</div>
         <div className="spacer" />
+        {/* 有更新才出现：蓝底白字，样式直接借用更新提示页的主按钮 .upd-btn.primary */}
+        {upd?.has_update && (
+          <button
+            className="upd-btn primary panel-updbtn"
+            title={`发现新版本 v${upd.latest}\n点击查看更新说明`}
+            onClick={() => api.openUpdateWindow().catch(() => {})}
+          >
+            有更新
+          </button>
+        )}
         {/* 「＋」已按用户要求移除：它紧挨着标题，容易被当成「往这个盒子里加图标」。
             新建收纳盒的入口在托盘菜单和盒子右键菜单里，功能没少。 */}
         <button
@@ -941,8 +977,13 @@ export default function PanelView() {
           >
             {menu.kind === "header" ? (
               /* 面板里只留和「这一盒的内容」有关的两个动作：
-                 盒子本身的增删改都在桌面盒子的右键菜单里（三点的菜单也指向这里） */
+                 盒子本身的增删改都在桌面盒子的右键菜单里（三点的菜单也指向这里）。
+                 顺序按用户要求：常用的「按名称排序」在上，会清空盒子的「解散收纳盒」
+                 放最下面，免得手滑点到。 */
               <>
+                <div className="ctx-item" onClick={sortByName}>
+                  按名称排序
+                </div>
                 <div
                   className={"ctx-item" + (items.length === 0 ? " disabled" : "")}
                   onClick={() => {
@@ -951,9 +992,6 @@ export default function PanelView() {
                   }}
                 >
                   解散收纳盒
-                </div>
-                <div className="ctx-item" onClick={sortByName}>
-                  按名称排序
                 </div>
               </>
             ) : (

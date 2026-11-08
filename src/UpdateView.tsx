@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { api, UpdateState } from "./api";
+import { useTheme } from "./theme";
 
 /**
  * 「版本更新」窗口。
@@ -12,6 +13,11 @@ import { api, UpdateState } from "./api";
  * 四种状态：检查中 / 有新版本 / 已是最新 / 出错（含「还没配置更新地址」）。
  */
 export default function UpdateView() {
+  // 窗口启动时就建好并隐藏，页面只挂载一次 —— 主题得在这里订阅。
+  // 以前漏了这一句：--card-bg / --panel-radius 一直是 styles.css 的默认深灰 + 0px，
+  // 用户自定义的面板颜色和「圆角窗口」开关都影响不到这一页，跟设置页对不上。
+  // useTheme 会主动拉一次 api.theme() 并订阅 theme:changed，改配色/圆角即时同步。
+  useTheme();
   const [s, setS] = useState<UpdateState | null>(null);
   const [err, setErr] = useState("");
   const [checking, setChecking] = useState(false);

@@ -22,6 +22,12 @@ export default function SettingsView() {
   const [id, setId] = useState("");
   const [view, setView] = useState<BoxViewData | null>(null);
   const [theme, setTheme] = useTheme();
+  /** 取色弹窗在改哪个色块。状态提到这一层：Esc 要先关弹窗、再关设置窗口 */
+  const [colorTarget, setColorTarget] = useState<"box" | "panel" | null>(null);
+  const colorTargetRef = useRef(colorTarget);
+  useEffect(() => {
+    colorTargetRef.current = colorTarget;
+  }, [colorTarget]);
   const themeRef = useRef(theme);
   useEffect(() => {
     themeRef.current = theme;
@@ -130,6 +136,11 @@ export default function SettingsView() {
           (el as HTMLInputElement).blur();
           return;
         }
+        // 取色弹窗开着：第一下 Esc 只关弹窗，别把整个设置页收掉
+        if (colorTargetRef.current) {
+          setColorTarget(null);
+          return;
+        }
         api.hideSettings().catch(() => {});
       }
     };
@@ -160,6 +171,8 @@ export default function SettingsView() {
           onChanged={() => {}}
           onClose={() => api.hideSettings().catch(() => {})}
           onHeight={applyHeight}
+          colorTarget={colorTarget}
+          onColorTarget={setColorTarget}
         />
       ) : view ? (
         <SettingsDialog
@@ -171,6 +184,8 @@ export default function SettingsView() {
           onChanged={() => load(view.id)}
           onClose={() => api.hideSettings().catch(() => {})}
           onHeight={applyHeight}
+          colorTarget={colorTarget}
+          onColorTarget={setColorTarget}
         />
       ) : (
         <div className="dlg-win-empty">…</div>
