@@ -1,15 +1,10 @@
-# ── 依赖 ─────────────────────────────────────────
-node_modules/
-
 # ── 构建产物（可完整重建，不入库）─────────────────
+native/target/
 dist/
-src-tauri/target/
-src-tauri/gen/schemas/
+dist-app/
 
 # ── 安装包与运行目录 ─────────────────────────────
-# exe 走 Gitee Releases 附件，不进 git 历史（每版 3.85MB 会永久占用仓库配额）
-# 这里同时屏蔽掉运行时生成的 config.json / boxes/ / update.json
-dist-app/
+# exe 走 Gitee Releases 附件，不进 git 历史（每版约 0.9MB 会永久占用仓库配额）
 lightbox.exe
 lightbox-v*.exe
 
@@ -18,8 +13,8 @@ config.json
 config.backup.json
 config.before-v*.json
 update.json
+update_url.txt
 boxes/
-update.json.tmp
 
 # ── 本地开发记录 ─────────────────────────────────
 # 含网盘真实提取码、本机绝对路径（用户名），公开仓库不能带
@@ -31,6 +26,9 @@ tools/*.py
 # 个人公众号稿件：只给自己排版用，不进公开仓库
 docs/wechat-guide*.md
 
+# 本机自测清单（含本机路径与内部排查项），只在本地用，不上传 Gitee / GitHub
+docs/test-checklist.md
+
 # ── 编辑器 / 系统 ────────────────────────────────
 .vscode/
 .idea/
@@ -40,3 +38,6 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# 本地排查时抓的临时二进制（无引用，纯垃圾）
+tmp_*.bin

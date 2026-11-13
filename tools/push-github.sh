@@ -14,7 +14,7 @@
 #
 # GitHub 只是**代码镜像**：安装包发布和自动更新仍然只走 Gitee。
 # exe 里的检查更新地址是 `include_str!` 编译期嵌进去的，存量版本改不了，
-# 仓库里 `src-tauri/update-url.txt` 也绝对不能指向 GitHub。
+# 仓库里 `native/update-url.txt` 也绝对不能指向 GitHub。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

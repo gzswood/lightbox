@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# 一键发版：打 tag → push → 建 Gitee 发行版 → 上传 exe 附件
+# 一键发版：构建 → 打 tag → push → 建 Gitee 发行版 → 上传 exe 附件
 #
 # 用法：
 #   export GITEE_TOKEN=<私人令牌>        # 只需配一次（Gitee → 设置 → 私人令牌，勾 projects）
-#   ./tools/release-gitee.sh             # 版本号自动读 src-tauri/Cargo.toml
-#   ./tools/release-gitee.sh --dry-run   # 只打印将要做什么，不联网
+#   ./tools/release-gitee.sh             # 版本号自动读 native/Cargo.toml
+#   ./tools/release-gitee.sh --dry-run   # 只打印将要做什么，不联网、不构建
+#   ./tools/release-gitee.sh --no-build  # 用已有的 native/target/release/lightbox.exe
 #
-# 前置：dist-app/lightbox.exe 已是最新（先跑 npm run build:exe）
-# 说明：exe 不进 git 历史，只作为发行版附件存 1 GB 配额，每版约 3.85 MB。
+# 前置：Rust 1.77+（MSVC 工具链）。构建产物 native/target/release/lightbox.exe。
+# 说明：exe 不进 git 历史，只作为发行版附件存 1 GB 配额，每版约 0.9 MB。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,16 +19,30 @@ export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+BUILD=1
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY=1 ;;
+        --no-build) BUILD=0 ;;
+        *) echo "未知参数：$a" >&2; exit 1 ;;
+    esac
+done
 
-VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/Cargo.toml | head -1)
+VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' native/Cargo.toml | head -1)
 TAG="v$VERSION"
-EXE="dist-app/lightbox.exe"
+EXE="native/target/release/lightbox.exe"
 
 die() { echo "✗ $*" >&2; exit 1; }
 
-[ -n "$VERSION" ] || die "读不到 src-tauri/Cargo.toml 里的 version"
-[ -f "$EXE" ] || die "找不到 $EXE —— 先跑 npm run build:exe"
+[ -n "$VERSION" ] || die "读不到 native/Cargo.toml 里的 version"
+
+# 1) 构建
+if [ "$BUILD" = 1 ]; then
+    command -v cargo >/dev/null || die "找不到 cargo，装 Rust 1.77+（MSVC 工具链）"
+    echo "· 构建 native（release）…"
+    cargo build --release --manifest-path native/Cargo.toml
+fi
+[ -f "$EXE" ] || die "找不到 $EXE —— 先跑 cargo build --release --manifest-path native/Cargo.toml"
 
 # 从 origin 解析 owner/repo，避免写死
 REMOTE=$(git remote get-url origin 2>/dev/null) || die "没有 origin，先 git remote add origin <仓库地址>"
@@ -77,7 +92,7 @@ if [ "$DRY" = 1 ]; then
     exit 0
 fi
 
-# 1) tag + push
+# 2) tag + push
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
     echo "· tag $TAG 已存在，跳过"
 else
@@ -89,7 +104,7 @@ echo "· 已推送"
 
 API="https://gitee.com/api/v5/repos/$OWNER/$REPO"
 
-# 2) 复用已有发行版，没有才创建（重复执行不会报错）
+# 3) 复用已有发行版，没有才创建（重复执行不会报错）
 RID=$(curl -sS "$API/releases/tags/$TAG?access_token=$GITEE_TOKEN" |
     python -c "import json,sys;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
 
@@ -107,7 +122,7 @@ else
     echo "· 复用已有发行版 id=$RID"
 fi
 
-# 3) 上传附件
+# 4) 上传附件
 NAME="lightbox-$VERSION.exe"
 UP=$(curl -sS -X POST "$API/releases/$RID/attach_files" \
     -F "access_token=$GITEE_TOKEN" \
@@ -115,7 +130,7 @@ UP=$(curl -sS -X POST "$API/releases/$RID/attach_files" \
 URL=$(printf '%s' "$UP" | python -c "import json,sys;print(json.load(sys.stdin).get('browser_download_url',''))" 2>/dev/null || true)
 [ -n "$URL" ] || { echo "$UP"; die "上传失败（单文件需 <100 MB）"; }
 
-# 4) 回读校验：说明正文不该出现 U+FFFD（编码坏掉的标志）
+# 5) 回读校验：说明正文不该出现 U+FFFD（编码坏掉的标志）
 BAD=$(curl -sS "$API/releases/tags/$TAG?access_token=$GITEE_TOKEN" |
     python -c "import json,sys;print((json.load(sys.stdin).get('body') or '').count('\ufffd'))" 2>/dev/null || echo 0)
 if [ "$BAD" != "0" ]; then
@@ -131,7 +146,7 @@ echo "  直链       : $URL"
 echo
 echo "（可选）把直链填进 update-site/version.json 的 download 字段，或直接改站点首页按钮"
 
-# 5) 代码镜像：配了 github remote 就顺手同步一份（GitHub 只是代码托管，发版仍在 Gitee）
+# 6) 代码镜像：配了 github remote 就顺手同步一份（GitHub 只是代码托管，发版仍在 Gitee）
 if git remote get-url github >/dev/null 2>&1; then
     echo
     echo "· 同步代码镜像到 GitHub…"
