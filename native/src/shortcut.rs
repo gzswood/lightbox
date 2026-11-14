@@ -16,19 +16,23 @@
 
 use std::path::{Path, PathBuf};
 
-use windows::core::Interface;
-use windows::Win32::Foundation::CloseHandle;
+use windows::core::{BOOL, Interface};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows::Win32::System::Threading::{
-    CreateProcessW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-    STARTUPINFOW,
+    CreateProcessW, GetCurrentProcessId, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+    STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
+use windows::Win32::UI::Controls::{TCIF_TEXT, TCITEMW, TCM_GETITEMRECT, TCM_GETITEMW};
 use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+    SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, SW_SHOWNORMAL,
+};
 
 use crate::util::wide;
 
@@ -387,12 +391,21 @@ pub fn reveal(path: &str) -> Result<(), String> {
     }
 }
 
-/// 文件的属性窗口（系统自带的那个）。
+/// 文件的属性窗口（系统自带的那个），默认停在「快捷方式」那一页。
+///
+/// 系统的属性对话框永远从第一页（常规）开始，没有官方参数能指定页
+/// （`SHObjectProperties` 的 page 参数早就不起作用，`SEE_MASK_INVOKEIDLIST`
+/// 走 IContextMenu 的 properties 动词也一样）。而用户点「属性」要看的基本
+/// 都是快捷方式本身（目标程序、参数、起始位置），所以弹出来之后替它点一下
+/// 那个标签：见 `focus_shortcut_tab`。
 pub fn properties(path: &str) -> Result<(), String> {
     let p = Path::new(path);
     if !p.exists() {
         return Err("文件已不存在".into());
     }
+    // 先挂上监视线程再弹：ShellExecuteW 是同步的，对话框在自己的模态循环里
+    // 跑，这一行不返回，只能另开线程去点标签。
+    focus_shortcut_tab();
     unsafe {
         let params = windows::core::HSTRING::from(format!("\"{}\"", path));
         let params_ptr = windows::core::PCWSTR(params.as_ptr());
@@ -410,6 +423,132 @@ pub fn properties(path: &str) -> Result<(), String> {
             Err("打开属性失败".into())
         }
     }
+}
+
+/// 等属性对话框出现，然后把标签切到「快捷方式」。
+///
+/// 只在**自己进程**的 `#32770` 窗口里找，而且要求它有标签控件、标签里有
+/// 「快捷方式 / Shortcut」—— 别的弹窗（比如我们自己的警告框）不会被误点；
+/// 普通文件（exe、文档）没有这一页，等两秒就静默退出。
+fn focus_shortcut_tab() {
+    std::thread::spawn(|| unsafe {
+        // 最多等 3 秒：慢机器上属性对话框可能要一秒多才把标签画出来
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let Some(sheet) = property_sheet() else { continue };
+            let Some(tab) = tab_control(sheet) else { continue };
+            let Some(idx) = shortcut_tab_index(tab) else { return };
+            // 已经是这一页就别动（用户手快自己点过去的）
+            let cur = SendMessageW(tab, 0x130B /* TCM_GETCURSEL */, None, None);
+            if cur.0 == idx as isize {
+                return;
+            }
+            if click_tab_item(tab, idx) {
+                return;
+            }
+        }
+    });
+}
+
+/// 本进程里第一个可见的对话框（`#32770`）
+unsafe fn property_sheet() -> Option<HWND> {
+    let mut found: Vec<HWND> = Vec::new();
+    let _ = EnumWindows(
+        Some(collect_sheets),
+        LPARAM(&mut found as *mut Vec<HWND> as isize),
+    );
+    found.into_iter().next()
+}
+
+unsafe extern "system" fn collect_sheets(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let out = &mut *(lp.0 as *mut Vec<HWND>);
+    if !IsWindowVisible(hwnd).as_bool() {
+        return TRUE;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != GetCurrentProcessId() {
+        return TRUE;
+    }
+    if class_name(hwnd) == "#32770" {
+        out.push(hwnd);
+    }
+    TRUE
+}
+
+/// 对话框里的标签控件（`SysTabControl32`），递归找一层就够用
+unsafe fn tab_control(parent: HWND) -> Option<HWND> {
+    let mut found: Vec<HWND> = Vec::new();
+    let _ = EnumChildWindows(
+        Some(parent),
+        Some(collect_tabs),
+        LPARAM(&mut found as *mut Vec<HWND> as isize),
+    );
+    found.into_iter().next()
+}
+
+unsafe extern "system" fn collect_tabs(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let out = &mut *(lp.0 as *mut Vec<HWND>);
+    if class_name(hwnd) == "SysTabControl32" {
+        out.push(hwnd);
+    }
+    TRUE
+}
+
+unsafe fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut buf);
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// 「快捷方式」标签的位置；没有这一页返回 None
+unsafe fn shortcut_tab_index(tab: HWND) -> Option<usize> {
+    let n = SendMessageW(tab, 0x1304 /* TCM_GETITEMCOUNT */, None, None).0;
+    for i in 0..n.max(0) as usize {
+        let mut buf = [0u16; 64];
+        let mut item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: windows::core::PWSTR(buf.as_mut_ptr()),
+            cchTextMax: buf.len() as i32,
+            ..Default::default()
+        };
+        SendMessageW(
+            tab,
+            TCM_GETITEMW,
+            Some(WPARAM(i)),
+            Some(LPARAM(&mut item as *mut TCITEMW as isize)),
+        );
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let text = String::from_utf16_lossy(&buf[..len]);
+        if text.contains("快捷方式") || text.eq_ignore_ascii_case("shortcut") {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 用一对鼠标消息点一下第 `idx` 个标签。
+///
+/// 不用 `TCM_SETCURSEL`：那个只挪高亮，属性页不会跟着换（页面靠
+/// `TCN_SELCHANGE` 通知切换）。发真鼠标消息最省事，也不用动用户的光标。
+unsafe fn click_tab_item(tab: HWND, idx: usize) -> bool {
+    let mut rc = RECT::default();
+    let ok = SendMessageW(
+        tab,
+        TCM_GETITEMRECT,
+        Some(WPARAM(idx)),
+        Some(LPARAM(&mut rc as *mut RECT as isize)),
+    )
+    .0;
+    if ok == 0 {
+        return false;
+    }
+    let x = (rc.left + rc.right) / 2;
+    let y = (rc.top + rc.bottom) / 2;
+    let lp = LPARAM(((y as isize) << 16) | (x as isize & 0xFFFF));
+    SendMessageW(tab, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(lp));
+    SendMessageW(tab, WM_LBUTTONUP, Some(WPARAM(0)), Some(lp));
+    true
 }
 
 #[cfg(test)]
@@ -534,5 +673,63 @@ mod tests {
                 "环境块里没有 USERPROFILE：{text:?}"
             );
         }
+    }
+
+    /// 手动跑：`cargo test --release 属性对话框默认停在快捷方式页 -- --ignored --nocapture`
+    ///
+    /// 会真的弹一个属性对话框（约 3 秒后自己关掉），验证监视线程把标签点到了
+    /// 「快捷方式」。平时不跑 —— 它需要桌面会话，跑测试的机器上会有窗口闪烁。
+    #[test]
+    #[ignore]
+    fn 属性对话框默认停在快捷方式页() {
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+        let dir = std::env::temp_dir().join("lightbox_props_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let lnk = dir.join("prop.lnk");
+        let _ = std::fs::remove_file(&lnk);
+        let exe = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let wd = dir.to_string_lossy().to_string();
+        assert!(make_lnk(&exe, "", &wd, &lnk), "造 .lnk 失败");
+
+        let path = lnk.to_string_lossy().to_string();
+        let worker = std::thread::spawn(move || {
+            let _ = properties(&path);
+        });
+
+        let mut sheet = None;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            unsafe {
+                if let Some(h) = property_sheet() {
+                    if tab_control(h).is_some() {
+                        sheet = Some(h);
+                        break;
+                    }
+                }
+            }
+        }
+        let sheet = sheet.expect("等不到属性对话框");
+        // 留时间给监视线程点标签
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let (cur, want) = unsafe {
+            let tab = tab_control(sheet).expect("找不到标签控件");
+            (
+                SendMessageW(tab, 0x130B /* TCM_GETCURSEL */, None, None).0,
+                shortcut_tab_index(tab).expect("标签里没有「快捷方式」") as isize,
+            )
+        };
+        unsafe {
+            let _ = PostMessageW(
+                Some(sheet),
+                0x0010, /* WM_CLOSE */
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        let _ = worker.join();
+        let _ = std::fs::remove_file(&lnk);
+        assert_eq!(cur, want, "属性页没停在「快捷方式」");
     }
 }

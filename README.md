@@ -6,7 +6,7 @@
 
 单文件 exe，绿色免安装，约 **1.0 MB**。所有收纳盒合成**一条长条**，整条嵌进任务栏。
 
-[![版本](https://img.shields.io/badge/version-1.0.0-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
+[![版本](https://img.shields.io/badge/version-1.0.1-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
 [![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square&logo=windows&logoColor=white)](#系统要求)
 [![协议](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)

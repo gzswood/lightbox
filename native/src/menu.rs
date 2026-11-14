@@ -6,15 +6,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_MENU};
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow,
-    SetForegroundWindow, TrackPopupMenuEx, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    SetForegroundWindow, SetMenuItemBitmaps, TrackPopupMenuEx, HMENU, MF_BYPOSITION, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SM_CXMENUCHECK, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON,
 };
 
 use crate::app::app;
 use crate::config::{self, Item};
+use crate::icons::MenuGlyph;
 use crate::{autostart, desktop, log};
 
 const ID_BASE: usize = 1000;
@@ -34,7 +37,10 @@ enum Act {
     // 长条
     BoxSettings,
     ToggleTopmost,
-    ToggleDesktopMode,
+    /// 主界面模式 → 桌面模式
+    ModeDesktop,
+    /// 主界面模式 → 任务栏模式
+    ModeTaskbar,
     Autostart,
     DeleteBox,
     NewBox,
@@ -61,6 +67,10 @@ struct MenuItem {
     text: String,
     checked: bool,
     disabled: bool,
+    /// 左侧的小图标（`None` = 不画，但菜单仍会为图标留出位置）
+    icon: Option<MenuGlyph>,
+    /// 非空就是个二级菜单，点它展开这些子项
+    children: Vec<MenuItem>,
     act: Option<Act>,
 }
 
@@ -69,8 +79,37 @@ fn item(text: impl Into<String>, act: Act) -> MenuItem {
         text: text.into(),
         checked: false,
         disabled: false,
+        icon: None,
+        children: Vec::new(),
         act: Some(act),
     }
+}
+
+/// 二级菜单。子项各自带动作，父项自己不触发任何事。
+fn submenu(text: impl Into<String>, children: Vec<MenuItem>) -> MenuItem {
+    MenuItem {
+        text: text.into(),
+        checked: false,
+        disabled: false,
+        icon: None,
+        children,
+        act: None,
+    }
+}
+
+/// 「主界面模式」二级菜单。
+///
+/// `bar.desktop == true` 就是桌面模式。这层映射单独抽出来是因为之前写反过
+/// （勾打在了另一项上），表现是「看着当前模式是任务栏，点桌面模式却没反应」。
+fn mode_submenu(desktop: bool) -> MenuItem {
+    submenu(
+        "主界面模式",
+        vec![
+            item("桌面模式", Act::ModeDesktop).checked(desktop),
+            item("任务栏模式", Act::ModeTaskbar).checked(!desktop),
+        ],
+    )
+    .icon(MenuGlyph::Mode)
 }
 
 fn header(text: impl Into<String>) -> MenuItem {
@@ -78,6 +117,8 @@ fn header(text: impl Into<String>) -> MenuItem {
         text: text.into(),
         checked: false,
         disabled: true,
+        icon: None,
+        children: Vec::new(),
         act: None,
     }
 }
@@ -88,6 +129,8 @@ fn sep() -> MenuItem {
         text: String::new(),
         checked: false,
         disabled: false,
+        icon: None,
+        children: Vec::new(),
         act: None,
     }
 }
@@ -95,6 +138,11 @@ fn sep() -> MenuItem {
 impl MenuItem {
     fn checked(mut self, on: bool) -> Self {
         self.checked = on;
+        self
+    }
+
+    fn icon(mut self, g: MenuGlyph) -> Self {
+        self.icon = Some(g);
         self
     }
 }
@@ -115,18 +163,66 @@ pub fn grab_foreground(hwnd: HWND) {
     }
 }
 
-/// 在光标处弹一个菜单，返回被选中的动作（None = 用户取消）
-fn popup(items: &[MenuItem]) -> Option<Act> {
+/// 系统菜单的底色和图标该用的颜色。
+///
+/// 菜单是系统画的，颜色只能问系统：`COLOR_MENU` 在浅色主题是浅灰、深色主题是深灰。
+/// 图标蓝色跟着底色的明暗走（`accent_on`），深底用亮蓝、浅底用深蓝。
+fn menu_colors() -> ((u8, u8, u8), (u8, u8, u8)) {
+    let c = unsafe { GetSysColor(COLOR_MENU) };
+    let bg = (
+        (c & 0xff) as u8,
+        ((c >> 8) & 0xff) as u8,
+        ((c >> 16) & 0xff) as u8,
+    );
+    (bg, crate::theme::accent_on(bg))
+}
+
+/// 菜单左侧图标位的边长（跟系统的勾选标记同宽，正好塞进去不被裁）
+fn menu_icon_size() -> i32 {
+    unsafe { GetSystemMetrics(SM_CXMENUCHECK) }.clamp(12, 40)
+}
+
+/// 给第 `pos` 项贴上图标位图
+fn set_image(menu: HMENU, pos: usize, g: MenuGlyph, bg: (u8, u8, u8), fg: (u8, u8, u8)) {
+    let Some(hb) = crate::icons::menu_bitmap(g, menu_icon_size(), bg, fg) else {
+        return;
+    };
+    unsafe {
+        // 两个槽位给同一张：这些项都不打勾，省得「勾选状态换一张图」
+        let _ = SetMenuItemBitmaps(menu, pos as u32, MF_BYPOSITION, Some(hb), Some(hb));
+    }
+}
+
+/// 递归建菜单。叶子项按出现顺序拿 id（`ID_BASE + n`），
+/// 返回值里这张表就能把 cmd 反查回动作 —— 二级菜单的项也在其中。
+fn build_menu(items: &[MenuItem], acts: &mut Vec<Option<Act>>) -> Option<HMENU> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
-        for (i, it) in items.iter().enumerate() {
+        let (bg, fg) = menu_colors();
+        let mut pos = 0usize;
+        for it in items {
             if it.text.is_empty() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, &windows::core::HSTRING::from(""));
+                pos += 1;
+                continue;
+            }
+            if !it.children.is_empty() {
+                let sub = build_menu(&it.children, acts)?;
+                let mut flags = MF_POPUP;
+                if it.disabled {
+                    flags |= MF_GRAYED | MF_DISABLED;
+                }
+                // MF_POPUP 时第三个参数是**子菜单句柄**，不是 id
                 let _ = AppendMenuW(
                     menu,
-                    MF_SEPARATOR,
-                    0,
-                    &windows::core::HSTRING::from(""),
+                    flags,
+                    sub.0 as usize,
+                    &windows::core::HSTRING::from(it.text.as_str()),
                 );
+                if let Some(g) = it.icon {
+                    set_image(menu, pos, g, bg, fg);
+                }
+                pos += 1;
                 continue;
             }
             let mut flags = MF_STRING;
@@ -136,13 +232,34 @@ fn popup(items: &[MenuItem]) -> Option<Act> {
             if it.disabled {
                 flags |= MF_GRAYED | MF_DISABLED;
             }
+            let id = ID_BASE + acts.len();
+            acts.push(it.act);
             let _ = AppendMenuW(
                 menu,
                 flags,
-                ID_BASE + i,
+                id,
                 &windows::core::HSTRING::from(it.text.as_str()),
             );
+            if let Some(g) = it.icon {
+                set_image(menu, pos, g, bg, fg);
+            }
+            pos += 1;
         }
+        Some(menu)
+    }
+}
+
+/// 给别处自己建的菜单项贴图标（托盘菜单就是这么用的，按位置第几项）
+pub fn attach_icon(menu: HMENU, position: usize, g: MenuGlyph) {
+    let (bg, fg) = menu_colors();
+    set_image(menu, position, g, bg, fg);
+}
+
+/// 在光标处弹一个菜单，返回被选中的动作（None = 用户取消）
+fn popup(items: &[MenuItem]) -> Option<Act> {
+    unsafe {
+        let mut acts: Vec<Option<Act>> = Vec::new();
+        let menu = build_menu(items, &mut acts)?;
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         // 用隐藏的宿主窗口当菜单 owner：长条是 WS_EX_NOACTIVATE 的，
@@ -159,12 +276,12 @@ fn popup(items: &[MenuItem]) -> Option<Act> {
             None,
         );
         MENU_OPEN.store(false, Ordering::Relaxed);
+        // DestroyMenu 会连子菜单一起销毁
         let _ = DestroyMenu(menu);
         if cmd.0 == 0 {
             return None;
         }
-        let idx = cmd.0 as usize - ID_BASE;
-        items.get(idx).and_then(|it| it.act)
+        acts.get(cmd.0 as usize - ID_BASE).copied().flatten()
     }
 }
 
@@ -186,16 +303,13 @@ pub fn box_menu(idx: usize) {
         item("恢复默认图标", Act::ResetBoxIcon),
         sep(),
         item("置顶", Act::ToggleTopmost).checked(topmost),
-        item(
-            if desktop { "嵌入任务栏" } else { "桌面模式" },
-            Act::ToggleDesktopMode,
-        ),
         item("开机自启", Act::Autostart).checked(autostart::enabled()),
-        item("设置…", Act::BoxSettings),
+        mode_submenu(desktop),
+        item("设置…", Act::BoxSettings).icon(MenuGlyph::Settings),
         sep(),
-        item("新建收纳盒", Act::NewBox),
-        item("解散收纳盒（图标放回桌面）", Act::DissolveBox),
-        item("删除收纳盒", Act::DeleteBox),
+        item("新建收纳盒", Act::NewBox).icon(MenuGlyph::NewBox),
+        item("解散收纳盒（图标放回桌面）", Act::DissolveBox).icon(MenuGlyph::Dissolve),
+        item("删除收纳盒", Act::DeleteBox).icon(MenuGlyph::Delete),
         sep(),
         item("退出", Act::Exit),
     ]);
@@ -210,25 +324,8 @@ pub fn box_menu(idx: usize) {
             drop(g);
             crate::bar::refresh();
         }
-        Some(Act::ToggleDesktopMode) => {
-            let mut g = app().cfg.lock().unwrap();
-            g.bar.desktop = !g.bar.desktop;
-            let desktop = g.bar.desktop;
-            if desktop {
-                // 刚切到桌面模式：清掉旧坐标，让长条落到默认位置
-                // （任务栏上边缘、屏幕水平中间）
-                g.bar.x = 0;
-                g.bar.y = 0;
-            }
-            config::save(&g);
-            drop(g);
-            crate::bar::refresh();
-            log::info(if desktop {
-                "已切换到桌面模式"
-            } else {
-                "已嵌入任务栏"
-            });
-        }
+        Some(Act::ModeDesktop) => set_desktop_mode(true),
+        Some(Act::ModeTaskbar) => set_desktop_mode(false),
         Some(Act::Autostart) => toggle_autostart(),
         Some(Act::SetBoxIcon) => {
             set_box_icon(&id);
@@ -274,6 +371,30 @@ pub fn box_menu(idx: usize) {
         }
         _ => {}
     }
+}
+
+/// 切换主界面模式（`true` = 桌面模式，`false` = 任务栏模式）。
+/// 已经是目标模式就什么都不做 —— 菜单里两项是互斥的，点到当前项不该再刷一次。
+fn set_desktop_mode(desktop: bool) {
+    let mut g = app().cfg.lock().unwrap();
+    if g.bar.desktop == desktop {
+        return;
+    }
+    g.bar.desktop = desktop;
+    if desktop {
+        // 刚切到桌面模式：清掉旧坐标，让长条落到默认位置
+        // （任务栏上边缘、屏幕水平中间）
+        g.bar.x = 0;
+        g.bar.y = 0;
+    }
+    config::save(&g);
+    drop(g);
+    crate::bar::refresh();
+    log::info(if desktop {
+        "已切换到桌面模式"
+    } else {
+        "已切换到任务栏模式"
+    });
 }
 
 /// 切换开机自启（盒子和托盘菜单共用）
@@ -346,9 +467,9 @@ fn warn(text: &str) {
 /// 长条空白处（非分段）的右键菜单
 pub fn bar_menu() {
     let picked = popup(&[
-        item("新建收纳盒", Act::NewBox),
+        item("新建收纳盒", Act::NewBox).icon(MenuGlyph::NewBox),
         sep(),
-        item("设置…", Act::GlobalSettings),
+        item("设置…", Act::GlobalSettings).icon(MenuGlyph::Settings),
         sep(),
         item("打开数据目录", Act::OpenDataDir),
         sep(),
@@ -503,4 +624,36 @@ fn find_box_id(path: &str) -> Option<String> {
         .iter()
         .find(|b| p.starts_with(config::box_dir(&b.id)))
         .map(|b| b.id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 主界面模式子菜单的勾必须落在**当前**那一项上
+    #[test]
+    fn 模式子菜单勾在当前模式上() {
+        for desktop in [false, true] {
+            let m = mode_submenu(desktop);
+            assert_eq!(m.text, "主界面模式");
+            assert_eq!(m.children.len(), 2, "子菜单应该只有两项");
+            let checked: Vec<&str> = m
+                .children
+                .iter()
+                .filter(|c| c.checked)
+                .map(|c| c.text.as_str())
+                .collect();
+            let want = if desktop { "桌面模式" } else { "任务栏模式" };
+            assert_eq!(checked, vec![want], "desktop={desktop} 时勾错了项");
+
+            // 点下去的动作要和文字对得上
+            for c in &m.children {
+                match c.text.as_str() {
+                    "桌面模式" => assert_eq!(c.act, Some(Act::ModeDesktop)),
+                    "任务栏模式" => assert_eq!(c.act, Some(Act::ModeTaskbar)),
+                    other => panic!("多出来的子项：{other}"),
+                }
+            }
+        }
+    }
 }

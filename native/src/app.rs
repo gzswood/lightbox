@@ -171,12 +171,7 @@ fn show_tray_menu(hwnd: HWND) {
             IDM_HIDE_BAR,
             &windows::core::HSTRING::from("隐藏主界面"),
         );
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING,
-            IDM_SETTINGS,
-            &windows::core::HSTRING::from("设置…"),
-        );
+        // 「开机自启」在「设置」上面：开关类的项放一起，设置属于下面的操作区
         let mut flags = MF_STRING;
         if autostart::enabled() {
             flags |= MF_CHECKED;
@@ -187,6 +182,14 @@ fn show_tray_menu(hwnd: HWND) {
             IDM_AUTOSTART,
             &windows::core::HSTRING::from("开机自启"),
         );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_SETTINGS,
+            &windows::core::HSTRING::from("设置…"),
+        );
+        // 位置从 0 数：显示 / 隐藏 / 开机自启 / 设置…
+        crate::menu::attach_icon(menu, 3, crate::icons::MenuGlyph::Settings);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, &windows::core::HSTRING::from(""));
         let _ = AppendMenuW(
             menu,

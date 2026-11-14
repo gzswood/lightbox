@@ -949,9 +949,12 @@ fn on_mouse_up(hwnd: HWND, x: i32, y: i32) {
     repaint(hwnd);
 }
 
-/// 右键：头部出「更多」菜单；图标上对选中集生效
+/// 右键：头部和空白处都出「⋯」那个菜单；图标上对选中集生效
 fn on_right_click(x: i32, y: i32) {
-    if y < head_h() {
+    let head_or_blank = y < head_h() || item_at(x, y).is_none();
+    if head_or_blank {
+        // 空白处（图标网格的空位）和标题栏走同一套动作：排序 / 解散，
+        // 免得用户在面板里点右键什么都没有。
         let id = state().lock().unwrap().box_id.clone();
         crate::menu::panel_header_menu(&id);
         return;
