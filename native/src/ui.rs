@@ -12,11 +12,11 @@
 
 use windows::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, GetStockObject, GetTextExtentPoint32W,
-    GetTextMetricsW, MoveToEx, Polygon, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HGDIOBJ, NULL_BRUSH, OUT_DEFAULT_PRECIS, TEXTMETRICW,
-    TRANSPARENT,
+    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, GetCharWidth32W, GetStockObject,
+    GetTextExtentPoint32W, GetTextMetricsW, MoveToEx, Polygon, SelectObject, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
+    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, HGDIOBJ, NULL_BRUSH,
+    OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::Graphics::Gdi::{CreatePen, PS_SOLID};
 use windows::Win32::Graphics::Gdi::HDC;
@@ -331,6 +331,27 @@ impl Gfx {
         }
     }
 
+    /// 实心多边形（顶点按顺序给，顺逆时针都行）
+    pub fn fill_poly(&self, pts: &[(i32, i32)], c: (u8, u8, u8)) {
+        if pts.len() < 3 {
+            return;
+        }
+        unsafe {
+            let col = colorref(c.0, c.1, c.2);
+            let brush = CreateSolidBrush(col);
+            // 同色 1px 描边：把多边形边缘的锯齿缺口填平，看起来更饱满
+            let pen = CreatePen(PS_SOLID, 1, col);
+            let old_brush = SelectObject(self.hdc, HGDIOBJ(brush.0));
+            let old_pen = SelectObject(self.hdc, HGDIOBJ(pen.0));
+            let points: Vec<POINT> = pts.iter().map(|&(x, y)| POINT { x, y }).collect();
+            let _ = Polygon(self.hdc, &points);
+            SelectObject(self.hdc, old_brush);
+            SelectObject(self.hdc, old_pen);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+    }
+
     /// 画一段文字
     pub fn text(&self, x: i32, y: i32, w: i32, h: i32, s: &str, c: (u8, u8, u8), align: Align) {
         if s.is_empty() || w <= 0 {
@@ -365,6 +386,22 @@ impl Gfx {
             let _ = GetTextExtentPoint32W(self.hdc, &buf, &mut sz);
             sz.cx
         }
+    }
+
+    /// 量一段文字**实际进位**的宽度（光标定位用，别拿它排布局）
+    ///
+    /// `text_w` 用的是 `GetTextExtentPoint32W`，它对同一串文字会比 GDI 真正走出来的
+    /// 宽度多算一点：16px 的「#00393B」量出 73px，`TextOutW` 画笔实际只走 65px。
+    /// 光标按它摆就会离文字空出小半个字符（取色器 hex 框上就是这个毛病）。
+    /// 这里改成逐字取 `GetCharWidth32W` 再相加，和绘制时的进位一致。
+    pub fn text_w_exact(&self, s: &str) -> i32 {
+        let mut total = 0;
+        for ch in s.chars() {
+            let mut w = 0i32;
+            let ok = unsafe { GetCharWidth32W(self.hdc, ch as u32, ch as u32, &mut w) };
+            total += if ok.as_bool() { w } else { ch.len_utf16() as i32 * self.px / 2 };
+        }
+        total
     }
 
     /// 画一个开关：轨道 + 圆钮。`on` 为真时是蓝色。

@@ -23,8 +23,9 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, EnumFontFamiliesExW, GetDC, ReleaseDC, SelectObject,
-    SetBkColor, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, DEFAULT_CHARSET, DIB_RGB_COLORS,
+    DeleteObject, EndPaint, EnumFontFamiliesExW, GetDC, IntersectClipRect, ReleaseDC,
+    SelectClipRgn, SelectObject, SetBkColor, SetTextColor, SetViewportOrgEx, BITMAPINFO,
+    BITMAPINFOHEADER, DEFAULT_CHARSET, DIB_RGB_COLORS,
     HBRUSH, HDC, HGDIOBJ, HFONT, InvalidateRect, LOGFONTW, PAINTSTRUCT, SRCCOPY, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -98,11 +99,32 @@ const DSIDEBAR: f32 = 160.0;
 const DPAD: f32 = 22.0;
 const DFOOT: f32 = 60.0;
 const DNAV: f32 = 42.0;
-const DROW_H: f32 = 46.0;
+/// 一行的高度。原来 46，加「解散 / 删除」按钮后压到 42：
+/// 行内 38 高，刚好还能塞下 32 的图标和 24 的箭头。
+const DROW_H: f32 = 42.0;
 const DBTN_W: f32 = 84.0;
 const DBTN_H: f32 = 34.0;
-/// 收纳盒列表下面要留给「隐藏名称开关 + 主界面模式」的空间
-const ROW_AREA_BOTTOM: f32 = 140.0;
+/// 内容区起始 y。页头标题 8~36、副标题 36~54，这里只留 20 的间隙 ——
+/// 原来是 110/128 起步，中间空出一大块，看着很空。
+const DCONTENT_TOP: f32 = 74.0;
+/// 内容区下边界：贴着页脚分隔线（页脚线在 DH - DFOOT），留 6 的余量
+const DCONTENT_GAP: f32 = 6.0;
+/// 列表下方「+」按钮：距最后一行 8、168×34、主色底白加号
+const DADD_GAP: f32 = 8.0;
+const DADD_W: f32 = 168.0;
+const DADD_H: f32 = 34.0;
+/// 开关行 / 主界面模式标题 / 模式按钮相对「最后一行底部」的偏移
+/// （开关标题画在命中区上方 14，所以 DSWITCH_Y 要按这个再算回来）
+const DSWITCH_Y: f32 = 76.0;
+const DMODE_LABEL_Y: f32 = 127.0;
+const DMODE_BTN_Y: f32 = 153.0;
+/// 行下方那一整块（+ 按钮 / 开关 / 主界面模式）的总高，
+/// 用来算「整页要不要滚动」：5 个盒子刚好不滚动，6 个起出现滚动条。
+const DBLOCK_H: f32 = 209.0;
+/// 页面滚动条宽度（贴在窗口右边缘的细条）
+const DSCROLL_W: f32 = 5.0;
+/// 行内「解散 / 删除」按钮宽度
+const DROWBTN_W: f32 = 78.0;
 /// 关于页「更新信息」文本框（只有查到新版本时才画），在检查更新按钮下方
 const DNOTES_TOP: f32 = 332.0;
 const DNOTES_BOTTOM: f32 = 490.0;
@@ -163,8 +185,16 @@ enum Hit {
     BoxRow(usize),
     BoxIcon(usize),
     BoxName(usize),
+    /// 行内「解散收纳盒」：图标放回桌面，盒子留着
+    BoxDissolve(usize),
+    /// 行内「删除收纳盒」：只有空盒子能删
+    BoxDelete(usize),
     BoxUp(usize),
     BoxDown(usize),
+    /// 列表下方「+」：新建收纳盒
+    NewBox,
+    /// 列表右侧滚动条（拖动手柄 / 点空白处翻页）
+    Scrollbar,
     Slider,
     Swatch(ColorTarget),
     ResetColor,
@@ -191,10 +221,35 @@ enum Hit {
 struct Layout {
     hits: Vec<(Hit, RECT)>,
     rows: Vec<RECT>,
+    /// 整页滚动条：（轨道, 手柄）。内容装得下时为 None
+    scrollbar: Option<(RECT, RECT)>,
 }
 
 fn hit_rect(lay: &Layout, hit: Hit) -> Option<RECT> {
     lay.hits.iter().find(|(h, _)| *h == hit).map(|(_, r)| *r)
+}
+
+/// 内容区的上下边界（绘制裁剪、滚动条、滚轮、拖拽手柄共用同一份算术）
+fn content_band(scale: f32) -> (i32, i32) {
+    let r = |v: f32| (v * scale).round() as i32;
+    (
+        r(DCONTENT_TOP),
+        r(DH) - r(DFOOT) - r(DCONTENT_GAP),
+    )
+}
+
+/// 外观 / 功能两页的坐标是写死的绝对值（110 / 128 起），
+/// 统一上移到 DCONTENT_TOP：绘制时用 `SetViewportOrgEx` 整体平移，
+/// 命中测试时把鼠标 y 反向补回来，两边就还是同一套数。
+fn content_shift(tab: Tab, scale: f32) -> i32 {
+    let r = |v: f32| (v * scale).round() as i32;
+    match tab {
+        Tab::Look => r(DCONTENT_TOP) - r(110.0),
+        // 功能页第一项是开关行，标题画在命中区上方 14 处，
+        // 所以要让「命中区顶 128」落到 DCONTENT_TOP + 14，标题才贴着内容区顶。
+        Tab::Features => r(DCONTENT_TOP) + r(14.0) - r(128.0),
+        _ => 0,
+    }
 }
 
 fn contains(r: &RECT, x: i32, y: i32) -> bool {
@@ -205,7 +260,6 @@ fn contains(r: &RECT, x: i32, y: i32) -> bool {
 #[derive(Clone, Copy)]
 struct Ctx {
     scale: f32,
-    h: i32,
     sx: i32,
     cx: i32,
     cr: i32,
@@ -239,8 +293,10 @@ struct Settings {
     autostart_orig: bool,
     /// 选中的盒子在 `draft.boxes` 里的下标
     selected: usize,
-    /// 列表滚动到第几个盒子
-    scroll: usize,
+    /// 收纳盒页整页滚动位移（设备像素，向下为正）
+    page: i32,
+    /// 正在拖整页滚动条：抓住手柄时的鼠标相对手柄顶部的偏移（像素）
+    scroll_drag: Option<i32>,
     /// 关于页「更新信息」文本框滚到第几行
     notes_scroll: usize,
     hover: Option<Hit>,
@@ -281,7 +337,8 @@ fn state() -> &'static Mutex<Settings> {
             autostart: false,
             autostart_orig: false,
             selected: 0,
-            scroll: 0,
+            page: 0,
+            scroll_drag: None,
             notes_scroll: 0,
             hover: None,
             dragging: false,
@@ -357,17 +414,15 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
     let id = box_id.unwrap_or("").to_string();
     let scale = display_scale();
     let selected = cfg.boxes.iter().position(|b| b.id == id).unwrap_or(0);
-    let visible = layout(
-        scale,
-        Tab::Boxes,
-        cfg.boxes.len(),
-        0,
-        crate::updater::has_update(),
-    )
-    .rows
-    .len()
-    .max(1);
-    let scroll = selected.saturating_sub(visible.saturating_sub(1));
+    // 从托盘 / 面板点某个盒子的「设置…」进来时，把它滚到能看见的位置
+    let row_h = (DROW_H * scale).round() as i32;
+    let (ctop, cbot) = content_band(scale);
+    let view = cbot - ctop;
+    let content_h = cfg.boxes.len() as i32 * row_h + (DBLOCK_H * scale).round() as i32;
+    let max_page = (content_h - view).max(0);
+    let page = (((selected as i32) + 1) * row_h - view)
+        .max(0)
+        .min(max_page);
 
     {
         let mut s = state().lock().unwrap();
@@ -378,7 +433,8 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
         s.autostart = auto;
         s.autostart_orig = auto;
         s.selected = selected;
-        s.scroll = scroll;
+        s.page = page;
+        s.scroll_drag = None;
         s.hover = None;
         s.dragging = false;
         s.drag_win = None;
@@ -563,7 +619,8 @@ fn dirty() -> bool {
 // —— 布局 ——
 
 /// 算出所有可点区域和列表行矩形。绘制和命中测试共用这一份，避免两处对不上。
-fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: bool) -> Layout {
+/// `page` = 整页滚动位移（设备像素，向下为正）。
+fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -> Layout {
     let r = |v: f32| (v * scale).round() as i32;
     let w = r(DW);
     let h = r(DH);
@@ -573,6 +630,7 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
     let cr = w - pad;
     let mut hits: Vec<(Hit, RECT)> = Vec::new();
     let mut rows: Vec<RECT> = Vec::new();
+    let mut scrollbar: Option<(RECT, RECT)> = None;
 
     // 关闭按钮
     hits.push((
@@ -626,12 +684,16 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
 
     match tab {
         Tab::Boxes => {
-            let top = r(DTITLE) + r(64.0);
-            let bottom = h - r(DFOOT) - r(ROW_AREA_BOTTOM);
+            let (top, bottom) = content_band(scale);
             let row_h = r(DROW_H);
-            let visible = (((bottom - top) / row_h).max(1)) as usize;
-            for i in scroll..(scroll + visible).min(box_count) {
-                let y = top + ((i - scroll) as i32) * row_h;
+            // 行内按钮的左右边界：从右往左 = 箭头(52) → 删除(78) → 解散(78) → 名字
+            let del_r = cr + r(8.0) - r(66.0);
+            let del_l = del_r - r(DROWBTN_W);
+            let dis_r = del_l - r(6.0);
+            let dis_l = dis_r - r(DROWBTN_W);
+            // 所有盒子都排出来，靠整页滚动看下面的 —— 这里不再截断行数
+            for i in 0..box_count {
+                let y = top + (i as i32) * row_h - page;
                 let row = RECT {
                     left: cx - r(8.0),
                     top: y,
@@ -639,49 +701,83 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
                     bottom: y + row_h - r(4.0),
                 };
                 // 先放整行，再放行内的小块：命中测试从后往前找，
-                // 这样图标 / 名字 / 箭头会盖过「整行」的点击区
+                // 这样图标 / 名字 / 按钮 / 箭头会盖过「整行」的点击区
                 hits.push((Hit::BoxRow(i), row));
                 rows.push(row);
                 hits.push((
                     Hit::BoxIcon(i),
                     RECT {
                         left: row.left + r(7.0),
-                        top: y + r(5.0),
+                        top: y + r(3.0),
                         right: row.left + r(39.0),
-                        bottom: y + r(37.0),
+                        bottom: y + r(35.0),
                     },
                 ));
                 hits.push((
                     Hit::BoxName(i),
                     RECT {
                         left: row.left + r(47.0),
-                        top: y + r(5.0),
-                        right: row.right - r(64.0),
-                        bottom: y + r(37.0),
+                        top: y + r(3.0),
+                        right: dis_l - r(8.0),
+                        bottom: y + r(35.0),
+                    },
+                ));
+                hits.push((
+                    Hit::BoxDissolve(i),
+                    RECT {
+                        left: dis_l,
+                        top: y + r(6.0),
+                        right: dis_r,
+                        bottom: y + r(32.0),
+                    },
+                ));
+                hits.push((
+                    Hit::BoxDelete(i),
+                    RECT {
+                        left: del_l,
+                        top: y + r(6.0),
+                        right: del_r,
+                        bottom: y + r(32.0),
                     },
                 ));
                 hits.push((
                     Hit::BoxUp(i),
                     RECT {
                         left: row.right - r(58.0),
-                        top: y + r(9.0),
+                        top: y + r(7.0),
                         right: row.right - r(34.0),
-                        bottom: y + r(33.0),
+                        bottom: y + r(31.0),
                     },
                 ));
                 hits.push((
                     Hit::BoxDown(i),
                     RECT {
                         left: row.right - r(30.0),
-                        top: y + r(9.0),
+                        top: y + r(7.0),
                         right: row.right - r(6.0),
-                        bottom: y + r(33.0),
+                        bottom: y + r(31.0),
                     },
                 ));
             }
 
+            // 最后一行下面：加号 → 隐藏名称 → 主界面模式
+            let y0 = top + (box_count as i32) * row_h - page;
+
+            let aw = r(DADD_W);
+            let ax = cx + (cr - cx - aw) / 2;
+            let ay = y0 + r(DADD_GAP);
+            hits.push((
+                Hit::NewBox,
+                RECT {
+                    left: ax,
+                    top: ay,
+                    right: ax + aw,
+                    bottom: ay + r(DADD_H),
+                },
+            ));
+
             // 隐藏名称
-            let ly = bottom + r(8.0);
+            let ly = y0 + r(DSWITCH_Y);
             hits.push((
                 Hit::Switch(Setting::HideLabel),
                 RECT {
@@ -692,8 +788,8 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
                 },
             ));
 
-            // 主界面：任务栏模式 / 桌面模式
-            let my = bottom + r(70.0);
+            // 主界面模式：任务栏模式 / 桌面模式
+            let my = y0 + r(DMODE_BTN_Y);
             let half = (cr - cx - r(8.0)) / 2;
             hits.push((
                 Hit::Mode(false),
@@ -713,6 +809,33 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
                     bottom: my + r(32.0),
                 },
             ));
+
+            // 整页滚动条：内容（所有盒子 + 下面那块设置）装不下才出现，
+            // 贴在窗口右边缘，不随内容滚动
+            let content_h = (box_count as i32) * row_h + r(DBLOCK_H);
+            let view_h = bottom - top;
+            if content_h > view_h {
+                let track = RECT {
+                    left: w - r(10.0),
+                    top,
+                    right: w - r(10.0) + r(DSCROLL_W),
+                    bottom,
+                };
+                let th = ((view_h as f32) * (view_h as f32) / (content_h as f32)).round() as i32;
+                let th = th.max(r(32.0)).min(view_h);
+                let max_page = content_h - view_h;
+                let span = view_h - th;
+                let used = page.clamp(0, max_page);
+                let ty = top + (span as f32 * used as f32 / max_page as f32).round() as i32;
+                let thumb = RECT {
+                    left: track.left,
+                    top: ty,
+                    right: track.right,
+                    bottom: ty + th,
+                };
+                hits.push((Hit::Scrollbar, track));
+                scrollbar = Some((track, thumb));
+            }
         }
         Tab::Look => {
             hits.push((
@@ -867,36 +990,68 @@ fn layout(scale: f32, tab: Tab, box_count: usize, scroll: usize, has_update: boo
         }
     }
 
-    Layout { hits, rows }
+    Layout {
+        hits,
+        rows,
+        scrollbar,
+    }
+}
+
+/// 不随内容平移、也不受内容区上下边界限制的命中区：
+/// 侧栏、关闭按钮、页脚「应用 / 取消 / 确定」都是窗口固定件，画在原始坐标上。
+fn pinned_hit(h: &Hit) -> bool {
+    matches!(
+        h,
+        Hit::Close | Hit::Nav(_) | Hit::Apply | Hit::Cancel | Hit::Ok
+    )
 }
 
 /// 鼠标在某点落在哪个可点区域（从后往前找 = 小块优先于整行）
 fn hit_at(x: i32, y: i32, scale: f32) -> Option<Hit> {
-    let (tab, count, scroll) = {
+    let (tab, count, page) = {
         let s = state().lock().unwrap();
-        (s.tab, s.draft.boxes.len(), s.scroll)
+        (s.tab, s.draft.boxes.len(), s.page)
     };
-    let lay = layout(scale, tab, count, scroll, crate::updater::has_update());
+    let lay = layout(scale, tab, count, page, crate::updater::has_update());
+    // 外观 / 功能页的内容整体上移过（GDI 视口原点），鼠标坐标要补回来。
+    // 注意：侧栏、关闭按钮、页脚那三个按钮**没有**跟着平移，用的是原始坐标。
+    let dy = content_shift(tab, scale);
+    // 收纳盒页是整页滚动的：滚出去的行 / 按钮不许在页头页脚上接点击
+    let (ctop, cbot) = content_band(scale);
     lay.hits
         .iter()
         .rev()
-        .find(|(_, r)| contains(r, x, y))
+        .find(|(h, r)| {
+            if pinned_hit(h) {
+                contains(r, x, y)
+            } else {
+                let cy = y - dy;
+                contains(r, x, cy) && cy >= ctop && cy < cbot
+            }
+        })
         .map(|(h, _)| *h)
 }
 
-/// 这个命中区能不能点（边界上的 ↑ / ↓、没改动时的「应用」是灰的）
+/// 这个命中区能不能点（边界上的 ↑ / ↓、空盒子的「解散」、没改动时的「应用」是灰的）
 fn clickable(h: Hit) -> bool {
-    let (is_dirty, count) = {
+    let (is_dirty, count, ids) = {
         let s = state().lock().unwrap();
         (
             s.draft != s.orig || s.autostart != s.autostart_orig,
             s.draft.boxes.len(),
+            s.draft
+                .boxes
+                .iter()
+                .map(|b| b.id.clone())
+                .collect::<Vec<_>>(),
         )
     };
     match h {
         Hit::Apply => is_dirty,
         Hit::BoxUp(i) => i > 0,
         Hit::BoxDown(i) => i + 1 < count,
+        // 空盒子没有图标可放回桌面，按钮置灰（点下去也不会有任何反应）
+        Hit::BoxDissolve(i) => ids.get(i).is_some_and(|id| config::count_items(id) > 0),
         _ => true,
     }
 }
@@ -1317,12 +1472,14 @@ fn show_font_combo() {
         let r = |v: f32| (v * scale).round() as i32;
         let row_h = fr.bottom - fr.top;
         let drop_h = r(220.0).max(row_h * 4);
+        // 外观页内容整体上移过（GDI 视口原点），子控件要跟着挪，否则会落在文字下面 36px
+        let dy = content_shift(Tab::Look, scale);
         // 控件总高 = 露出的一行 + 下拉列表；只给行高的话下拉只有几像素
         let _ = SetWindowPos(
             combo,
             None,
             fr.left,
-            fr.top,
+            fr.top + dy,
             fr.right - fr.left,
             row_h + drop_h,
             SWP_NOZORDER,
@@ -1438,7 +1595,7 @@ fn paint(hwnd: HWND) {
     let scale = display_scale();
     let (
         tab,
-        scroll,
+        page,
         hover,
         selected,
         editing,
@@ -1451,7 +1608,7 @@ fn paint(hwnd: HWND) {
         let s = state().lock().unwrap();
         (
             s.tab,
-            s.scroll,
+            s.page,
             s.hover,
             s.selected,
             s.editing.clone(),
@@ -1464,7 +1621,7 @@ fn paint(hwnd: HWND) {
     };
     let is_dirty = draft != orig || auto_on != auto_orig;
     let has_update = crate::updater::has_update();
-    let lay = layout(scale, tab, draft.boxes.len(), scroll, has_update);
+    let lay = layout(scale, tab, draft.boxes.len(), page, has_update);
 
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -1486,7 +1643,6 @@ fn paint(hwnd: HWND) {
         let r = |v: f32| (v * scale).round() as i32;
         let c = Ctx {
             scale,
-            h: ch,
             sx: r(DSIDEBAR),
             cx: r(DSIDEBAR) + r(DPAD),
             cr: cw - r(DPAD),
@@ -1593,14 +1749,27 @@ fn paint(hwnd: HWND) {
         }
 
         // —— 当前页 ——
+        // 内容区裁剪：收纳盒页是整页滚动的，滚出去的半行不能画到页头 / 页脚上。
+        // 裁剪矩形用设备坐标（此时视口原点还是 0,0）。
+        let (ctop, cbot) = content_band(scale);
+        let _ = IntersectClipRect(dc, 0, ctop, cw, cbot);
+        // 外观 / 功能页整体上移，代码里的绝对坐标不用逐条改
+        let dy = content_shift(tab, scale);
+        if dy != 0 {
+            let _ = SetViewportOrgEx(dc, 0, dy, None);
+        }
         match tab {
             Tab::Boxes => paint_boxes(
-                &mut g, &c, &lay, &col, &draft, hover, selected, scroll, &editing,
+                &mut g, &c, &lay, &col, &draft, hover, selected, page, &editing,
             ),
             Tab::Look => paint_look(&mut g, &c, &lay, &col, &draft, hover),
             Tab::Features => paint_features(&mut g, &c, &lay, &col, &draft, hover, auto_on),
             Tab::About => paint_about(&mut g, &c, &lay, &col, hover, has_update, notes_scroll),
         }
+        if dy != 0 {
+            let _ = SetViewportOrgEx(dc, 0, 0, None);
+        }
+        let _ = SelectClipRgn(dc, None);
 
         // 字体下拉框不能在重绘里隐藏：鼠标移动 / hover 变化都会 repaint()，
         // 刚展开的 ComboBox 会被立刻藏回去，表现就是「字体选择框点不开」。
@@ -1669,12 +1838,11 @@ fn paint_boxes(
     draft: &config::Config,
     hover: Option<Hit>,
     selected: usize,
-    scroll: usize,
+    _page: i32,
     editing: &Option<String>,
 ) {
     let r = |v: f32| c.r(v);
-    let top = r(DTITLE) + r(64.0);
-    let bottom = c.h - r(DFOOT) - r(ROW_AREA_BOTTOM);
+    let (top, _bottom) = content_band(c.scale);
 
     if draft.boxes.is_empty() {
         g.font(r(13.0), false);
@@ -1683,18 +1851,20 @@ fn paint_boxes(
             top + r(36.0),
             c.cr - c.cx,
             r(24.0),
-            "还没有收纳盒。右键长条，选「新建收纳盒」。",
+            "还没有收纳盒。点下面的「+」新建一个。",
             col.muted,
             Align::Left,
         );
     }
 
     for (k, row) in lay.rows.iter().enumerate() {
-        let i = scroll + k;
+        let i = k;
         let Some(b) = draft.boxes.get(i) else { continue };
         let hot = matches!(
             hover,
-            Some(Hit::BoxRow(j)) | Some(Hit::BoxName(j)) | Some(Hit::BoxIcon(j)) | Some(Hit::BoxUp(j)) | Some(Hit::BoxDown(j)) if j == i
+            Some(Hit::BoxRow(j)) | Some(Hit::BoxName(j)) | Some(Hit::BoxIcon(j))
+                | Some(Hit::BoxDissolve(j)) | Some(Hit::BoxDelete(j))
+                | Some(Hit::BoxUp(j)) | Some(Hit::BoxDown(j)) if j == i
         );
         let row_bg = if i == selected {
             theme::mix(col.bg, col.accent, 0.14)
@@ -1765,6 +1935,21 @@ fn paint_boxes(
             }
         }
 
+        // 解散 / 删除：放在名字右边、上下箭头左边。
+        // 「解散」把盒子里的图标放回桌面（盒子留着），空盒子时灰掉；
+        // 「删除」只删空盒子，里面有图标就弹提示让先解散。
+        for (hit, label, enabled) in [
+            (
+                Hit::BoxDissolve(i),
+                "解散收纳盒",
+                config::count_items(&b.id) > 0,
+            ),
+            (Hit::BoxDelete(i), "删除收纳盒", true),
+        ] {
+            let Some(br) = hit_rect(lay, hit) else { continue };
+            draw_row_button(g, c, col, br, label, hover == Some(hit), enabled);
+        }
+
         // 上移 / 下移：标准 ⬆ / ⬇ 比例的蓝色实心箭头（见 ui::Gfx::arrow）。
         // 普通态 = 完整强调蓝（浅底 #2F6FEB / 深底 #6CA8FF），
         // 悬停态 = 往文字色靠一点做加深反馈，禁用态 = 灰。
@@ -1811,6 +1996,37 @@ fn paint_boxes(
         }
     }
 
+    // 「+」新建收纳盒（列表正下方，水平居中）
+    if let Some(ar) = hit_rect(lay, Hit::NewBox) {
+        draw_add_button(g, c, col, ar, hover == Some(Hit::NewBox));
+    }
+
+    // 右侧滚动条（盒子多到装不下时才有）
+    if let Some((track, thumb)) = lay.scrollbar {
+        let hot = hover == Some(Hit::Scrollbar);
+        let tw = track.right - track.left;
+        g.fill_round(
+            track.left,
+            track.top,
+            tw,
+            track.bottom - track.top,
+            tw / 2,
+            theme::mix(col.bg, col.fg, 0.06),
+        );
+        g.fill_round(
+            thumb.left,
+            thumb.top,
+            tw,
+            thumb.bottom - thumb.top,
+            tw / 2,
+            if hot {
+                theme::mix(col.fg, col.bg, 0.25)
+            } else {
+                theme::mix(col.fg, col.bg, 0.42)
+            },
+        );
+    }
+
     // 隐藏名称
     draw_switch_row(
         g,
@@ -1818,20 +2034,20 @@ fn paint_boxes(
         lay,
         col,
         Hit::Switch(Setting::HideLabel),
-        "嵌入任务栏时隐藏盒子名称",
-        "打开后任务栏里只显示图标，不显示名字",
+        "隐藏盒子名称",
+        "打开后只显示图标，不显示名字",
         draft.bar_hide_label,
     );
 
-    // 主界面形态
-    let my = bottom + r(70.0);
+    // 主界面模式（和上面的开关之间留出一段，免得两块黏在一起）
+    let my = hit_rect(lay, Hit::Mode(false)).map(|m| m.top).unwrap_or(0);
     g.font(r(13.0), false);
     g.text(
         c.cx,
-        bottom + r(46.0),
+        my - r(DMODE_BTN_Y - DMODE_LABEL_Y),
         c.cr - c.cx,
         r(20.0),
-        "主界面",
+        "主界面模式",
         col.fg,
         Align::Left,
     );
@@ -1937,9 +2153,17 @@ fn paint_look(
         Align::Left,
     );
 
-    // 颜色
+    // 背景颜色（收纳盒 / 弹出窗口各一个色块）
     g.font(r(13.0), false);
-    g.text(c.cx, r(192.0), r(200.0), r(22.0), "颜色", col.fg, Align::Left);
+    g.text(
+        c.cx,
+        r(192.0),
+        r(200.0),
+        r(22.0),
+        "背景颜色",
+        col.fg,
+        Align::Left,
+    );
     if let Some(rr) = hit_rect(lay, Hit::ResetColor) {
         let hot = hover == Some(Hit::ResetColor);
         g.font(r(11.0), false);
@@ -2562,6 +2786,65 @@ fn draw_button(
     g.text(x, y, w, h, label, text, Align::Center);
 }
 
+/// 列表行里的「解散收纳盒 / 删除收纳盒」：细描边小按钮，
+/// 嵌在 42 高的行里只占 26，颜色比正文略淡，不抢名字的注意力。
+fn draw_row_button(
+    g: &mut Gfx,
+    c: &Ctx,
+    col: &Colors,
+    rect: RECT,
+    label: &str,
+    hot: bool,
+    enabled: bool,
+) {
+    let (x, y) = (rect.left, rect.top);
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    let radius = c.r(6.0);
+    let (fill, text, border) = if !enabled {
+        (
+            col.bg,
+            theme::muted_on(col.bg),
+            theme::mix(col.bg, col.fg, 0.12),
+        )
+    } else if hot {
+        (
+            theme::mix(col.bg, col.accent, 0.12),
+            col.accent,
+            theme::mix(col.accent, col.bg, 0.45),
+        )
+    } else {
+        (
+            col.bg,
+            theme::mix(col.fg, col.bg, 0.12),
+            theme::mix(col.bg, col.fg, 0.22),
+        )
+    };
+    g.fill_round(x, y, w, h, radius, fill);
+    g.stroke_round(x, y, w, h, radius, border, 1);
+    g.font(c.r(12.0), false);
+    g.text(x, y, w, h, label, text, Align::Center);
+}
+
+/// 列表下方的「+」新建按钮：整条主色底（和页脚「确定」同一套蓝）+ 白色加号
+fn draw_add_button(g: &mut Gfx, c: &Ctx, col: &Colors, rect: RECT, hot: bool) {
+    let (x, y) = (rect.left, rect.top);
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    let radius = c.r(7.0);
+    let fill = if hot {
+        theme::mix(col.accent, theme::SNOW, 0.12)
+    } else {
+        col.accent
+    };
+    g.fill_round(x, y, w, h, radius, fill);
+    let ink = theme::text_on(col.accent);
+    let bar = c.r(14.0);
+    let thick = (c.r(2.0)).max(1);
+    let cxp = x + w / 2;
+    let cyp = y + h / 2;
+    g.fill_rect(cxp - bar / 2, cyp - thick / 2, bar, thick, ink);
+    g.fill_rect(cxp - thick / 2, cyp - bar / 2, thick, bar, ink);
+}
+
 // —— 图标 ——
 
 fn hash_str(s: &str) -> u64 {
@@ -2762,7 +3045,7 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
                 let mut s = state().lock().unwrap();
                 s.tab = t;
                 s.hover = None;
-                s.scroll = 0;
+                s.page = 0;
                 s.pending_font_combo = false;
             }
             hide_font_combo();
@@ -2774,6 +3057,10 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
             start_edit(i);
         }
         Hit::BoxIcon(i) => pick_icon(i),
+        Hit::BoxDissolve(i) => dissolve_box(i),
+        Hit::BoxDelete(i) => delete_box(i),
+        Hit::NewBox => new_box(),
+        Hit::Scrollbar => start_scroll_drag(hwnd, y),
         Hit::BoxUp(i) => move_box(i, -1),
         Hit::BoxDown(i) => move_box(i, 1),
         Hit::Slider => {
@@ -2862,10 +3149,11 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
 fn on_mouse_up() {
     let (was_dragging, open_font) = {
         let mut s = state().lock().unwrap();
-        let d = s.dragging || s.drag_win.is_some();
+        let d = s.dragging || s.drag_win.is_some() || s.scroll_drag.is_some();
         let f = std::mem::take(&mut s.pending_font_combo);
         s.dragging = false;
         s.drag_win = None;
+        s.scroll_drag = None;
         (d, f)
     };
     unsafe {
@@ -2884,6 +3172,11 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
 
     if state().lock().unwrap().dragging {
         set_transparency_from_x(x, scale);
+        return;
+    }
+
+    if state().lock().unwrap().scroll_drag.is_some() {
+        drag_scroll_to(y, scale);
         return;
     }
 
@@ -2915,7 +3208,8 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
         }
     };
     if changed {
-        let hand = hit.map_or(false, clickable);
+        // 滚动条拖的是位置，不是「点一下」——用箭头，别给手型
+        let hand = hit.map_or(false, |h| clickable(h) && h != Hit::Scrollbar);
         unsafe {
             let cur = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }).ok();
             let _ = SetCursor(cur);
@@ -2926,9 +3220,9 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
 
 fn on_wheel(delta: i16) {
     let scale = display_scale();
-    let (tab, count, scroll, notes_scroll) = {
+    let (tab, count, page, notes_scroll) = {
         let s = state().lock().unwrap();
-        (s.tab, s.draft.boxes.len(), s.scroll, s.notes_scroll)
+        (s.tab, s.draft.boxes.len(), s.page, s.notes_scroll)
     };
     // 关于页：滚「更新信息」文本框。清单说明常有十条，一屏放不下。
     if tab == Tab::About {
@@ -2948,23 +3242,36 @@ fn on_wheel(delta: i16) {
         }
         return;
     }
-    if tab != Tab::Boxes || count == 0 {
+    // 收纳盒页：滚整页（盒子 + 下面那块设置一起动）
+    if tab != Tab::Boxes {
         return;
     }
-    let visible = layout(scale, Tab::Boxes, count, 0, crate::updater::has_update())
-        .rows
-        .len()
-        .max(1);
-    let max_scroll = count.saturating_sub(visible);
+    // 名字输入框是独立子窗口，不跟着内容走：滚之前先提交，免得它悬在半空
+    commit_inline_edit();
+    let max_page = max_page(scale, count);
+    if max_page <= 0 {
+        return;
+    }
+    // 一格滚轮 ≈ 3 行，跟系统设置的节奏接近
+    let step = (DROW_H * scale * 3.0).round() as i32;
     let next = if delta > 0 {
-        scroll.saturating_sub(1)
+        (page - step).max(0)
     } else {
-        (scroll + 1).min(max_scroll)
+        (page + step).min(max_page)
     };
-    if next != scroll {
-        state().lock().unwrap().scroll = next;
+    if next != page {
+        state().lock().unwrap().page = next;
         repaint();
     }
+}
+
+/// 整页最多能滚多远（设备像素）；装得下就是 0
+fn max_page(scale: f32, count: usize) -> i32 {
+    let (ctop, cbot) = content_band(scale);
+    let view = cbot - ctop;
+    let content_h = count as i32 * (DROW_H * scale).round() as i32
+        + (DBLOCK_H * scale).round() as i32;
+    (content_h - view).max(0)
 }
 
 fn start_window_drag(hwnd: HWND) {
@@ -2986,25 +3293,192 @@ fn select_box(i: usize) {
     repaint();
 }
 
+/// 把第 i 个盒子滚进可视范围（新建 / 打开指定盒子时用）
+fn scroll_into_view(i: usize) {
+    let scale = display_scale();
+    let (ctop, cbot) = content_band(scale);
+    let view = cbot - ctop;
+    let row_h = (DROW_H * scale).round() as i32;
+    let mut s = state().lock().unwrap();
+    let count = s.draft.boxes.len();
+    let max = max_page(scale, count);
+    let row_top = (i as i32) * row_h - s.page;
+    if row_top < 0 {
+        s.page = (s.page + row_top).max(0);
+    } else if row_top + row_h > view {
+        s.page = (s.page + row_top + row_h - view).min(max);
+    }
+}
+
+// —— 列表下方的三个动作 ——
+//
+// 这三个都是**立刻生效**的：解散要动文件、删除要删目录、新建要建盒子，
+// 没法像名字 / 图标那样攒到「确定」再一起写。做完同步一份到 draft / orig，
+// 否则点「确定」时会被 apply_changes 的「以当前配置为准」又补回来。
+
+/// 解散：盒子里所有图标放回桌面，盒子本身留着（变成空盒）
+fn dissolve_box(i: usize) {
+    let (id, name) = {
+        let s = state().lock().unwrap();
+        match s.draft.boxes.get(i) {
+            Some(b) => (b.id.clone(), b.name.clone()),
+            None => return,
+        }
+    };
+    if config::count_items(&id) == 0 {
+        return;
+    }
+    let n = config::restore_all(&id);
+    // 顺序表里的文件名已经不在了，顺手清掉，免得留下空洞
+    {
+        let mut s = state().lock().unwrap();
+        config::prune_order(&mut s.draft, &id);
+    }
+    crate::bar::refresh();
+    crate::panel::reload();
+    log::info(&format!("解散收纳盒 {name}：{n} 个图标已放回桌面"));
+    repaint();
+}
+
+/// 删除：只有空盒子能删（和右键菜单里的规则一致）
+fn delete_box(i: usize) {
+    let (id, name) = {
+        let s = state().lock().unwrap();
+        match s.draft.boxes.get(i) {
+            Some(b) => (b.id.clone(), b.name.clone()),
+            None => return,
+        }
+    };
+    let count = config::count_items(&id);
+    if count > 0 {
+        if let Some(h) = state().lock().unwrap().hwnd {
+            warn(
+                h,
+                &format!(
+                    "「{name}」里还有 {count} 个图标。\n请先「解散收纳盒」把图标放回桌面，再删除。"
+                ),
+            );
+        }
+        return;
+    }
+    {
+        let mut g = app().cfg.lock().unwrap();
+        config::remove_box(&mut g, &id);
+    }
+    {
+        let mut s = state().lock().unwrap();
+        // draft 和 orig 都要摘掉：orig 留着的话「应用」会一直是可点的脏状态
+        s.draft.boxes.retain(|b| b.id != id);
+        s.orig.boxes.retain(|b| b.id != id);
+        s.selected = s.selected.min(s.draft.boxes.len().saturating_sub(1));
+    }
+    clamp_page();
+    crate::bar::refresh();
+    crate::panel::reload();
+    log::info(&format!("已删除收纳盒 {name}"));
+    repaint();
+}
+
+/// 删掉盒子之后滚动位移可能越界（内容变短了），不夹一下会滚出一片空白。
+fn clamp_page() {
+    let scale = display_scale();
+    let count = state().lock().unwrap().draft.boxes.len();
+    let max = max_page(scale, count);
+    let mut s = state().lock().unwrap();
+    if s.page > max {
+        s.page = max;
+    }
+}
+
+/// 新建：直接走菜单里那一套（命名 + 存盘 + 长条滚到末尾）
+fn new_box() {
+    commit_inline_edit();
+    crate::menu::add_box();
+    let live = app().cfg.lock().unwrap().clone();
+    let mut added = None;
+    {
+        let mut s = state().lock().unwrap();
+        if let Some(nb) = live.boxes.last() {
+            if !s.draft.boxes.iter().any(|b| b.id == nb.id) {
+                s.draft.boxes.push(nb.clone());
+                s.orig.boxes.push(nb.clone());
+                added = Some(s.draft.boxes.len() - 1);
+            }
+        }
+        if let Some(i) = added {
+            s.selected = i;
+        }
+    }
+    if let Some(i) = added {
+        scroll_into_view(i);
+    }
+    repaint();
+}
+
+/// 按下滚动条：摸到手柄就拖，摸到轨道空白处就翻一页（随即也能接着拖）
+fn start_scroll_drag(hwnd: HWND, y: i32) {
+    let scale = display_scale();
+    let (count, page, tab) = {
+        let s = state().lock().unwrap();
+        (s.draft.boxes.len(), s.page, s.tab)
+    };
+    if tab != Tab::Boxes {
+        return;
+    }
+    let lay = layout(scale, Tab::Boxes, count, page, crate::updater::has_update());
+    let Some((track, thumb)) = lay.scrollbar else {
+        return;
+    };
+    let th = thumb.bottom - thumb.top;
+    let max = max_page(scale, count);
+    let view = track.bottom - track.top;
+    let grab = if y >= thumb.top && y < thumb.bottom {
+        y - thumb.top
+    } else {
+        // 点在轨道空白：先翻一页，再让手柄跟到鼠标位置
+        let dir = if y < thumb.top { -1 } else { 1 };
+        let next = (page + dir * view).clamp(0, max);
+        state().lock().unwrap().page = next;
+        th / 2
+    };
+    state().lock().unwrap().scroll_drag = Some(grab);
+    unsafe {
+        let _ = SetCapture(hwnd);
+    }
+    repaint();
+}
+
+/// 拖滚动条：手柄顶部跟手，换算回整页位移
+fn drag_scroll_to(y: i32, scale: f32) {
+    let grab = match state().lock().unwrap().scroll_drag {
+        Some(g) => g,
+        None => return,
+    };
+    let (count, page) = {
+        let s = state().lock().unwrap();
+        (s.draft.boxes.len(), s.page)
+    };
+    let max = max_page(scale, count);
+    if max <= 0 {
+        return;
+    }
+    let lay = layout(scale, Tab::Boxes, count, page, crate::updater::has_update());
+    let Some((track, thumb)) = lay.scrollbar else { return };
+    let area_h = track.bottom - track.top;
+    let th = thumb.bottom - thumb.top;
+    let span = (area_h - th).max(1);
+    let ty = (y - grab - track.top).clamp(0, span);
+    let next = (ty as f32 * max as f32 / span as f32).round() as i32;
+    let next = next.clamp(0, max);
+    if next != page {
+        state().lock().unwrap().page = next;
+        repaint();
+    }
+}
+
 /// 上移 / 下移一个盒子（只改 draft）
 fn move_box(i: usize, delta: i32) {
-    let scale = display_scale();
-    let (count, visible) = {
-        let s = state().lock().unwrap();
-        (
-            s.draft.boxes.len(),
-            layout(
-                scale,
-                Tab::Boxes,
-                s.draft.boxes.len(),
-                0,
-                crate::updater::has_update(),
-            )
-            .rows
-            .len()
-            .max(1),
-        )
-    };
+    let count = state().lock().unwrap().draft.boxes.len();
     let j = i as i32 + delta;
     if j < 0 || j as usize >= count {
         return;
@@ -3014,12 +3488,8 @@ fn move_box(i: usize, delta: i32) {
         let mut s = state().lock().unwrap();
         s.draft.boxes.swap(i, j);
         s.selected = j;
-        if j < s.scroll {
-            s.scroll = j;
-        } else if j >= s.scroll + visible {
-            s.scroll = j - visible + 1;
-        }
     }
+    scroll_into_view(j);
     repaint();
 }
 
@@ -3098,7 +3568,7 @@ fn set_transparency_from_x(x: i32, scale: f32) {
 
 fn start_edit(i: usize) {
     let scale = display_scale();
-    let (id, name, hwnd, edit, count, scroll) = {
+    let (id, name, hwnd, edit, count, page) = {
         let s = state().lock().unwrap();
         let Some(b) = s.draft.boxes.get(i) else { return };
         (
@@ -3107,11 +3577,11 @@ fn start_edit(i: usize) {
             s.hwnd,
             s.edit,
             s.draft.boxes.len(),
-            s.scroll,
+            s.page,
         )
     };
     let (Some(_hwnd), Some(edit)) = (hwnd, edit) else { return };
-    let lay = layout(scale, Tab::Boxes, count, scroll, crate::updater::has_update());
+    let lay = layout(scale, Tab::Boxes, count, page, crate::updater::has_update());
     let Some(nr) = hit_rect(&lay, Hit::BoxName(i)) else { return };
     // 单行 EDIT 的文字是顶对齐的：把控件压到字体行高附近再垂直居中，
     // 否则名字会贴在输入框上沿。
@@ -3304,5 +3774,129 @@ fn warn(hwnd: HWND, msg: &str) {
             &windows::core::HSTRING::from("LightBox"),
             MB_OK | MB_ICONWARNING,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(lay: &Layout, h: Hit) -> RECT {
+        hit_rect(lay, h).expect("命中区应该存在")
+    }
+
+    /// 内容区顶到页头副标题下面 20 —— 原来空了一大块
+    #[test]
+    fn 收纳盒从内容区顶开始排() {
+        let lay = layout(1.0, Tab::Boxes, 3, 0, false);
+        assert_eq!(lay.rows.len(), 3);
+        assert_eq!(lay.rows[0].top, (DCONTENT_TOP).round() as i32);
+        assert_eq!(lay.rows[1].top - lay.rows[0].top, DROW_H as i32);
+    }
+
+    /// 5 个盒子刚好一屏放完：不出现滚动条，最后一块设置也不越过页脚线
+    #[test]
+    fn 五个盒子不用滚动() {
+        let lay = layout(1.0, Tab::Boxes, 5, 0, false);
+        assert!(lay.scrollbar.is_none());
+        let (ctop, cbot) = content_band(1.0);
+        let y0 = ctop + 5 * DROW_H as i32;
+        let desc_bottom = y0 + DBLOCK_H as i32;
+        assert!(desc_bottom <= cbot, "说明文字越过了页脚线：{desc_bottom} > {cbot}");
+    }
+
+    /// 6 个盒子开始整页滚动，滚动位移直接作用在行位置上
+    #[test]
+    fn 六个盒子出现滚动条且能滚动() {
+        let lay = layout(1.0, Tab::Boxes, 6, 0, false);
+        assert!(lay.scrollbar.is_some());
+        let lay2 = layout(1.0, Tab::Boxes, 6, 20, false);
+        assert_eq!(lay2.rows[0].top, lay.rows[0].top - 20);
+        assert_eq!(max_page(1.0, 6), 6 * DROW_H as i32 + DBLOCK_H as i32 - {
+            let (a, b) = content_band(1.0);
+            b - a
+        });
+        assert_eq!(max_page(1.0, 5), 0);
+    }
+
+    /// 「+」紧贴最后一行（中间只留 DADD_GAP），不再是原来那一大块空白
+    #[test]
+    fn 加号按钮紧跟最后一行() {
+        let lay = layout(1.0, Tab::Boxes, 3, 0, false);
+        let last = *lay.rows.last().unwrap();
+        let add = hit(&lay, Hit::NewBox);
+        assert_eq!(add.top - last.bottom, 4 + DADD_GAP as i32);
+        // 加宽 + 居中
+        assert_eq!(add.right - add.left, DADD_W as i32);
+        assert_eq!(add.bottom - add.top, DADD_H as i32);
+        let center = (add.left + add.right) / 2;
+        // 内容列 = DSIDEBAR + DPAD(=182) 到 DW - DPAD(=658)
+        assert_eq!(center, (182 + 658) / 2);
+    }
+
+    /// 外观 / 功能页整体上移到内容区顶：首行不再悬在半空
+    #[test]
+    fn 外观与功能页内容贴顶() {
+        assert_eq!(content_shift(Tab::Look, 1.0) + 110, DCONTENT_TOP as i32);
+        // 功能页第一项是开关行，标题画在命中区上方 14
+        assert_eq!(
+            content_shift(Tab::Features, 1.0) + 128 - 14,
+            DCONTENT_TOP as i32
+        );
+        assert_eq!(content_shift(Tab::Boxes, 1.0), 0);
+        assert_eq!(content_shift(Tab::About, 1.0), 0);
+    }
+
+    /// 窗口固定件（侧栏 / 关闭 / 页脚三个按钮）不跟内容平移，也不吃内容区裁剪
+    #[test]
+    fn 侧栏与页脚是固定件() {
+        for h in [
+            Hit::Close,
+            Hit::Nav(Tab::Boxes),
+            Hit::Nav(Tab::Look),
+            Hit::Apply,
+            Hit::Cancel,
+            Hit::Ok,
+        ] {
+            assert!(pinned_hit(&h), "{h:?} 应该是固定件");
+        }
+        for h in [
+            Hit::BoxRow(0),
+            Hit::BoxDissolve(0),
+            Hit::BoxDelete(0),
+            Hit::NewBox,
+            Hit::Slider,
+            Hit::Mode(false),
+            Hit::Switch(Setting::HideLabel),
+        ] {
+            assert!(!pinned_hit(&h), "{h:?} 不该当固定件");
+        }
+    }
+
+    /// 页脚按钮本来就在内容区下方：不加例外就会被内容区过滤掉，点了没反应
+    #[test]
+    fn 页脚按钮在内容区外() {
+        let (_ctop, cbot) = content_band(1.0);
+        for tab in [Tab::Boxes, Tab::Look, Tab::Features, Tab::About] {
+            let lay = layout(1.0, tab, 3, 0, false);
+            let ok = hit(&lay, Hit::Ok);
+            assert!(ok.top >= cbot, "{tab:?} 页的「确定」应在内容区下方");
+        }
+    }
+
+    /// 侧栏吸附位置与当前页无关：切到外观 / 功能页后，鼠标位置不能偏
+    #[test]
+    fn 侧栏命中区不随页面平移() {
+        let a = layout(1.0, Tab::Boxes, 3, 0, false);
+        for tab in [Tab::Look, Tab::Features, Tab::About] {
+            let b = layout(1.0, tab, 3, 0, false);
+            for t in TABS {
+                assert_eq!(
+                    hit(&a, Hit::Nav(t)),
+                    hit(&b, Hit::Nav(t)),
+                    "{tab:?} 页的侧栏位置变了"
+                );
+            }
+        }
     }
 }

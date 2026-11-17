@@ -54,11 +54,22 @@ const EM_SETSEL: u32 = 0x00B1;
 /// 输入框里按了回车（延后到消息队列里再处理，见 edit_proc）
 const WM_COMMIT_NAME: u32 = 0x8101;
 
+/// 改名的对象：整个盒子，还是盒子里某一个图标。
+///
+/// 图标的名字就是它那个 `.lnk` / `.url` 的文件名，所以「改图标名」= 改文件名。
+#[derive(Clone, PartialEq, Debug)]
+pub enum Target {
+    /// 收纳盒名（面板标题栏那个）
+    Box(String),
+    /// 盒子里的某个图标：`file` 是盒子目录里的文件名
+    Item { box_id: String, file: String },
+}
+
 struct RenameState {
     hwnd: Option<HWND>,
     edit: Option<HWND>,
-    /// 正在改名的盒子
-    box_id: String,
+    /// 正在改谁的名字
+    target: Option<Target>,
     font: Option<HFONT>,
     brush: Option<HBRUSH>,
     /// 正在提交：防止「提交 → 销毁 → 失焦 → 再提交」递归
@@ -80,7 +91,7 @@ fn state() -> &'static Mutex<RenameState> {
         Mutex::new(RenameState {
             hwnd: None,
             edit: None,
-            box_id: String::new(),
+            target: None,
             font: None,
             brush: None,
             committing: false,
@@ -100,12 +111,22 @@ pub fn is_open() -> bool {
     state().lock().unwrap().hwnd.is_some()
 }
 
+/// 正在改的是不是**盒子名**。
+///
+/// 面板标题右边那个图标个数小牌要在改名时让位（改名窗正好压在那儿）；
+/// 改图标名时小牌不用躲，它跟被改的那个图标不在一个位置。
+pub fn renaming_box() -> bool {
+    matches!(state().lock().unwrap().target, Some(Target::Box(_)))
+}
+
 /// 打开改名窗。
 ///
-/// `at` 是输入框要占的位置（屏幕坐标，一般就是面板标题那块），
-/// `name` 是当前的名字，`owner` 是弹出面板的窗口句柄。
-pub fn open(box_id: &str, name: &str, at: RECT, scale: f32, owner: HWND) {
+/// `at` 是输入框要占的位置（屏幕坐标）：改盒子名时是面板标题那块（左对齐），
+/// 改图标名时是那个图标的格子（居中盖在格子上）。`owner` 是弹出面板的窗口句柄。
+pub fn open(target: Target, name: &str, at: RECT, scale: f32, owner: HWND) {
     close();
+    // 图标格子比盒子标题窄，输入框要摆正中间；盒子名是左对齐的文字，跟着左边走
+    let centered = matches!(target, Target::Item { .. });
     let r = |v: f32| (v * scale).round() as i32;
     let pad = r(D_PAD);
     // 改名框也跟着「外观 → 弹窗字体」走：字体名 + 字号倍率都取当前配置，
@@ -128,8 +149,12 @@ pub fn open(box_id: &str, name: &str, at: RECT, scale: f32, owner: HWND) {
     let text_w = crate::render::text(name, r(D_FONT), true)
         .map(|t| t.w)
         .unwrap_or(0);
-    let w = (text_w + r(24.0)).clamp(r(120.0), r(D_W_MAX));    // 垂直居中在标题那一行里
-    let x = at.left;
+    let w = (text_w + r(24.0)).clamp(r(120.0), r(D_W_MAX));
+    let x = if centered {
+        at.left + ((at.right - at.left) - w) / 2
+    } else {
+        at.left
+    };
     let y = at.top + ((at.bottom - at.top - h) / 2).max(0);
 
     let hwnd = match create_window(x, y, w, h, owner) {
@@ -144,7 +169,7 @@ pub fn open(box_id: &str, name: &str, at: RECT, scale: f32, owner: HWND) {
         let mut s = state().lock().unwrap();
         s.hwnd = Some(hwnd);
         s.edit = Some(edit);
-        s.box_id = box_id.to_string();
+        s.target = Some(target);
         s.committing = false;
     }
     unsafe {
@@ -183,7 +208,7 @@ pub fn close() {
         let mut s = state().lock().unwrap();
         let h = s.hwnd.take();
         s.edit = None;
-        s.box_id.clear();
+        s.target = None;
         s.committing = false;
         let f = s.font.take();
         let b = s.brush.take();
@@ -206,18 +231,18 @@ pub fn close() {
 
 /// 提交名字（面板里点别处收起编辑时也要用，所以放开给同 crate 调用）
 pub(crate) fn commit() {
-    let (edit, id) = {
+    let (edit, target) = {
         let mut s = state().lock().unwrap();
         if s.committing {
             return;
         }
         s.committing = true;
-        (s.edit, s.box_id.clone())
+        (s.edit, s.target.clone())
     };
-    if id.is_empty() {
+    let Some(target) = target else {
         close();
         return;
-    }
+    };
     let Some(h) = edit else {
         close();
         return;
@@ -229,26 +254,51 @@ pub(crate) fn commit() {
         crate::util::from_wide(&buf)
     };
     let v = raw.trim();
-    let v = if v.is_empty() { "收纳盒" } else { v };
-    let old = {
-        let cfg = app().cfg.lock().unwrap().clone();
-        cfg.boxes
-            .iter()
-            .find(|b| b.id == id)
-            .map(|b| b.name.clone())
-            .unwrap_or_default()
-    };
-    if v != old {
-        {
-            let mut g = app().cfg.lock().unwrap();
-            if let Some(b) = g.boxes.iter_mut().find(|b| b.id == id) {
-                b.name = v.to_string();
+    match target {
+        Target::Box(id) => {
+            let v = if v.is_empty() { "收纳盒" } else { v };
+            let old = {
+                let cfg = app().cfg.lock().unwrap().clone();
+                cfg.boxes
+                    .iter()
+                    .find(|b| b.id == id)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_default()
+            };
+            if v != old {
+                {
+                    let mut g = app().cfg.lock().unwrap();
+                    if let Some(b) = g.boxes.iter_mut().find(|b| b.id == id) {
+                        b.name = v.to_string();
+                    }
+                    config::save(&g);
+                }
+                crate::bar::refresh();
+                crate::panel::reload();
+                log::info(&format!("收纳盒改名：{old} → {v}"));
             }
-            config::save(&g);
         }
-        crate::bar::refresh();
-        crate::panel::reload();
-        log::info(&format!("收纳盒改名：{old} → {v}"));
+        Target::Item { box_id, file } => {
+            // 名字清空等于放弃改名（不要把图标改成空名）
+            let old = std::path::Path::new(&file)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if !v.is_empty() && v != old {
+                let r = {
+                    let mut g = app().cfg.lock().unwrap();
+                    config::rename_item(&mut g, &box_id, &file, v)
+                };
+                match r {
+                    Ok(new_file) => {
+                        crate::panel::reload();
+                        log::info(&format!("图标改名：{old} → {new_file}"));
+                    }
+                    Err(e) => log::info(&format!("图标改名失败：{e}")),
+                }
+            }
+        }
     }
     close();
 }

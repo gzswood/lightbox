@@ -8,6 +8,7 @@
 mod app;
 mod autostart;
 mod bar;
+mod clip;
 mod collate;
 mod config;
 mod desktop;

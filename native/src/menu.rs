@@ -59,6 +59,12 @@ enum Act {
     RestoreToDesktop,
     RemoveFromBox,
     Properties,
+    /// 重命名（只有一个图标时才有）
+    RenameItem,
+    /// 复制到剪贴板
+    CopyItems,
+    /// 从剪贴板粘贴进来
+    PasteItems,
 }
 
 /// 菜单项。`disabled` 的项（比如「盒子名 / 共 N 个图标」这种抬头）画成灰的，
@@ -143,6 +149,13 @@ impl MenuItem {
 
     fn icon(mut self, g: MenuGlyph) -> Self {
         self.icon = Some(g);
+        self
+    }
+
+    /// 置灰（不点不动）。「粘贴」在没有可粘贴的内容时就是这么显示的：
+    /// 留着这一项，用户才知道这里有粘贴，只是当下没东西可粘。
+    fn disabled(mut self, on: bool) -> Self {
+        self.disabled = on;
         self
     }
 }
@@ -503,15 +516,27 @@ pub fn add_box() {
     crate::bar::scroll_to_end();
 }
 
-/// 面板头部的「⋯」菜单：只放和「这一盒的内容」有关的两个动作。
+/// 面板头部的「⋯」菜单：只放和「这一盒的内容」有关的动作。
 /// 盒子本身的增删改在长条分段的右键菜单里。
-pub fn panel_header_menu(box_id: &str) {
+///
+/// `with_paste` 只有**面板空白处右键**才传 true —— 空盒子没有图标可点，
+/// 那是唯一能把复制好的快捷方式粘进来的入口。「⋯」按钮上不出现「粘贴」。
+pub fn panel_header_menu(box_id: &str, with_paste: bool) {
     let count = config::count_items(box_id);
-    let picked = popup(&[
-        item("按名称排序", Act::SortByName),
-        item("解散收纳盒", Act::DissolveBox),
-    ]);
+    let mut menu: Vec<MenuItem> = Vec::new();
+    if with_paste {
+        menu.push(
+            item("粘贴", Act::PasteItems)
+                .icon(MenuGlyph::Paste)
+                .disabled(!crate::clip::can_paste()),
+        );
+        menu.push(sep());
+    }
+    menu.push(item("按名称排序", Act::SortByName));
+    menu.push(item("解散收纳盒", Act::DissolveBox));
+    let picked = popup(&menu);
     match picked {
+        Some(Act::PasteItems) => paste_into(box_id),
         Some(Act::SortByName) => {
             let mut g = app().cfg.lock().unwrap();
             config::sort_by_name(&mut g, box_id);
@@ -533,7 +558,9 @@ pub fn panel_header_menu(box_id: &str) {
 }
 
 /// 面板里图标的右键菜单：对选中集生效（单选一个、多选一批，同一套菜单）
-pub fn items_menu(items: &[Item]) {
+///
+/// `box_id` 是面板所属的盒子 —— 粘贴要把剪贴板里的快捷方式拷进这个盒子。
+pub fn items_menu(box_id: &str, items: &[Item]) {
     let n = items.len();
     if n == 0 {
         return;
@@ -546,6 +573,14 @@ pub fn items_menu(items: &[Item]) {
     } else {
         menu.push(item(format!("打开全部（{n}）"), Act::OpenItems));
     }
+    menu.push(sep());
+    // 重命名 / 复制：和资源管理器一样排在「放回桌面」上面。
+    // 「粘贴」不在这里 —— 图标上的粘贴和「复制的那个图标怎么办」容易混淆，
+    // 粘进盒子统一走面板空白处右键 / 长条分段菜单。
+    if n == 1 {
+        menu.push(item("重命名", Act::RenameItem).icon(MenuGlyph::Rename));
+    }
+    menu.push(item("复制", Act::CopyItems).icon(MenuGlyph::Copy));
     menu.push(sep());
     if n > 1 {
         menu.push(item(format!("放回桌面（{n}）"), Act::RestoreToDesktop));
@@ -612,7 +647,52 @@ pub fn items_menu(items: &[Item]) {
                 log::info(&format!("打开属性失败：{e}"));
             }
         }
+        Some(Act::RenameItem) => {
+            let Some(it) = items.first() else { return };
+            // 面板没开着就没地方改名（菜单是从面板弹出来的，正常不会走到这儿）
+            let Some(panel) = crate::panel::hwnd() else { return };
+            let at = crate::panel::item_rect(&it.file).unwrap_or_default();
+            crate::rename::open(
+                crate::rename::Target::Item {
+                    box_id: box_id.to_string(),
+                    file: it.file.clone(),
+                },
+                &it.name,
+                at,
+                crate::panel::ui_scale(),
+                panel,
+            );
+        }
+        Some(Act::CopyItems) => {
+            let paths: Vec<String> = items.iter().map(|it| it.path.clone()).collect();
+            match crate::clip::set_files(&paths) {
+                Ok(()) => log::info(&format!("已复制 {n} 个图标到剪贴板")),
+                Err(e) => log::info(&format!("复制失败：{e}")),
+            }
+        }
+        // 图标菜单里已经没有「粘贴」了，留着这个分支只是为了让 match 覆盖整个枚举
+        Some(Act::PasteItems) => {}
         _ => {}
+    }
+}
+
+/// 把剪贴板里的快捷方式粘贴进盒子（图标右键菜单和面板空白处菜单共用）。
+///
+/// 只认 `.lnk` / `.url`：盒子里装的就是快捷方式，粘别的东西进来也成不了图标。
+/// 粘贴是**复制**，源文件留在原地 —— 从别的盒子里拷一个过来，两个盒子都得有。
+fn paste_into(box_id: &str) {
+    let files = crate::clip::pasteable();
+    if files.is_empty() {
+        log::info("粘贴：剪贴板里没有快捷方式");
+        return;
+    }
+    let (added, skipped) = config::import_copy(box_id, &files);
+    for s in skipped {
+        log::info(&format!("粘贴跳过：{s}"));
+    }
+    if added > 0 {
+        crate::panel::reload();
+        log::info(&format!("粘贴：{added} 个图标已加入盒子 {box_id}"));
     }
 }
 

@@ -638,6 +638,109 @@ pub fn remove_from_box(id: &str, file: &str) -> Result<(), String> {
     fs::remove_file(&p).map_err(|e| format!("删除失败：{e}"))
 }
 
+/// 粘贴：把剪贴板里的快捷方式**复制**一份进盒子（源文件留着不动）。
+///
+/// 和 `import`（拖进来）的区别就在这儿：拖动是「搬」，复制粘贴是「拷贝」——
+/// 从别的盒子拷一个过来，原来那个盒子里的还得在。
+/// 返回 (成功个数, 跳过原因)。
+pub fn import_copy(id: &str, paths: &[String]) -> (usize, Vec<String>) {
+    let dir = box_dir(id);
+    let mut added = 0usize;
+    let mut skipped = Vec::new();
+    for raw in paths {
+        let src = PathBuf::from(raw);
+        let shown = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw)
+            .to_string();
+        if !src.is_file() {
+            skipped.push(format!("{shown}：不是文件"));
+            continue;
+        }
+        if !is_shortcut(&src) {
+            skipped.push(format!("{shown}：只粘贴快捷方式（.lnk / .url）"));
+            continue;
+        }
+        let file_name = src.file_name().and_then(|s| s.to_str()).unwrap_or("item.lnk");
+        let dst = unique_target(&dir, file_name);
+        match fs::copy(&src, &dst) {
+            Ok(_) => added += 1,
+            Err(e) => skipped.push(format!("{shown}：复制失败（{e}）")),
+        }
+    }
+    (added, skipped)
+}
+
+/// 给盒子里的图标改名 = 改那个 `.lnk` 文件的文件名（面板上显示的就是文件名）。
+///
+/// 顺手把 `order` 里的旧文件名换成新的：用户拖好的顺序不能因为改个名就乱掉。
+/// 返回改名后的新文件名。
+pub fn rename_item(cfg: &mut Config, id: &str, file: &str, name: &str) -> Result<String, String> {
+    let dir = box_dir(id);
+    let src = dir.join(file);
+    if !src.exists() {
+        return Err("文件不存在".into());
+    }
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("lnk")
+        .to_string();
+    let stem = clean_file_stem(name, &ext);
+    let want = format!("{stem}.{ext}");
+    if want == file {
+        return Ok(want);
+    }
+    let dst = unique_target(&dir, &want);
+    fs::rename(&src, &dst).map_err(|e| format!("改名失败：{e}"))?;
+    let new_file = dst
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&want)
+        .to_string();
+    if let Some(b) = cfg.boxes.iter_mut().find(|b| b.id == id) {
+        for f in b.order.iter_mut() {
+            if f == file {
+                *f = new_file.clone();
+            }
+        }
+    }
+    save(cfg);
+    Ok(new_file)
+}
+
+/// 把用户输入的名字收拾成合法的文件名主干（不含扩展名）。
+///
+/// Windows 文件名里不许出现 `\ / : * ? " < > |`，结尾的点和空格也会被系统吃掉；
+/// 用户顺手把 `.lnk` 也打进来时别再拼成 `名字.lnk.lnk`。
+fn clean_file_stem(name: &str, ext: &str) -> String {
+    let mut s = name.trim().to_string();
+    // 用户把扩展名也打上了 → 去掉（大小写都不认）
+    let suffix = format!(".{ext}");
+    if s.len() > suffix.len() && s.to_lowercase().ends_with(&suffix) {
+        s.truncate(s.len() - suffix.len());
+        s = s.trim_end().to_string();
+    }
+    let bad = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if bad.contains(&c) || (c as u32) < 0x20 {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim().to_string();
+    if cleaned.is_empty() {
+        "未命名".into()
+    } else {
+        cleaned
+    }
+}
+
 /// 写回盒子的自定义顺序（用户在面板里拖动排序后调用）
 pub fn save_order(cfg: &mut Config, id: &str, order: &[String]) {
     if let Some(b) = cfg.boxes.iter_mut().find(|b| b.id == id) {
@@ -702,6 +805,20 @@ pub fn prune_order(cfg: &mut Config, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 图标改名：文件名里的非法字符要收拾掉，扩展名不能拼两遍
+    #[test]
+    fn 改名清理文件名() {
+        assert_eq!(clean_file_stem("  微信  ", "lnk"), "微信");
+        assert_eq!(clean_file_stem("微信.lnk", "lnk"), "微信");
+        assert_eq!(clean_file_stem("微信.LNK", "lnk"), "微信");
+        assert_eq!(clean_file_stem("a/b:c*d?", "lnk"), "a_b_c_d_");
+        // 结尾的点和空格系统会吃掉，提前去掉
+        assert_eq!(clean_file_stem("名字...", "lnk"), "名字");
+        assert_eq!(clean_file_stem("   ", "lnk"), "未命名");
+        // 扩展名不同的不该被误删（.url 文件里写「.lnk」是名字的一部分）
+        assert_eq!(clean_file_stem("a.lnk", "url"), "a.lnk");
+    }
 
     #[test]
     fn 首启两个默认盒_名字和数量固定() {

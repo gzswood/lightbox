@@ -138,6 +138,9 @@ fn state() -> &'static Mutex<Picker> {
     })
 }
 
+/// 吸管图标位图缓存：(key, 不透明 BGRA)。光标闪烁会定期重绘，不必每次重算。
+static PIPETTE_CACHE: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
+
 /// 打开调色板。`owner` 是设置窗口（调色板是它的子窗口层级的弹出层）。
 pub fn open(target: ColorTarget, hex: &str, owner: HWND) {
     close();
@@ -644,12 +647,13 @@ fn paint(hwnd: HWND) {
         g.font(r(13.0), false);
         let text_x = hex_x + r(8.0);
         g.text(text_x, hex_y, hex_w - r(16.0), r(DHEX), &hex, fg, Align::Left);
-        // 光标：画在第几位前面
+        // 光标：画在第几位前面。
+        // 用 text_w_exact 而不是 text_w：后者量的比实际绘制宽，光标会离文字空半格。
         if blink {
             let prefix: String = std::iter::once('#')
                 .chain(digits(&hex).chars().take(caret))
                 .collect();
-            let cx = text_x + g.text_w(&prefix);
+            let cx = text_x + g.text_w_exact(&prefix);
             g.fill_rect(cx, hex_y + r(5.0), 2, r(DHEX) - r(10.0), fg);
         }
         // 当前颜色的小方块（同样带一条深边，白 / 浅色也看得见）
@@ -661,10 +665,25 @@ fn paint(hwnd: HWND) {
             .find(|(h, _)| *h == Hit::Pipette)
             .map(|(_, r)| *r)
             .unwrap_or_default();
-        if hover == Some(Hit::Pipette) {
-            g.fill_round(pip.left, pip.top, pip.right - pip.left, pip.bottom - pip.top, r(6.0), theme::mix(bg, fg, 0.12));
+        let pip_hot = hover == Some(Hit::Pipette);
+        if pip_hot {
+            g.fill_round(
+                pip.left,
+                pip.top,
+                pip.right - pip.left,
+                pip.bottom - pip.top,
+                r(6.0),
+                theme::mix(bg, fg, 0.12),
+            );
         }
-        pipette_icon(&g, pip, fg);
+        // 图标走 4× 超采样位图（直接画会全是锯齿），底色要跟着悬停色走
+        let icon_bg = if pip_hot { theme::mix(bg, fg, 0.12) } else { bg };
+        let icon_size = (pip.bottom - pip.top - r(2.0)).max(r(18.0));
+        if let Some(px) = pipette_bitmap(icon_size, icon_bg, fg) {
+            let ix = (pip.left + pip.right) / 2 - icon_size / 2;
+            let iy = (pip.top + pip.bottom) / 2 - icon_size / 2;
+            blit_bgra(dc, ix, iy, icon_size, icon_size, &px);
+        }
 
         let done = hits
             .iter()
@@ -702,27 +721,148 @@ fn paint(hwnd: HWND) {
 
 /// 吸管的小图标
 ///
-/// 竖着画一支滴管：上面是鼓起来的胶头，中间是细管，下面是收尖的嘴，
-/// 旁边点一滴颜色。之前斜画的那版是根「棍子」，用户看不出是吸管。
-/// 尺寸按屏幕缩放走，不然在 125% 的屏幕上会小得看不见。
-fn pipette_icon(g: &Gfx, rect: RECT, fg: (u8, u8, u8)) {
-    let scale = display_scale();
-    let r = |v: f32| (v * scale).round() as i32;
-    let cx = (rect.left + rect.right) / 2;
-    let cy = (rect.top + rect.bottom) / 2;
-    let top = cy - r(10.0);
-    // 胶头：明显比管身宽，一看就是捏的那头
-    let bulb_w = r(9.0);
-    let bulb_h = r(7.0);
-    g.fill_round(cx - bulb_w / 2, top, bulb_w, bulb_h, r(3.0), fg);
-    // 管身
-    let tube_w = r(3.0).max(2);
-    g.fill_rect(cx - tube_w / 2, top + bulb_h - r(1.0), tube_w, r(9.0), fg);
-    // 尖嘴：两段收细，最后 1px
-    g.fill_rect(cx - tube_w / 2, top + bulb_h + r(8.0), tube_w, r(2.0), fg);
-    g.fill_rect(cx, top + bulb_h + r(10.0), 1, r(3.0), fg);
-    // 尖嘴旁边的一滴，表明这是「吸」颜色的
-    g.fill_round(cx + r(4.0), top + bulb_h + r(8.0), r(3.0), r(4.0), r(1.5), fg);
+/// 为什么不是竖着画：竖着（圆头 + 直杆）无论怎么调都像话筒 —— 话筒就是这个
+/// 骨架。这版按图标的通行画法**斜 40° 摆**：右上捏的胶头 → 略宽的箍 →
+/// 细长越走越细的针 → 尖嘴，尖嘴外悬着一滴颜色。有「头、细管、尖、一滴」
+/// 这四段，配上左边 hex 输入框的语境，一眼能认出是取色用的吸管。
+///
+/// 小尺寸直接画会全是锯齿（画笔只有 1px），所以先按 4 倍画再降采样，
+/// 见 `pipette_bitmap`。
+fn draw_pipette(g: &Gfx, cx: f32, cy: f32, s: f32, fg: (u8, u8, u8)) {
+    let f = |v: f32| v * s;
+    let (ux, uy) = (-0.766f32, 0.643f32); // 轴向：左下
+    let (nx, ny) = (-uy, ux); // 法向
+    let len = f(21.0);
+    let bx = cx - ux * len / 2.0;
+    let by = cy - uy * len / 2.0;
+
+    let xy = |d: f32, off: f32| {
+        (
+            (bx + ux * f(d) + nx * off).round() as i32,
+            (by + uy * f(d) + ny * off).round() as i32,
+        )
+    };
+    // 沿轴的一段梯形：(起点距离, 终点距离, 起点半宽, 终点半宽)
+    let band = |d0: f32, d1: f32, hw0: f32, hw1: f32| {
+        let a1 = xy(d0, f(hw0));
+        let a2 = xy(d1, f(hw1));
+        let a3 = xy(d1, -f(hw1));
+        let a4 = xy(d0, -f(hw0));
+        g.fill_poly(&[a1, a2, a3, a4], fg);
+    };
+    // 沿轴的胶囊：矩形段 + 两端圆
+    let capsule = |d0: f32, d1: f32, hw: f32| {
+        band(d0, d1, hw, hw);
+        for d in [d0, d1] {
+            let (px, py) = xy(d, 0.0);
+            let rr = f(hw).round() as i32;
+            g.fill_round(px - rr, py - rr, rr * 2, rr * 2, rr, fg);
+        }
+    };
+
+    // 胶头：短胖的胶囊，明显比管身粗
+    capsule(0.0, 2.4, 3.4);
+    // 箍：胶头下面那道略宽的收口，有它才不会连成一根棉签
+    band(2.4, 4.2, 2.6, 2.1);
+    // 针管：细长，越走越细
+    band(4.2, 15.8, 1.5, 0.65);
+    // 尖嘴：收成针尖
+    band(15.8, 18.4, 0.65, 0.15);
+
+    // 尖嘴外悬着一滴：说明这是「吸」颜色的
+    let (qx, qy) = xy(18.4, 0.0);
+    let (dx, dy) = (qx as f32 + ux * f(1.7), qy as f32 + uy * f(1.7));
+    let rr = f(1.4).round() as i32;
+    g.fill_round(dx as i32 - rr, dy as i32 - rr, rr * 2, rr * 2, rr, fg);
+}
+
+/// 吸管位图：4× 超采样后按块平均，得到不透明 BGRA（已合成到底色上）
+///
+/// 结果按 (尺寸, 底色) 缓存：光标闪烁会 500ms 重绘一次，没必要每次都重算。
+fn pipette_bitmap(size: i32, bg: (u8, u8, u8), fg: (u8, u8, u8)) -> Option<Vec<u8>> {
+    const SS: i32 = 4;
+    if size <= 0 {
+        return None;
+    }
+    let key: u64 = ((size as u64) << 24)
+        | ((bg.0 as u64) << 16)
+        | ((bg.1 as u64) << 8)
+        | bg.2 as u64;
+    if let Some((_, px)) = PIPETTE_CACHE
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| *k == key)
+    {
+        return Some(px.clone());
+    }
+
+    let big = size * SS;
+    let px = unsafe {
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: big,
+                biHeight: -big,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            return None;
+        }
+        let dc = CreateCompatibleDC(None);
+        let old = SelectObject(dc, HGDIOBJ(hbmp.0));
+        let g = Gfx::new(dc);
+        g.fill_rect(0, 0, big, big, bg);
+        // 图形按设计高度 24.2 单位算：占画布 85%，左右留白（竖直的一支，本来就不宽）
+        draw_pipette(
+            &g,
+            big as f32 / 2.0,
+            big as f32 / 2.0,
+            big as f32 * 0.85 / 24.2,
+            fg,
+        );
+        drop(g);
+
+        let src = bits as *const u8;
+        let mut out = vec![255u8; (size * size * 4) as usize];
+        let n = (SS * SS) as u32;
+        for y in 0..size {
+            for x in 0..size {
+                let (mut sb, mut sg, mut sr) = (0u32, 0u32, 0u32);
+                for dy in 0..SS {
+                    for dx in 0..SS {
+                        let i = (((y * SS + dy) * big + (x * SS + dx)) * 4) as isize;
+                        let p = src.offset(i);
+                        sb += *p as u32;
+                        sg += *p.add(1) as u32;
+                        sr += *p.add(2) as u32;
+                    }
+                }
+                let o = ((y * size + x) * 4) as usize;
+                out[o] = (sb / n) as u8;
+                out[o + 1] = (sg / n) as u8;
+                out[o + 2] = (sr / n) as u8;
+            }
+        }
+        let _ = SelectObject(dc, old);
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        let _ = DeleteDC(dc);
+        out
+    };
+
+    let mut cache = PIPETTE_CACHE.lock().unwrap();
+    if cache.len() >= 8 {
+        cache.clear();
+    }
+    cache.push((key, px.clone()));
+    Some(px)
 }
 
 /// 饱和/明度方块的像素（BGRA）
@@ -875,6 +1015,9 @@ fn on_up(hwnd: HWND, x: i32, y: i32) {
 }
 
 /// 点在输入框的哪个位置 → 光标放哪
+///
+/// 以前用「每个字符约 13px」估位置，字号 / 字体一变就对不上（点在第 3 位，
+/// 光标跑到第 4 位）。现在按真实进位宽度算每个卡位的 x，取离得最近的那个。
 fn caret_at(x: i32, scale: f32) -> i32 {
     let rect = {
         let (_h, hits) = layout(scale);
@@ -885,15 +1028,25 @@ fn caret_at(x: i32, scale: f32) -> i32 {
     };
     let r = |v: f32| (v * scale).round() as i32;
     let text_x = rect.left + r(8.0);
-    // 每个字符大概多宽（中文一格，英文半格）
-    let unit = 13.0 * scale;
-    let dx = (x - text_x) as f32;
-    if dx <= 0.0 {
+    let hex = state().lock().unwrap().hex.clone();
+    let chars: Vec<char> = digits(&hex).chars().collect();
+    let Some(buf) = ui::Buf::new(8, 8) else {
         return 0;
+    };
+    let mut g = Gfx::new(buf.hdc());
+    g.font(r(13.0), false);
+    let mut best = 0;
+    let mut best_d = i32::MAX;
+    for i in 0..=chars.len() {
+        let prefix: String = std::iter::once('#').chain(chars[..i].iter().copied()).collect();
+        let cx = text_x + g.text_w_exact(&prefix);
+        let d = (x - cx).abs();
+        if d < best_d {
+            best_d = d;
+            best = i as i32;
+        }
     }
-    // "#" 占一格
-    let n = (dx / unit).round() as i32 - 1;
-    n.max(0)
+    best
 }
 
 /// 输入框里的 hex 是完整的就按它改一次颜色（点「完成」时用）
@@ -1393,5 +1546,56 @@ fn paint_magnifier(hwnd: HWND) {
         }
         g.stroke_round(0, 0, size, size, 6, (0x60, 0x66, 0x72), 1);
         let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Buf;
+
+    /// 手动跑：`cargo test --release 导出吸管图标预览 -- --ignored --nocapture`
+    /// 把吸管图标放大 10 倍存到临时目录，肉眼确认造型（别再画成话筒）。
+    #[test]
+    #[ignore]
+    fn 导出吸管图标预览() {
+        let (size, zoom) = (26i32, 12u32);
+        let bg = (0xF3, 0xF4, 0xF6);
+        let fg = (0x28, 0x2C, 0x34);
+        let px = pipette_bitmap(size, bg, fg).unwrap();
+        let mut img = image::RgbaImage::new((size as u32) * zoom, (size as u32) * zoom);
+        for y in 0..size {
+            for x in 0..size {
+                let i = ((y * size + x) * 4) as usize;
+                let c = image::Rgba([px[i + 2], px[i + 1], px[i], 255]);
+                for dy in 0..zoom {
+                    for dx in 0..zoom {
+                        img.put_pixel((x as u32) * zoom + dx, (y as u32) * zoom + dy, c);
+                    }
+                }
+            }
+        }
+        let p = std::env::temp_dir().join("lightbox-pipette-preview.png");
+        img.save(&p).unwrap();
+        println!("{}", p.display());
+    }
+
+    /// hex 文字用「逐字进位」量宽度：和 `GetTextExtentPoint32W` 的估值差一格以内
+    #[test]
+    fn 十六进制宽度用逐字进位量() {
+        let buf = Buf::new(8, 8).unwrap();
+        let mut g = Gfx::new(buf.hdc());
+        g.font(16, false);
+        let exact = g.text_w_exact("#00393B");
+        let rough = g.text_w("#00393B");
+        // 实测：exact=65、rough=73（就是原来光标空出小半格的原因）
+        assert!(
+            exact < rough,
+            "逐字进位 {exact} 应该小于 Point32 的 {rough}"
+        );
+        assert!(exact >= 55 && exact <= 70, "宽度看着不对：{exact}");
+        // 单字符与累加一致（'#' 比数字宽，但都必须是正数）
+        assert!(g.text_w_exact("#") > 0);
+        assert_eq!(g.text_w_exact(""), 0);
     }
 }

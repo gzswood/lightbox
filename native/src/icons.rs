@@ -533,6 +533,12 @@ pub enum MenuGlyph {
     Dissolve,
     /// 删除收纳盒：垃圾桶
     Delete,
+    /// 重命名：铅笔
+    Rename,
+    /// 复制：两张叠起来的纸
+    Copy,
+    /// 粘贴：剪贴板
+    Paste,
 }
 
 /// 点到线段的距离（16 单位 viewBox）
@@ -613,6 +619,28 @@ fn sample_menu_glyph(g: MenuGlyph, u: f32, v: f32) -> bool {
                 || in_seg(u, v, 11.6, 4.8, 10.6, 13.4, 1.9)
                 || in_seg(u, v, 5.4, 13.4, 10.6, 13.4, 1.9)
         }
+        // 铅笔：45° 笔杆 + 尖头 + 笔尾的橡皮分界线
+        MenuGlyph::Rename => {
+            in_seg(u, v, 4.0, 12.0, 11.6, 4.4, 3.4)
+                // 笔尖（左下角的三角）
+                || in_seg(u, v, 2.2, 13.8, 4.0, 12.0, 3.0)
+                // 橡皮那一圈：笔杆靠近尾部的一道横线
+                || in_seg(u, v, 9.7, 3.4, 12.6, 6.3, 1.2)
+        }
+        // 复制：前面一张纸 + 后面露出的一角
+        MenuGlyph::Copy => {
+            in_stroke_round_rect(u, v, 5.2, 1.6, 9.2, 9.2, 1.4, 1.6)
+                || in_seg(u, v, 3.4, 4.2, 3.4, 12.0, 1.6)
+                || in_seg(u, v, 2.6, 13.0, 10.4, 13.0, 1.6)
+                || in_seg(u, v, 11.2, 12.2, 11.2, 5.2, 1.6)
+        }
+        // 粘贴：板子 + 上方的夹子
+        MenuGlyph::Paste => {
+            in_stroke_round_rect(u, v, 2.6, 2.4, 10.8, 12.2, 1.6, 1.6)
+                || in_seg(u, v, 5.4, 4.6, 10.6, 4.6, 1.6)
+                || in_seg(u, v, 5.0, 8.0, 11.0, 8.0, 1.4)
+                || in_seg(u, v, 5.0, 10.6, 9.2, 10.6, 1.4)
+        }
     }
 }
 
@@ -654,6 +682,9 @@ fn glyph_char(g: MenuGlyph) -> u32 {
         MenuGlyph::NewBox => 0xE710,   // Add：加号
         MenuGlyph::Dissolve => 0xE72A, // Share：向右的箭头
         MenuGlyph::Delete => 0xE74D,   // Delete：垃圾桶
+        MenuGlyph::Rename => 0xE70F,   // Edit：铅笔
+        MenuGlyph::Copy => 0xE8C8,     // Copy：两张纸
+        MenuGlyph::Paste => 0xE77F,    // Paste：剪贴板
     }
 }
 
@@ -964,5 +995,45 @@ mod tests {
         println!("不透明 {n} px，平均色 #{mr:02X}{mg:02X}{mb:02X}");
         // 旧托盘是蓝底白字：蓝通道应该明显高于红通道
         assert!(mb > mr + 40, "颜色不对：蓝 {mb} 红 {mr}");
+    }
+}
+
+#[cfg(test)]
+mod glyph_scan {
+    use super::*;
+
+    /// 手动跑：扫一段 Segoe MDL2 码位，拼成 16 列网格，用来找某个图标
+    #[test]
+    #[ignore]
+    fn 扫描图标字体码位() {
+        let start: u32 = std::env::var("GLYPH_START")
+            .ok()
+            .and_then(|v| u32::from_str_radix(&v, 16).ok())
+            .unwrap_or(0xE700);
+        let cell = 32i32;
+        let cols = 16;
+        let rows = 8;
+        let mut img = image::RgbaImage::new((cell * cols) as u32, (cell * rows) as u32);
+        for r in 0..rows {
+            for c in 0..cols {
+                let cp = start + (r * cols + c) as u32;
+                if let Some(ic) = font_glyph(cp, cell - 8, (255, 255, 255), (0, 0, 0)) {
+                    for y in 0..ic.h {
+                        for x in 0..ic.w {
+                            let i = ((y * ic.w + x) * 4) as usize;
+                            let px = image::Rgba([ic.px[i + 2], ic.px[i + 1], ic.px[i], 255]);
+                            img.put_pixel(
+                                (c * cell + 4 + x) as u32,
+                                (r * cell + 4 + y) as u32,
+                                px,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let p = std::env::temp_dir().join(format!("lightbox-glyphs-{start:X}.png"));
+        img.save(&p).unwrap();
+        println!("start=0x{start:04X} cols={cols} rows={rows} -> {}", p.display());
     }
 }

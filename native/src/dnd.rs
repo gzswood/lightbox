@@ -51,7 +51,9 @@ fn preferred_dropeffect_id() -> u16 {
 }
 
 /// 构造 CF_HDROP 内存块：DROPFILES 头 + 双 0 结尾的文件名列表
-fn make_hdrop(files: &[PathBuf]) -> Option<windows::Win32::Foundation::HGLOBAL> {
+///
+/// `pub(crate)`：「复制」要把同一份格式写进剪贴板（见 `clip.rs`）。
+pub(crate) fn make_hdrop(files: &[PathBuf]) -> Option<windows::Win32::Foundation::HGLOBAL> {
     let mut names: Vec<u16> = Vec::new();
     for f in files {
         names.extend(f.as_os_str().encode_wide());
@@ -85,7 +87,9 @@ fn make_hdrop(files: &[PathBuf]) -> Option<windows::Win32::Foundation::HGLOBAL> 
 }
 
 /// 解析 CF_HDROP 内存块 → 文件路径列表
-fn parse_hdrop(hg: windows::Win32::Foundation::HGLOBAL) -> Vec<String> {
+///
+/// `pub(crate)`：「粘贴」从剪贴板读回来的也是同一份格式。
+pub(crate) fn parse_hdrop(hg: windows::Win32::Foundation::HGLOBAL) -> Vec<String> {
     let mut out = Vec::new();
     unsafe {
         let p = GlobalLock(hg);

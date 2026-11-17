@@ -296,6 +296,27 @@ fn create_font_w(px: i32, weight: i32, family: &str) -> HFONT {
     }
 }
 
+/// 覆盖率 → 视觉覆盖率的 gamma。
+///
+/// GDI 的 `ANTIALIASED_QUALITY` 给出来的是**线性覆盖率**，DirectWrite（旧版
+/// WebView2 里 Chromium 用的那套）还会再做一次 gamma 校正。同一个字号、同一个
+/// 字重，线性混合出来的字看着明显更细更虚 —— 弹窗里 13px 标题、12px 图标名
+/// 尤其明显（同样是 Regular，旧版看着干净，新版像隔了一层）。
+/// 趁生成覆盖率位图时补上这一段；位图有缓存，不增加每帧开销。
+const TEXT_GAMMA: f32 = 0.82;
+
+fn gamma_lut() -> &'static [u8; 256] {
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0u8; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let f = (i as f32 / 255.0).powf(TEXT_GAMMA) * 255.0;
+            *v = f.round().clamp(0.0, 255.0) as u8;
+        }
+        t
+    })
+}
+
 /// 长条胶囊里的名字沿用旧网页版（参考软件）的字体：
 /// `font-family: "Microsoft YaHei"; font-weight: 600`
 const BAR_FONT_FAMILY: &str = "Microsoft YaHei";
@@ -468,9 +489,11 @@ fn render_text_w(text: &str, px: i32, weight: i32, family: &str) -> Option<TextB
         );
 
         let raw = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        let lut = gamma_lut();
         let mut coverage = vec![0u8; (w * h) as usize];
         for i in 0..(w * h) as usize {
-            coverage[i] = raw[i * 4]; // GDI 灰度抗锯齿：亮度 == 覆盖率
+            // GDI 灰度抗锯齿：亮度 == 覆盖率。再补一次 gamma 校正，见 `TEXT_GAMMA`。
+            coverage[i] = lut[raw[i * 4] as usize];
         }
 
         SelectObject(dc, old_bmp);
@@ -626,5 +649,102 @@ pub fn push_layered(hwnd: HWND, canvas: &Canvas) {
         let _ = DeleteObject(HGDIOBJ(hbmp.0));
         let _ = DeleteDC(hdc_mem);
         ReleaseDC(None, hdc_screen);
+    }
+}
+
+#[cfg(test)]
+mod fontprobe {
+    use super::*;
+
+    /// coverage 做 gamma 提亮（模拟 DirectWrite / Chromium 的灰度抗锯齿对比度）
+    fn boost(c: u8, g: f32) -> u8 {
+        if g == 1.0 {
+            return c;
+        }
+        let v = (c as f32 / 255.0).powf(g) * 255.0;
+        v.round().clamp(0.0, 255.0) as u8
+    }
+
+    fn write_bmp(path: &str, w: usize, h: usize, bgra: &[u8]) {
+        let mut out = Vec::new();
+        let size = (w * h * 4) as u32;
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(54 + size).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(-(h as i32)).to_le_bytes()); // 顶向下
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(bgra);
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_variants() {
+        let bg = (90u8, 96u8, 107u8);
+        let fg = (255u8, 255u8, 255u8);
+        let cases: &[(i32, i32, f32)] = &[
+            (13, 400, 1.0),
+            (13, 700, 1.0),
+            (17, 400, 1.0),
+            (17, 700, 1.0),
+        ];
+        let zoom = 4usize;
+        let row_h = 26usize;
+        let text = "系统工具 14";
+        let w = 140usize;
+        let h = row_h * cases.len();
+        let mut buf = vec![0u8; w * h * 4];
+        for i in 0..(w * h) {
+            buf[i * 4] = bg.2;
+            buf[i * 4 + 1] = bg.1;
+            buf[i * 4 + 2] = bg.0;
+            buf[i * 4 + 3] = 255;
+        }
+        for (r, &(px, weight, gamma)) in cases.iter().enumerate() {
+            let t = render_text_w(text, px, weight, "微软雅黑").expect("render");
+            let ox = 2;
+            let oy = r * row_h + 2;
+            for sy in 0..t.h as usize {
+                for sx in 0..t.w as usize {
+                    let c = boost(t.coverage[sy * t.w as usize + sx], gamma);
+                    if c == 0 {
+                        continue;
+                    }
+                    let (x, y) = (ox + sx, oy + sy);
+                    if x >= w || y >= h {
+                        continue;
+                    }
+                    let o = (y * w + x) * 4;
+                    let a = c as u32;
+                    let inv = 255 - a;
+                    let mix = |s: u8, d: u8| -> u8 {
+                        ((s as u32 * a + d as u32 * inv) / 255) as u8
+                    };
+                    buf[o] = mix(fg.2, bg.2);
+                    buf[o + 1] = mix(fg.1, bg.1);
+                    buf[o + 2] = mix(fg.0, bg.0);
+                }
+            }
+        }
+        // 4× 最近邻放大，方便肉眼看笔画
+        let (zw, zh) = (w * zoom, h * zoom);
+        let mut big = vec![0u8; zw * zh * 4];
+        for y in 0..zh {
+            for x in 0..zw {
+                let s = ((y / zoom) * w + (x / zoom)) * 4;
+                let d = (y * zw + x) * 4;
+                big[d..d + 4].copy_from_slice(&buf[s..s + 4]);
+            }
+        }
+        let path = std::env::temp_dir().join("lb-font-variants.bmp");
+        write_bmp(path.to_str().unwrap(), zw, zh, &big);
+        eprintln!("wrote {}", path.display());
     }
 }

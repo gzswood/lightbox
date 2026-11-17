@@ -87,6 +87,9 @@ const D_CELL_PAD: f32 = 6.0;
 const D_CELL_GAP: f32 = 5.0;
 /// 面板和长条（任务栏上沿）之间的间隙：别贴着，显得挤
 const D_BAR_GAP: f32 = 6.0;
+/// 面板圆角（设计单位）。旧版 WebView2 的 `PANEL_RADIUS` 就是这个值 —— 形状照抄，
+/// 换成原生版之后圆角才不会看着「比原来方」。
+const D_PANEL_RADIUS: f32 = 20.0;
 
 /// 指针移动超过这么多像素才算「拖动」
 const DRAG_THRESHOLD: i32 = 6;
@@ -853,7 +856,8 @@ fn on_mouse_up(hwnd: HWND, x: i32, y: i32) {
             }
             HeadHit::More => {
                 let id = state().lock().unwrap().box_id.clone();
-                crate::menu::panel_header_menu(&id);
+                // 「⋯」上不放粘贴 —— 粘进盒子走空白右键
+                crate::menu::panel_header_menu(&id, false);
             }
             // 「有更新」只负责把人带到「关于」页，说明和下载入口都在那儿
             HeadHit::Update => crate::settings::open_about(),
@@ -879,7 +883,13 @@ fn on_mouse_up(hwnd: HWND, x: i32, y: i32) {
                     right: origin.x + title.right,
                     bottom: origin.y + title.bottom,
                 };
-                crate::rename::open(&id, &name, at, scale(), hwnd);
+                crate::rename::open(
+                    crate::rename::Target::Box(id),
+                    &name,
+                    at,
+                    scale(),
+                    hwnd,
+                );
             }
         }
         repaint(hwnd);
@@ -954,13 +964,16 @@ fn on_right_click(x: i32, y: i32) {
     let head_or_blank = y < head_h() || item_at(x, y).is_none();
     if head_or_blank {
         // 空白处（图标网格的空位）和标题栏走同一套动作：排序 / 解散，
-        // 免得用户在面板里点右键什么都没有。
+        // 免得用户在面板里点右键什么都没有。只有**图标网格的空白处**多一项
+        // 「粘贴」—— 空盒子没有图标可右键，不从这儿进就永远粘不进去；
+        // 标题栏右键跟「⋯」按钮保持一致，不出粘贴。
         let id = state().lock().unwrap().box_id.clone();
-        crate::menu::panel_header_menu(&id);
+        let blank = y >= head_h() && item_at(x, y).is_none();
+        crate::menu::panel_header_menu(&id, blank);
         return;
     }
     let Some(i) = item_at(x, y) else { return };
-    let batch: Vec<Item> = {
+    let (batch, box_id): (Vec<Item>, String) = {
         let mut s = state().lock().unwrap();
         // 和资源管理器一致：右键点到未选中的图标上 = 只选中它；
         // 点到已选中的图标上 = 保持整个选中集，菜单对整批生效
@@ -970,10 +983,11 @@ fn on_right_click(x: i32, y: i32) {
             vec![i]
         };
         s.sel = idxs.clone();
-        idxs.iter().filter_map(|&b| s.items.get(b).cloned()).collect()
+        let items: Vec<Item> = idxs.iter().filter_map(|&b| s.items.get(b).cloned()).collect();
+        (items, s.box_id.clone())
     };
     if !batch.is_empty() {
-        crate::menu::items_menu(&batch);
+        crate::menu::items_menu(&box_id, &batch);
     }
 }
 
@@ -1245,7 +1259,11 @@ fn repaint(hwnd: HWND) {
     let alpha = (255.0 * base).round().clamp(0.0, 255.0) as u8;
 
     let mut canvas = Canvas::new(w, h);
-    let radius = if cfg.panel_radius { 12.0 } else { 0.0 };
+    let radius = if cfg.panel_radius {
+        (D_PANEL_RADIUS * scale()).round()
+    } else {
+        0.0
+    };
 
     // 毛玻璃：先把面板底下那块屏幕截下来糊掉当底，再压一层带透明度的底色。
     // 顺序很重要 —— 玻璃图在底下，底色（半透明）盖在上面，才有「磨砂」的层次。
@@ -1265,10 +1283,9 @@ fn repaint(hwnd: HWND) {
         .find(|b| b.id == box_id)
         .map(|b| b.name.clone())
         .unwrap_or_else(|| "LightBox".into());
-    // 改名热区只包住名字这几个字 —— 记下文字宽度，命中判定要用
-    let title_w = crate::render::text(&title, px(13.0), true)
-        .map(|t| t.w)
-        .unwrap_or(0);
+    // 改名热区只包住名字这几个字 —— 记下文字墨迹宽度，命中判定要用
+    let (_, title_ink) = title_text(&title);
+    let title_w = title_ink.2;
     state().lock().unwrap().title_w = title_w;
     draw_head(&mut canvas, w, &title, items.len(), fg, muted, head_hover);
 
@@ -1354,6 +1371,21 @@ fn ink_rect(bmp: &crate::render::TextBitmap) -> Option<(i32, i32, i32, i32)> {
     (x1 >= 0).then_some((x0, y0, x1 + 1 - x0, y1 + 1 - y0))
 }
 
+/// 标题文字的位图 + 它的墨迹框 `(x, y, w, h)`（位图内坐标）。
+///
+/// 「改名」热区宽度、图标个数小牌的位置、垂直居中都用它。用**墨迹**而不是
+/// `GetTextExtentPoint32W` 量出来的宽高 —— 后者对中文会多算几像素、上方还带
+/// ascent 空白，小牌会离名字远出小半个字，字也会整体偏下。
+fn title_text(title: &str) -> (Option<crate::render::Text>, (i32, i32, i32, i32)) {
+    match crate::render::text(title, px(13.0), false) {
+        Some(t) => {
+            let ink = ink_rect(&t.bmp).unwrap_or((0, 0, t.bmp.w, t.bmp.h));
+            (Some(t), ink)
+        }
+        None => (None, (0, 0, 0, 0)),
+    }
+}
+
 fn draw_head(
     canvas: &mut Canvas,
     w: i32,
@@ -1365,23 +1397,32 @@ fn draw_head(
 ) {
     let (tr, mr, cr) = head_hits(w);
 
-    // 盒子名
-    let title_txt = crate::render::text(title, px(13.0), true);
+    // 盒子名：字重用 Regular —— 旧版 CSS 是 `font-size: 13px; font-weight: 500`，
+    // 而雅黑只有 Regular / Bold 两档，500 落地就是 Regular。GDI 的 Bold 在 13px
+    // 中文上笔画会糊成一坨，反倒不如细体干净（用户对比旧版截图就是这个观感）。
+    let (title_txt, (ix, iy, iw, ih)) = title_text(title);
     if let Some(txt) = &title_txt {
-        canvas.blend_text(tr.left, (head_h() - txt.h) / 2, &txt.bmp, fg);
+        // 墨迹左边贴 tr.left、墨迹中线贴头部中线 —— 不同名字、不同字数的标题
+        // 起笔位置和视觉重心都一致，看着才「规矩」
+        canvas.blend_text(tr.left - ix, (head_h() - ih) / 2 - iy, &txt.bmp, fg);
     }
 
     // 图标个数：标题右边一个圆角小牌（改名时藏起来 —— 改名窗正好盖在那儿）
-    if !crate::rename::is_open() {
-        let cx = tr.left + title_txt.map(|t| t.w).unwrap_or(0) + px(8.0);
-        // 粗体：11px 常规字在这个小圆角牌里笔画太细，缩略图尺度下几乎糊成灰点，
-        // 换成 700 后数字轮廊才立得住。
-        if let Some(txt) = crate::render::text(&count.to_string(), px(11.0), true) {
-            let bw = txt.w + px(14.0);
+    if !crate::rename::renaming_box() {
+        let cx = tr.left + iw + px(8.0);
+        // 旧版是 11px 常规体（CSS 没设 font-weight，就是 400）
+        if let Some(txt) = crate::render::text(&count.to_string(), px(11.0), false) {
+            let (ix, iy, iw, ih) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
+            let bw = iw + px(14.0);
             let bh = px(17.0);
             let by = (head_h() - bh) / 2;
             canvas.fill_round_rect(cx, by, bw, bh, bh as f32 / 2.0, fg, 30);
-            canvas.blend_text(cx + px(7.0), by + px(1.0), &txt.bmp, muted);
+            canvas.blend_text(
+                cx + (bw - iw) / 2 - ix,
+                by + (bh - ih) / 2 - iy,
+                &txt.bmp,
+                muted,
+            );
         }
     }
 
@@ -1443,8 +1484,9 @@ fn draw_empty_hint(canvas: &mut Canvas, w: i32, h: i32, muted: (u8, u8, u8)) {
     let top = grid_top() + px(24.0);
     for (i, line) in lines.iter().enumerate() {
         if let Some(txt) = crate::render::text(line, px(12.0), false) {
+            let (ix, _, iw, _) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
             canvas.blend_text(
-                (w - txt.w) / 2,
+                (w - iw) / 2 - ix,
                 top + i as i32 * (txt.h + px(4.0)),
                 &txt.bmp,
                 muted,
@@ -1480,8 +1522,10 @@ fn draw_cell(
     // 所以中文能显示 6 个、英文能显示十来个，比原来多不少。
     let max_w = cell_w() - px(8.0);
     if let Some(txt) = fit_label(&it.name, max_w) {
+        // 按墨迹居中：`txt.w` 多算的那几像素会让名字整体偏左
+        let (ix, _, iw, _) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
         canvas.blend_text(
-            cx + (cell_w() - txt.w) / 2,
+            cx + (cell_w() - iw) / 2 - ix,
             icon_y + size + px(D_CELL_GAP),
             &txt.bmp,
             fg,
@@ -1491,9 +1535,16 @@ fn draw_cell(
 
 /// 图标名：按像素宽度截断（超了就加省略号）
 fn fit_label(name: &str, max_w: i32) -> Option<crate::render::Text> {
+    // 放不放得下按**墨迹**宽度判，不能按 `t.w` —— 那是 `GetTextExtentPoint32W`
+    // 量的，对西文比实际进位多算一成多，名字会提前被省略号砍掉
+    // （旧版「HiBitUninstaller」是完整的，新版只剩「HiBitUninstal…」）。
+    let fits = |t: &crate::render::Text| {
+        let (_, _, iw, _) = ink_rect(&t.bmp).unwrap_or((0, 0, t.bmp.w, t.bmp.h));
+        iw <= max_w
+    };
     let mut s: String = name.chars().take(24).collect();
     if let Some(t) = crate::render::text(&s, label_px(), false) {
-        if t.w <= max_w {
+        if fits(&t) {
             return Some(t);
         }
     }
@@ -1502,7 +1553,7 @@ fn fit_label(name: &str, max_w: i32) -> Option<crate::render::Text> {
         s.pop();
         let with = format!("{s}…");
         if let Some(t) = crate::render::text(&with, label_px(), false) {
-            if t.w <= max_w {
+            if fits(&t) {
                 return Some(t);
             }
         }
@@ -1541,6 +1592,32 @@ fn fit(src: &IconBmp, size: i32) -> IconBmp {
         }
     }
     out
+}
+
+/// 面板窗口句柄（右键菜单里开改名窗要拿它当 owner）
+pub fn hwnd() -> Option<HWND> {
+    state().lock().unwrap().hwnd
+}
+
+/// 面板当前的界面缩放（右键菜单里新建的改名窗要跟着同一个系数）
+pub fn ui_scale() -> f32 {
+    scale()
+}
+
+/// 某个图标（按盒子里的文件名找）在屏幕上的格子矩形。
+///
+/// 右键「重命名」时把输入框摆到这一格上 —— 用户眼睛还停在那个图标上，
+/// 输入框跑别处去就找不着了。
+pub fn item_rect(file: &str) -> Option<RECT> {
+    let s = state().lock().unwrap();
+    let (i, _) = s.items.iter().enumerate().find(|(_, it)| it.file == file)?;
+    let (cx, cy) = cell_origin(i, s.cols);
+    Some(RECT {
+        left: s.origin.x + cx,
+        top: s.origin.y + cy,
+        right: s.origin.x + cx + cell_w(),
+        bottom: s.origin.y + cy + cell_h(),
+    })
 }
 
 /// 外观变了（底色 / 透明度 / 毛玻璃 / 圆角）：把开着的面板重画一遍

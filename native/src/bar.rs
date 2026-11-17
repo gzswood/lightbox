@@ -75,6 +75,9 @@ const PAD_Y: i32 = 3;
 const ICON_MAX: i32 = 26;
 /// 图标右侧到文字的间距
 const GAP: i32 = 3;
+/// 隐藏名称后每段的左右内边距：PAD_X(3) 时两个图标只隔 6，挤在一起；
+/// 按图标边长的四分之一给（26 → 6，两图标间 12），看着就松开了
+const PAD_X_HIDDEN_DIV: i32 = 4;
 /// 一个分段里文字最多几个字
 const LABEL_CHARS: usize = 2;
 /// 名称字号 = 任务栏厚度 × 0.30（物理像素）。
@@ -818,7 +821,8 @@ fn load_seg_icon(b: &BoxConfig) -> Option<IconBmp> {
 /// 一段的宽度：左右内边距 + 图标 + 间距 + 文字
 fn seg_width(label: &str, icon: i32, text_px: i32) -> i32 {
     if label.is_empty() {
-        PAD_X * 2 + icon
+        let pad = (icon / PAD_X_HIDDEN_DIV).max(PAD_X);
+        pad * 2 + icon
     } else {
         let tw = crate::render::bar_text(label, text_px)
             .map(|t| t.w)
@@ -1116,7 +1120,12 @@ fn paint(hwnd: HWND, w: i32, h: i32) {
         if seg.x <= 0 {
             continue; // 滚出可视区的段不画
         }
-        let icon_x = seg.x + PAD_X;
+        // 隐藏名称时分段里只有图标：居中放，两边的留白才一样宽
+        let icon_x = if seg.label.is_empty() {
+            seg.x + (seg.w - icon) / 2
+        } else {
+            seg.x + PAD_X
+        };
         match &seg.icon {
             Some(img) => {
                 let tmp = fit_icon(img, icon);
