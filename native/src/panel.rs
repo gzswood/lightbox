@@ -431,14 +431,9 @@ fn drop_at(x: i32, y: i32, n: usize, cols: usize, batch: &[usize]) -> usize {
 /// 按图标数算列数、行数和面板大小。
 /// 行数太多、塞不进工作区时就加宽（宁可宽一点也别让面板高到出屏）。
 fn grid_size(n: usize, avail_h: i32) -> (usize, usize, i32, i32) {
-    // 空盒子也按一排 4 格算宽度 —— 否则刚建出来只有一个窄条，没地方放图标
-    let mut cols = if n == 0 {
-        MAX_COLS
-    } else if n == 1 {
-        1
-    } else {
-        n.min(MAX_COLS)
-    };
+    // 宽度一律按一排 4 格算 —— 空盒子、只有一两个图标时也不缩窄，
+    // 否则面板会随图标数忽宽忽窄，看着像抽风。高度仍随行数自适应。
+    let mut cols = MAX_COLS;
     let mut rows = if n == 0 { 1 } else { n.div_ceil(cols) };
     // 面板总高 = 头部 + 分隔线 + 网格 + 网格下面的空白带 + 底边留白
     let height = |rows: usize| {
@@ -1916,6 +1911,23 @@ mod tests {
 
     fn names(v: &[Item]) -> Vec<&str> {
         v.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    /// 宽度固定一排 4 格：1 个图标和 4 个图标的面板必须一样宽，只有高度能变。
+    /// 曾经 1 个图标时按 1 列收窄，面板窄成一条，右侧留白全没了。
+    #[test]
+    fn 图标少于四个也按四列宽() {
+        let (_, _, w1, _) = grid_size(1, 10000);
+        let (_, _, w4, _) = grid_size(4, 10000);
+        let (_, _, w0, _) = grid_size(0, 10000);
+        assert_eq!(w1, w4);
+        assert_eq!(w0, w4);
+        // 5 个图标进第二行，宽度不变、高度长一行
+        let (_, rows5, w5, h5) = grid_size(5, 10000);
+        assert_eq!(w5, w4);
+        assert_eq!(rows5, 2);
+        let (_, _, _, h4) = grid_size(4, 10000);
+        assert_eq!(h5 - h4, cell_h() + gap());
     }
 
     /// 墨迹框必须返回 (x, y, 宽, 高)。曾经错返回 (left, top, right, bottom)，

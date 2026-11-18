@@ -6,7 +6,7 @@
 
 单文件 exe，绿色免安装，约 **1.0 MB**。所有收纳盒合成**一条长条**，整条嵌进任务栏。
 
-[![版本](https://img.shields.io/badge/version-1.0.3-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
+[![版本](https://img.shields.io/badge/version-1.0.4-4C8BF5?style=flat-square)](https://gitee.com/gathon/lightbox/releases)
 [![平台](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square&logo=windows&logoColor=white)](#系统要求)
 [![协议](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -46,6 +46,12 @@ LightBox 解决一个很小但很麻烦的问题：桌面图标越堆越多，�
 把整个文件夹拷到别的机器上就能接着用。
 
 支持 **Windows 10 与 Windows 11**（含 Win11 任务栏），多屏 / 混合缩放均可用。
+
+| Windows 10 | Windows 11 |
+| :---: | :---: |
+| <img src="docs/images/win10.jpg" width="470" alt="LightBox 在 Windows 10 上运行：长条嵌在任务栏，弹出面板与设置页"> | <img src="docs/images/win11.jpg" width="490" alt="LightBox 在 Windows 11 上运行：长条嵌在任务栏，弹出面板与设置页"> |
+
+<sub>实际运行效果：任务栏模式，收纳盒弹窗和设置页面。</sub>
 
 ## 功能
 
