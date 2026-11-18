@@ -12,6 +12,7 @@ mod clip;
 mod collate;
 mod config;
 mod desktop;
+mod dialog;
 mod dnd;
 mod geom;
 mod glass;

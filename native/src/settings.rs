@@ -29,17 +29,19 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HGDIOBJ, HFONT, InvalidateRect, LOGFONTW, PAINTSTRUCT, SRCCOPY, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, KillTimer, LoadCursorW,
-    MessageBoxW, RegisterClassW, SendMessageW, SetCursor, SetTimer,
+    RegisterClassW, SendMessageW, SetCursor, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, GWLP_WNDPROC, IDC_ARROW, IDC_HAND,
-    MB_ICONWARNING,
-    MB_OK, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOW,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_SETTEXT,
     WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WS_TABSTOP, WS_VSCROLL,
@@ -93,7 +95,13 @@ fn dimmed() -> bool {
 
 // —— 尺寸（设计单位 = 96 DPI 下的逻辑像素）——
 const DW: f32 = 680.0;
-const DH: f32 = 560.0;
+/// 顶部留白：相当于一条标题栏的高度。
+///
+/// 页头标题原来离窗口顶只有 8，紧贴着上沿显得憋屈；这里整页内容（品牌、
+/// 导航、页头、内容区）统一下移这么多，窗口高度同步加高同样的值 ——
+/// 内容区高度不变，所以「5 个盒子不滚动」这类阈值也不受影响。
+const DTOP: f32 = 30.0;
+const DH: f32 = 560.0 + DTOP;
 const DTITLE: f32 = 52.0;
 const DSIDEBAR: f32 = 160.0;
 const DPAD: f32 = 22.0;
@@ -106,7 +114,7 @@ const DBTN_W: f32 = 84.0;
 const DBTN_H: f32 = 34.0;
 /// 内容区起始 y。页头标题 8~36、副标题 36~54，这里只留 20 的间隙 ——
 /// 原来是 110/128 起步，中间空出一大块，看着很空。
-const DCONTENT_TOP: f32 = 74.0;
+const DCONTENT_TOP: f32 = 74.0 + DTOP;
 /// 内容区下边界：贴着页脚分隔线（页脚线在 DH - DFOOT），留 6 的余量
 const DCONTENT_GAP: f32 = 6.0;
 /// 列表下方「+」按钮：距最后一行 8、168×34、主色底白加号
@@ -115,16 +123,17 @@ const DADD_W: f32 = 168.0;
 const DADD_H: f32 = 34.0;
 /// 开关行 / 主界面模式标题 / 模式按钮相对「最后一行底部」的偏移
 /// （开关标题画在命中区上方 14，所以 DSWITCH_Y 要按这个再算回来）
-const DSWITCH_Y: f32 = 76.0;
-const DMODE_LABEL_Y: f32 = 127.0;
-const DMODE_BTN_Y: f32 = 153.0;
+const DSWITCH_Y: f32 = 66.0;
+const DMODE_LABEL_Y: f32 = 118.0;
+const DMODE_BTN_Y: f32 = 144.0;
 /// 行下方那一整块（+ 按钮 / 开关 / 主界面模式）的总高，
 /// 用来算「整页要不要滚动」：5 个盒子刚好不滚动，6 个起出现滚动条。
-const DBLOCK_H: f32 = 209.0;
+const DBLOCK_H: f32 = 184.0;
 /// 页面滚动条宽度（贴在窗口右边缘的细条）
 const DSCROLL_W: f32 = 5.0;
-/// 行内「解散 / 删除」按钮宽度
-const DROWBTN_W: f32 = 78.0;
+/// 行内「解散 / 删除」按钮宽度。88 是去掉描边后按 11px 字重新量的：
+/// 5 个汉字约 55，两侧各留 16，视觉上不再顶到边。
+const DROWBTN_W: f32 = 88.0;
 /// 关于页「更新信息」文本框（只有查到新版本时才画），在检查更新按钮下方
 const DNOTES_TOP: f32 = 332.0;
 const DNOTES_BOTTOM: f32 = 490.0;
@@ -248,6 +257,9 @@ fn content_shift(tab: Tab, scale: f32) -> i32 {
         // 功能页第一项是开关行，标题画在命中区上方 14 处，
         // 所以要让「命中区顶 128」落到 DCONTENT_TOP + 14，标题才贴着内容区顶。
         Tab::Features => r(DCONTENT_TOP) + r(14.0) - r(128.0),
+        // 关于页整页用的是绝对坐标（72 / 112 / 166…），窗口顶部多留出来的
+        // 那条空白只能靠整体平移补上，否则内容会顶到标题上面去。
+        Tab::About => r(DTOP),
         _ => 0,
     }
 }
@@ -459,7 +471,9 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
     let font_combo = create_font_combo(hwnd, scale);
     state().lock().unwrap().font_combo = Some(font_combo);
     refresh_round();
-    position(hwnd, scale);
+    position(hwnd);
+    // 摆好位置之后再裁一次圆角：窗口落到鼠标那颗屏上，DPI 才定下来
+    refresh_round();
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetFocus(Some(hwnd));
@@ -637,14 +651,14 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
         Hit::Close,
         RECT {
             left: w - r(46.0),
-            top: r(6.0),
+            top: r(6.0) + r(DTOP),
             right: w - r(6.0),
-            bottom: r(42.0),
+            bottom: r(42.0) + r(DTOP),
         },
     ));
 
     // 左侧导航
-    let mut ny = r(DTITLE) + r(10.0);
+    let mut ny = r(DTITLE) + r(10.0) + r(DTOP);
     for t in TABS {
         hits.push((
             Hit::Nav(t),
@@ -842,18 +856,18 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                 Hit::Slider,
                 RECT {
                     left: cx,
-                    top: r(140.0),
+                    top: r(138.0),
                     right: cr - r(58.0),
-                    bottom: r(164.0),
+                    bottom: r(162.0),
                 },
             ));
             hits.push((
                 Hit::ResetColor,
                 RECT {
                     left: cr - r(84.0),
-                    top: r(192.0),
+                    top: r(182.0),
                     right: cr,
-                    bottom: r(214.0),
+                    bottom: r(204.0),
                 },
             ));
             // 「收纳盒」「弹出窗口」两块色卡并排放，一行看完
@@ -862,21 +876,21 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                 Hit::Swatch(ColorTarget::Box),
                 RECT {
                     left: cx,
-                    top: r(218.0),
+                    top: r(208.0),
                     right: cx + half,
-                    bottom: r(264.0),
+                    bottom: r(254.0),
                 },
             ));
             hits.push((
                 Hit::Swatch(ColorTarget::Panel),
                 RECT {
                     left: cx + half + r(8.0),
-                    top: r(218.0),
+                    top: r(208.0),
                     right: cr,
-                    bottom: r(264.0),
+                    bottom: r(254.0),
                 },
             ));
-            for (s, top) in [(Setting::Acrylic, 300.0), (Setting::Radius, 356.0)] {
+            for (s, top) in [(Setting::Acrylic, 284.0), (Setting::Radius, 330.0)] {
                 hits.push((
                     Hit::Switch(s),
                     RECT {
@@ -893,35 +907,35 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                 Hit::FontName,
                 RECT {
                     left: cx + r(104.0),
-                    top: r(392.0),
+                    top: r(378.0),
                     right: cr,
-                    bottom: r(420.0),
+                    bottom: r(406.0),
                 },
             ));
             hits.push((
                 Hit::FontMinus,
                 RECT {
                     left: cr - r(140.0),
-                    top: r(440.0),
+                    top: r(416.0),
                     right: cr - r(112.0),
-                    bottom: r(468.0),
+                    bottom: r(444.0),
                 },
             ));
             hits.push((
                 Hit::FontPlus,
                 RECT {
                     left: cr - r(28.0),
-                    top: r(440.0),
+                    top: r(416.0),
                     right: cr,
-                    bottom: r(468.0),
+                    bottom: r(444.0),
                 },
             ));
         }
         Tab::Features => {
             for (s, top) in [
                 (Setting::Autostart, 128.0),
-                (Setting::Topmost, 184.0),
-                (Setting::Diagnostics, 240.0),
+                (Setting::Topmost, 176.0),
+                (Setting::Diagnostics, 224.0),
             ] {
                 hits.push((
                     Hit::Switch(s),
@@ -937,9 +951,9 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                 Hit::OpenDir,
                 RECT {
                     left: cr - r(80.0),
-                    top: r(326.0),
+                    top: r(284.0),
                     right: cr,
-                    bottom: r(356.0),
+                    bottom: r(314.0),
                 },
             ));
         }
@@ -1056,10 +1070,31 @@ fn clickable(h: Hit) -> bool {
     }
 }
 
-/// 当前显示器的缩放系数（96 DPI = 1.0）
+/// 设置窗口自己所在显示器的缩放系数（96 DPI = 1.0）。
+///
+/// 必须按**窗口自己的 DPI** 算，不能按长条所在显示器算：设置页可以拖到
+/// 另一颗屏上（100% ↔ 125%），那时窗口的 DPI 和长条的 DPI 已经不是一回事，
+/// 用错了就会出现「内容按新比例画进按旧比例开的窗口里」——右/下被裁掉，
+/// 或者右边和底部留一大片空白。
+///
+/// 窗口还没建出来时按鼠标位置算（窗口就开在鼠标那儿）。
 fn display_scale() -> f32 {
-    let cfg = app().cfg.lock().unwrap().clone();
-    let mon = geom::work_area_at(cfg.bar.x, cfg.bar.y);
+    if let Some(h) = state().lock().unwrap().hwnd {
+        let dpi = unsafe { GetDpiForWindow(h) };
+        if dpi > 0 {
+            return dpi as f32 / 96.0;
+        }
+    }
+    cursor_scale()
+}
+
+/// 鼠标所在显示器的缩放系数（开窗定位、建窗前算尺寸用）
+fn cursor_scale() -> f32 {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let mon = geom::work_area_at(pt.x, pt.y);
     mon.scale as f32 / 96.0
 }
 
@@ -1144,6 +1179,39 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 state().lock().unwrap().copied = None;
                 repaint();
             }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // 窗口被拖到另一颗不同缩放的显示器上。系统只给一个「建议矩形」，
+            // 不会替我们重排：必须按新比例把窗口尺寸重新算一遍，否则内容
+            // 按新 scale 画进按旧 scale 开的窗口里 —— 100%→125% 时右侧和底部
+            // 被裁（关闭按钮、应用/取消/确定看不见），反过来则留一大片空白。
+            let suggested = unsafe { *(lp.0 as *const RECT) };
+            let scale = (wp.0 & 0xffff) as u32 as f32 / 96.0;
+            let w = (DW * scale).round() as i32;
+            let h = (DH * scale).round() as i32;
+            // 改名输入框 / 字体下拉是按旧比例摆的，先收掉再重排，
+            // 免得留一个字号和位置都对不上的浮窗；
+            // 输入框的字体也是建窗时按旧比例造的，一并按新比例重造
+            commit_inline_edit();
+            hide_font_combo();
+            state().lock().unwrap().pending_font_combo = false;
+            rescale_edit(scale);
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            // 圆角区域按新尺寸重裁（别用 refresh_round：WM_DPICHANGED 里
+            // GetDpiForWindow 未必已经是新值，这里直接用手上的 scale）
+            round_corners(hwnd, w, h);
+            repaint();
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1242,6 +1310,32 @@ fn refresh_round() {
     let w = (DW * scale).round() as i32;
     let h = (DH * scale).round() as i32;
     round_corners(hwnd, w, h);
+}
+
+/// 换显示器后把输入框的字号换成新比例。
+///
+/// EDIT 的字体是 `create_edit` 里按当时的 scale 造一次的，窗口拖到另一颗
+/// 屏上（100% ↔ 125%）后如果不重造，改名框里的字会明显比页面上的小/大。
+fn rescale_edit(scale: f32) {
+    let (edit, old) = {
+        let s = state().lock().unwrap();
+        (s.edit, s.font)
+    };
+    let Some(edit) = edit else { return };
+    let font = ui::create_font((14.0 * scale).round() as i32, false);
+    unsafe {
+        // 先把新字体换上去，再删旧的（选进控件的字体不能直接删）
+        let _ = SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        if let Some(f) = old {
+            let _ = DeleteObject(HGDIOBJ(f.0));
+        }
+    }
+    state().lock().unwrap().font = Some(font);
 }
 
 /// 名字输入框（建好先藏着，点哪一行就挪到哪一行）
@@ -1568,16 +1662,18 @@ fn commit_font_from_combo() {
     repaint();
 }
 
-/// 把窗口摆在鼠标附近（居中，再夹进工作区）
-fn position(hwnd: HWND, scale: f32) {
-    let r = |v: f32| (v * scale).round() as i32;
-    let w = r(DW);
-    let h = r(DH);
+/// 把窗口摆在鼠标附近（居中，再夹进工作区）。
+/// 尺寸按**鼠标所在那颗屏**的缩放算：窗口就开在那儿。
+fn position(hwnd: HWND) {
     let mut pt = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
     let mon = geom::work_area_at(pt.x, pt.y);
+    let scale = mon.scale as f32 / 96.0;
+    let r = |v: f32| (v * scale).round() as i32;
+    let w = r(DW);
+    let h = r(DH);
     let min_x = mon.work.left + r(12.0);
     let min_y = mon.work.top + r(12.0);
     let max_x = (mon.work.right - w - r(12.0)).max(min_x);
@@ -1639,6 +1735,10 @@ fn paint(hwnd: HWND) {
             None => hdc,
         };
         let mut g = Gfx::new(dc);
+        // 开关这类曲线图形走像素直写的抗锯齿通道（没有离屏位图就自动退回 GDI）
+        if let Some(b) = &buf {
+            g.attach(b.surface());
+        }
 
         let r = |v: f32| (v * scale).round() as i32;
         let c = Ctx {
@@ -1651,9 +1751,10 @@ fn paint(hwnd: HWND) {
         let col = Colors {
             bg,
             fg: theme::text_on(bg),
-            // 次要文字比通用 muted 再深一点：浅灰底上细字本来就显得软，
-            // 按 0.62 收会偏虚，0.70 更接近系统设置的观感
-            muted: theme::mix(bg, theme::text_on(bg), 0.70),
+            // 次要文字：浅灰底上的小字本来就显得软，往深里收一点才立得住。
+            // 0.78 ≈ 旧版 `rgba(0,0,0,.7)` 落在 #f9fafd 上的观感（≈ #4b4b4b），
+            // 早先的 0.70 比它浅一档，说明文字看着发灰。
+            muted: theme::mix(bg, theme::text_on(bg), 0.78),
             accent: theme::accent_on(bg),
             line: line_color(bg),
             sunken: sunken_color(bg),
@@ -1663,14 +1764,28 @@ fn paint(hwnd: HWND) {
         g.fill_rect(0, 0, cw, ch, bg);
         let sidebar = theme::mix(bg, col.fg, 0.045);
         g.fill_rect(0, 0, c.sx, ch, sidebar);
+        let brand = "LightBox";
         g.font(r(14.0), true);
+        let brand_w = g.text_w(brand);
         g.text(
             r(20.0),
-            r(10.0),
+            r(10.0) + r(DTOP),
             c.sx - r(40.0),
             r(30.0),
-            "LightBox",
+            brand,
             col.fg,
+            Align::Left,
+        );
+        // 版本号：贴着品牌名右侧一小段浅灰小字（排障时一眼看出装的是哪版）
+        g.font(r(11.0), false);
+        let vx = r(20.0) + brand_w + r(7.0);
+        g.text(
+            vx,
+            r(10.0) + r(DTOP),
+            c.sx - vx - r(8.0),
+            r(30.0),
+            &format!("v{}", env!("CARGO_PKG_VERSION")),
+            theme::mix(bg, col.fg, 0.42),
             Align::Left,
         );
         for t in TABS {
@@ -1696,7 +1811,7 @@ fn paint(hwnd: HWND) {
                     theme::mix(bg, col.fg, 0.08),
                 );
             }
-            g.font(r(13.0), active);
+            g.font(r(12.0), active);
             g.text(
                 nr.left + r(12.0),
                 nr.top,
@@ -1712,11 +1827,19 @@ fn paint(hwnd: HWND) {
         // —— 页头 ——
         let title_w = cw - c.cx - r(50.0);
         g.font(r(17.0), true);
-        g.text(c.cx, r(8.0), title_w, r(28.0), tab.title(), col.fg, Align::Left);
+        g.text(
+            c.cx,
+            r(8.0) + r(DTOP),
+            title_w,
+            r(28.0),
+            tab.title(),
+            col.fg,
+            Align::Left,
+        );
         g.font(r(11.0), false);
         g.text(
             c.cx,
-            r(36.0),
+            r(36.0) + r(DTOP),
             title_w,
             r(18.0),
             tab.subtitle(),
@@ -1753,10 +1876,12 @@ fn paint(hwnd: HWND) {
         // 裁剪矩形用设备坐标（此时视口原点还是 0,0）。
         let (ctop, cbot) = content_band(scale);
         let _ = IntersectClipRect(dc, 0, ctop, cw, cbot);
+        g.clip_y(Some((ctop, cbot)));
         // 外观 / 功能页整体上移，代码里的绝对坐标不用逐条改
         let dy = content_shift(tab, scale);
         if dy != 0 {
             let _ = SetViewportOrgEx(dc, 0, dy, None);
+            g.viewport_y(dy);
         }
         match tab {
             Tab::Boxes => paint_boxes(
@@ -1768,8 +1893,10 @@ fn paint(hwnd: HWND) {
         }
         if dy != 0 {
             let _ = SetViewportOrgEx(dc, 0, 0, None);
+            g.viewport_y(0);
         }
         let _ = SelectClipRgn(dc, None);
+        g.clip_y(None);
 
         // 字体下拉框不能在重绘里隐藏：鼠标移动 / hover 变化都会 repaint()，
         // 刚展开的 ComboBox 会被立刻藏回去，表现就是「字体选择框点不开」。
@@ -1845,7 +1972,7 @@ fn paint_boxes(
     let (top, _bottom) = content_band(c.scale);
 
     if draft.boxes.is_empty() {
-        g.font(r(13.0), false);
+        g.font(r(12.0), false);
         g.text(
             c.cx,
             top + r(36.0),
@@ -1920,7 +2047,7 @@ fn paint_boxes(
                         theme::mix(row_bg, col.fg, 0.06),
                     );
                 }
-                g.font(r(13.0), false);
+                g.font(r(12.0), false);
                 let tw = (nr.right - nr.left - r(12.0)).max(r(20.0));
                 let shown = ui::ellipsize(&b.name, tw, |s| g.text_w(s));
                 g.text(
@@ -2035,13 +2162,12 @@ fn paint_boxes(
         col,
         Hit::Switch(Setting::HideLabel),
         "隐藏盒子名称",
-        "打开后只显示图标，不显示名字",
         draft.bar_hide_label,
     );
 
     // 主界面模式（和上面的开关之间留出一段，免得两块黏在一起）
     let my = hit_rect(lay, Hit::Mode(false)).map(|m| m.top).unwrap_or(0);
-    g.font(r(13.0), false);
+    g.font(r(12.0), false);
     g.text(
         c.cx,
         my - r(DMODE_BTN_Y - DMODE_LABEL_Y),
@@ -2070,6 +2196,8 @@ fn paint_boxes(
             r(7.0),
             fill,
         );
+        // 和标题「主界面模式」同为 12px：之前是 11，100% 下和标题差 1px 看着还行，
+        // 到 125% 一取整（15 vs 14）就明显比标题小一圈，像是「字缩了」。
         g.font(r(12.0), active);
         let tc = if active {
             theme::text_on(col.accent)
@@ -2086,16 +2214,6 @@ fn paint_boxes(
             Align::Center,
         );
     }
-    g.font(r(11.0), false);
-    g.text(
-        c.cx,
-        my + r(38.0),
-        c.cr - c.cx,
-        r(18.0),
-        "任务栏模式嵌在任务栏里；桌面模式浮在桌面上，可拖到任意位置",
-        col.muted,
-        Align::Left,
-    );
 }
 
 fn paint_look(
@@ -2110,7 +2228,7 @@ fn paint_look(
 
     // 透明度
     let t = (draft.panel_transparency.clamp(0.0, 50.0) / 50.0) as f32;
-    g.font(r(13.0), false);
+    g.font(r(12.0), false);
     g.text(c.cx, r(110.0), r(200.0), r(22.0), "透明度", col.fg, Align::Left);
     g.text(
         c.cr - r(56.0),
@@ -2142,22 +2260,12 @@ fn paint_look(
             col.accent,
         );
     }
-    g.font(r(11.0), false);
-    g.text(
-        c.cx,
-        r(166.0),
-        c.cr - c.cx,
-        r(18.0),
-        "0% 完全不透明，50% 最透",
-        col.muted,
-        Align::Left,
-    );
 
     // 背景颜色（收纳盒 / 弹出窗口各一个色块）
-    g.font(r(13.0), false);
+    g.font(r(12.0), false);
     g.text(
         c.cx,
-        r(192.0),
+        r(182.0),
         r(200.0),
         r(22.0),
         "背景颜色",
@@ -2166,7 +2274,7 @@ fn paint_look(
     );
     if let Some(rr) = hit_rect(lay, Hit::ResetColor) {
         let hot = hover == Some(Hit::ResetColor);
-        g.font(r(11.0), false);
+        g.font(r(10.0), false);
         g.text(
             rr.left,
             rr.top,
@@ -2200,7 +2308,7 @@ fn paint_look(
         );
         let sw = r(26.0);
         g.swatch(rect.left + r(8.0), rect.top + (sh - sw) / 2, sw, sw, rgb);
-        g.font(r(12.0), false);
+        g.font(r(11.0), false);
         g.text(
             rect.left + r(46.0),
             rect.top,
@@ -2210,7 +2318,7 @@ fn paint_look(
             col.fg,
             Align::Left,
         );
-        g.font(r(11.0), false);
+        g.font(r(10.0), false);
         g.text(
             rect.left + r(46.0),
             rect.top,
@@ -2229,7 +2337,6 @@ fn paint_look(
         col,
         Hit::Switch(Setting::Acrylic),
         "毛玻璃",
-        "弹出窗口背后做模糊，像磨砂玻璃",
         draft.panel_acrylic,
     );
     draw_switch_row(
@@ -2239,18 +2346,18 @@ fn paint_look(
         col,
         Hit::Switch(Setting::Radius),
         "圆角窗口",
-        "弹出窗口和本设置页四角为圆角；关掉是直角",
         draft.panel_radius,
     );
 
     // —— 弹窗字体 ——
     // 设置只作用于点击收纳盒弹出的那个面板（标题、图标名、提示、改名框），
     // 长条胶囊和色块首字尺寸固定，不跟着放大，免得字撑出格子。
-    g.hline(c.cx, c.cr, r(388.0), col.line);
-    g.font(r(13.0), false);
+    // 这里不画分割线：上面一组是弹窗外观开关，下面一组建的是弹窗字体，
+    // 一条横线反而把两件事切得很硬，留白就够分层了。
+    g.font(r(12.0), false);
     g.text(
         c.cx,
-        r(392.0),
+        r(378.0),
         r(100.0),
         r(28.0),
         "弹窗字体",
@@ -2273,7 +2380,6 @@ fn paint_look(
         // 下拉箭头 ▼（右边预留 20px 给箭头）
         let arrow_area = r(20.0);
         let arrow_left = fr.right - arrow_area;
-        g.font(r(10.0), true);
         // 用实心小三角作为下拉指示（用 GDI 画比 unicode 字符更稳）
         // arrow_area 已经是像素，别再乘一次缩放
         let ax = arrow_left + arrow_area / 2;
@@ -2288,7 +2394,7 @@ fn paint_look(
             0, // 只要一个等腰三角，不要箭杆
         );
         // 字体名（文字区域减去箭头空间）
-        g.font(r(12.0), false);
+        g.font(r(11.0), false);
         let shown = ui::ellipsize(&draft.panel_font, fw - arrow_area - r(16.0), |s| g.text_w(s));
         g.text(
             fr.left + r(8.0),
@@ -2300,22 +2406,12 @@ fn paint_look(
             Align::Left,
         );
     }
-    g.font(r(11.0), false);
-    g.text(
-        c.cx,
-        r(421.0),
-        c.cr - c.cx,
-        r(18.0),
-        "点上方选择框，从系统已安装字体中挑选；点「应用」后生效",
-        col.muted,
-        Align::Left,
-    );
 
     // 文字大小
-    g.font(r(13.0), false);
+    g.font(r(12.0), false);
     g.text(
         c.cx,
-        r(440.0),
+        r(416.0),
         r(120.0),
         r(28.0),
         "文字大小",
@@ -2348,7 +2444,7 @@ fn paint_look(
             if can_plus { 1 } else { 0 },
             hover == Some(Hit::FontPlus) && can_plus,
         );
-        g.font(r(12.0), false);
+        g.font(r(11.0), false);
         g.text(
             mr.right,
             mr.top,
@@ -2361,7 +2457,7 @@ fn paint_look(
     }
 
     // 预览：用当前草稿的字体和字号，画在弹窗底色上，改之前就能看出样子
-    let py = r(472.0);
+    let py = r(452.0);
     let ph = r(24.0);
     let bg = crate::util::parse_hex(&draft.panel_bg).unwrap_or((0x5A, 0x60, 0x6B));
     g.fill_round(c.cx, py, c.cr - c.cx, ph, r(6.0), bg);
@@ -2371,7 +2467,7 @@ fn paint_look(
         py,
         c.cr - c.cx - r(20.0),
         ph,
-        "LightBox  收纳盒  ABC 123",
+        "LightBox  收纳盒  ABC 0123",
         theme::text_on(bg),
         Align::Left,
     );
@@ -2395,7 +2491,6 @@ fn paint_features(
         col,
         Hit::Switch(Setting::Autostart),
         "开机自启",
-        "登录 Windows 后自动运行 LightBox",
         auto_on,
     );
     draw_switch_row(
@@ -2405,7 +2500,6 @@ fn paint_features(
         col,
         Hit::Switch(Setting::Topmost),
         "总是置顶",
-        "长条浮在普通窗口之上（任务栏模式自动置顶）",
         draft.bar.topmost,
     );
     draw_switch_row(
@@ -2415,15 +2509,14 @@ fn paint_features(
         col,
         Hit::Switch(Setting::Diagnostics),
         "打印诊断信息",
-        "把排障日志写到 lightbox.log；平时关着，出问题再打开",
         draft.diagnostics,
     );
 
     // 存储位置
-    g.font(r(13.0), false);
+    g.font(r(12.0), false);
     g.text(
         c.cx,
-        r(300.0),
+        r(262.0),
         r(200.0),
         r(22.0),
         "存储位置",
@@ -2435,20 +2528,10 @@ fn paint_features(
     let dir = config::root_dir().display().to_string();
     g.font(r(11.0), false);
     let shown = ui::ellipsize(&dir, pw, |s| g.text_w(s));
-    g.text(c.cx, r(330.0), pw, r(22.0), &shown, col.muted, Align::Left);
+    g.text(c.cx, r(288.0), pw, r(22.0), &shown, col.muted, Align::Left);
     if let Some(rect) = hit_rect(lay, Hit::OpenDir) {
         draw_button(g, c, col, rect, "打开目录", 1, hover == Some(Hit::OpenDir));
     }
-    g.font(r(11.0), false);
-    g.text(
-        c.cx,
-        r(362.0),
-        c.cr - c.cx,
-        r(18.0),
-        "配置和收纳盒里的快捷方式都存在这个目录，可整个拷走备份",
-        col.muted,
-        Align::Left,
-    );
 }
 
 fn paint_about(
@@ -2462,12 +2545,13 @@ fn paint_about(
 ) {
     let r = |v: f32| c.r(v);
 
-    g.font(r(26.0), true);
+    // 和页头那行「关于」同号（17px 粗体）：原来 26px 比页标题大一圈，看着突兀
+    g.font(r(17.0), true);
     g.text(
         c.cx,
         r(72.0),
         c.cr - c.cx,
-        r(36.0),
+        r(30.0),
         "LightBox",
         col.fg,
         Align::Left,
@@ -2525,18 +2609,9 @@ fn paint_about(
     if let Some(rect) = hit_rect(lay, Hit::Link) {
         draw_button(g, c, col, rect, "打开", 1, hover == Some(Hit::Link));
     }
-    // 可复制这件事得说出来，不然没人会想到去点文字
-    g.font(r(11.0), false);
-    g.text(
-        c.cx,
-        r(264.0),
-        c.cr - c.cx,
-        r(18.0),
-        "点一下作者 / 微信 / 链接即可复制到剪贴板",
-        col.muted,
-        Align::Left,
-    );
 
+    // 「检查更新」和上面的三行信息之间留一段空白（原来这里还有一行
+    // 「点一下即可复制」的提示，去掉后靠留白分层就够）
     if let Some(rect) = hit_rect(lay, Hit::CheckUpdate) {
         draw_button(
             g,
@@ -2696,7 +2771,7 @@ fn update_status() -> (String, bool) {
     ("点「检查更新」联网获取最新版本".into(), false)
 }
 
-/// 一行开关：左边标题 + 说明，右边开关
+/// 一行开关：左边标题，右边开关
 fn draw_switch_row(
     g: &mut Gfx,
     c: &Ctx,
@@ -2704,32 +2779,17 @@ fn draw_switch_row(
     col: &Colors,
     hit: Hit,
     title: &str,
-    desc: &str,
     on: bool,
 ) {
     let Some(rect) = hit_rect(lay, hit) else { return };
     let text_w = (rect.left - c.cx - c.r(16.0)).max(c.r(60.0));
-    g.font(c.r(13.0), false);
-    g.text(
-        c.cx,
-        rect.top - c.r(14.0),
-        text_w,
-        c.r(20.0),
-        title,
-        col.fg,
-        Align::Left,
-    );
-    g.font(c.r(11.0), false);
-    let shown = ui::ellipsize(desc, text_w, |s| g.text_w(s));
-    g.text(
-        c.cx,
-        rect.top + c.r(7.0),
-        text_w,
-        c.r(18.0),
-        &shown,
-        col.muted,
-        Align::Left,
-    );
+    // 标题和开关**同一条基线**：标题框贴开关的上下中缝居中。
+    // 早先标题画在开关上方 14（那时下面还有一行说明小字），说明去掉后
+    // 标题就和开关错开半个行高，看着是歪的。
+    let th = c.r(20.0);
+    let ty = rect.top + (rect.bottom - rect.top - th) / 2;
+    g.font(c.r(12.0), false);
+    g.text(c.cx, ty, text_w, th, title, col.fg, Align::Left);
     g.switch(
         rect.left,
         rect.top,
@@ -2800,28 +2860,24 @@ fn draw_row_button(
     let (x, y) = (rect.left, rect.top);
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     let radius = c.r(6.0);
-    let (fill, text, border) = if !enabled {
-        (
-            col.bg,
-            theme::muted_on(col.bg),
-            theme::mix(col.bg, col.fg, 0.12),
-        )
+    // 只留文字，不画描边也不铺底色。
+    //
+    // 原来是一圈浅灰描边的实体小按钮：78 宽里塞 5 个汉字，为了不贴边把字号
+    // 压到 10px —— 而这个尺寸在 100% 下本就偏虚，到 125% 又取整成 13，
+    // 两颗屏一比就像「字变大了」；盒子名 12px 一路是 15，反而稳定。
+    // 现在去掉边框（边框才是显得拥塞的主因），按钮加宽到 88、字回到 11px，
+    // 只在悬停时浮一层淡蓝底提示可点。
+    if hot && enabled {
+        g.fill_round(x, y, w, h, radius, theme::mix(col.bg, col.accent, 0.14));
+    }
+    let text = if !enabled {
+        theme::muted_on(col.bg)
     } else if hot {
-        (
-            theme::mix(col.bg, col.accent, 0.12),
-            col.accent,
-            theme::mix(col.accent, col.bg, 0.45),
-        )
+        col.accent
     } else {
-        (
-            col.bg,
-            theme::mix(col.fg, col.bg, 0.12),
-            theme::mix(col.bg, col.fg, 0.22),
-        )
+        theme::mix(col.fg, col.bg, 0.12)
     };
-    g.fill_round(x, y, w, h, radius, fill);
-    g.stroke_round(x, y, w, h, radius, border, 1);
-    g.font(c.r(12.0), false);
+    g.font(c.r(11.0), false);
     g.text(x, y, w, h, label, text, Align::Center);
 }
 
@@ -3325,7 +3381,19 @@ fn dissolve_box(i: usize) {
             None => return,
         }
     };
-    if config::count_items(&id) == 0 {
+    let count = config::count_items(&id);
+    if count == 0 {
+        return;
+    }
+    // 先问一句再动手：这一步不可撤销，图标会被真的搬回桌面。
+    let hwnd = state().lock().unwrap().hwnd;
+    let Some(h) = hwnd else { return };
+    if !confirm(
+        h,
+        &format!(
+            "「{name}」里的 {count} 个图标会被放回桌面，盒子保留为空。\n\n确定要解散吗？"
+        ),
+    ) {
         return;
     }
     let n = config::restore_all(&id);
@@ -3767,14 +3835,15 @@ fn apply_changes() {
 }
 
 fn warn(hwnd: HWND, msg: &str) {
-    unsafe {
-        MessageBoxW(
-            Some(hwnd),
-            &windows::core::HSTRING::from(msg),
-            &windows::core::HSTRING::from("LightBox"),
-            MB_OK | MB_ICONWARNING,
-        );
-    }
+    crate::dialog::tell(Some(hwnd), msg);
+}
+
+/// 二次确认：点「确定」返回 true，点「取消」/ 关掉窗口返回 false。
+///
+/// 解散是不可撤销的（图标会真的被搬回桌面），所以走系统弹窗让用户点一次，
+/// 免得误触行尾那颗按钮就把一盒图标全撒到桌面上。
+fn confirm(hwnd: HWND, msg: &str) -> bool {
+    crate::dialog::ask(Some(hwnd), msg)
 }
 
 #[cfg(test)]
@@ -3844,7 +3913,8 @@ mod tests {
             DCONTENT_TOP as i32
         );
         assert_eq!(content_shift(Tab::Boxes, 1.0), 0);
-        assert_eq!(content_shift(Tab::About, 1.0), 0);
+        // 关于页整页用绝对坐标，靠同量的平移补上顶部留白
+        assert_eq!(content_shift(Tab::About, 1.0), DTOP as i32);
     }
 
     /// 窗口固定件（侧栏 / 关闭 / 页脚三个按钮）不跟内容平移，也不吃内容区裁剪

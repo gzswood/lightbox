@@ -309,7 +309,7 @@ pub fn box_menu(idx: usize) {
     let count = config::count_items(&id);
 
     let picked = popup(&[
-        header(name),
+        header(name.clone()),
         header(format!("共 {count} 个图标")),
         sep(),
         item("设置图标…", Act::SetBoxIcon),
@@ -360,6 +360,11 @@ pub fn box_menu(idx: usize) {
         Some(Act::NewBox) => add_box(),
         Some(Act::DissolveBox) => {
             if count == 0 {
+                return;
+            }
+            if !confirm(&format!(
+                "「{name}」里的 {count} 个图标会被放回桌面，盒子保留为空。\n\n确定要解散吗？"
+            )) {
                 return;
             }
             let n = config::restore_all(&id);
@@ -464,17 +469,16 @@ fn set_box_icon(id: &str) {
     crate::panel::reload();
 }
 
-/// 一个简短的提示框（菜单已经收起来了，只能靠系统提示框告知用户）
+/// 一个简短的提示框（菜单已经收起来了，只能靠系统提示框告知用户）。
+/// 走 `dialog` 统一入口：owner 自动挑置顶的面板，弹窗才不会被面板压住。
 fn warn(text: &str) {
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            None,
-            &windows::core::HSTRING::from(text),
-            &windows::core::HSTRING::from("LightBox"),
-            windows::Win32::UI::WindowsAndMessaging::MB_OK
-                | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
-        );
-    }
+    crate::dialog::tell(None, text);
+}
+
+/// 二次确认：点「确定」返回 true，「取消」/ 关掉窗口返回 false。
+/// 解散会把图标真的搬回桌面，不可撤销，所以每个入口都先问一句。
+fn confirm(text: &str) -> bool {
+    crate::dialog::ask(None, text)
 }
 
 /// 长条空白处（非分段）的右键菜单
@@ -548,6 +552,11 @@ pub fn panel_header_menu(box_id: &str, with_paste: bool) {
             if count == 0 {
                 return;
             }
+            if !confirm(&format!(
+                "这个收纳盒里的 {count} 个图标会被放回桌面，盒子保留为空。\n\n确定要解散吗？"
+            )) {
+                return;
+            }
             let n = config::restore_all(box_id);
             crate::bar::refresh();
             crate::panel::reload();
@@ -609,6 +618,16 @@ pub fn items_menu(box_id: &str, items: &[Item]) {
             }
         }
         Some(Act::RevealItem) => {
+            // 连点几下会开出好几个资源管理器窗口，1.2 秒内只认第一次
+            if !crate::dialog::throttle(
+                &format!("reveal:{}", items[0].path),
+                std::time::Duration::from_millis(1200),
+            ) {
+                return;
+            }
+            // 面板是置顶窗，资源管理器会被压在下面 —— 先让它退一档，
+            // 鼠标回到面板时 panel 自己会重新置顶
+            crate::dialog::yield_topmost();
             if let Err(e) = crate::shortcut::reveal(&items[0].path) {
                 log::info(&format!("打开资源管理器失败：{e}"));
             }
@@ -643,9 +662,20 @@ pub fn items_menu(box_id: &str, items: &[Item]) {
             log::info(&format!("已从盒子移除 {done} 个图标"));
         }
         Some(Act::Properties) => {
+            // 属性框同理：连点会叠出好几个，短时间内只认第一次
+            if !crate::dialog::throttle(
+                &format!("props:{}", items[0].path),
+                std::time::Duration::from_millis(1200),
+            ) {
+                return;
+            }
+            crate::dialog::yield_topmost();
             if let Err(e) = crate::shortcut::properties(&items[0].path) {
                 log::info(&format!("打开属性失败：{e}"));
             }
+            // 这里**不能**立刻 restore：不管 ShellExecute 是同步还是异步返回，
+            // 一抬回置顶就可能盖住刚弹出的属性框。让面板保持让位，
+            // 等用户点回面板（`panel::restore_topmost`）再恢复。
         }
         Some(Act::RenameItem) => {
             let Some(it) = items.first() else { return };

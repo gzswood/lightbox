@@ -22,11 +22,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, LoadCursorW,
     PostMessageW, RegisterClassW, SetWindowsHookExW, SetWindowPos, ShowWindow,
     UnhookWindowsHookEx, HC_ACTION, HHOOK, HTCLIENT, IDC_ARROW, IDC_HAND, KBDLLHOOKSTRUCT,
-    MA_NOACTIVATE, MSLLHOOKSTRUCT, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WNDCLASSW,
+    MA_NOACTIVATE, MSLLHOOKSTRUCT, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_DESTROY, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WNDCLASSW, HWND_NOTOPMOST, HWND_TOPMOST,
 };
 
 use crate::app::app;
@@ -62,6 +62,9 @@ const D_GAP: f32 = 4.0;
 const D_ICON: f32 = 36.0;
 /// 图标名的字号
 const D_LABEL: f32 = 12.0;
+/// 图标名的行距：旧版 CSS 是 `line-height: 1.25`，12px × 1.25 = 15px。
+/// 名字最多折两行（旧版 `-webkit-line-clamp: 2`），第二行超出就用省略号收掉。
+const D_LABEL_LINE: f32 = 15.0;
 /// 一行放几个图标
 const MAX_COLS: usize = 4;
 /// 图标太多、面板放不下时允许加宽到几列
@@ -656,6 +659,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            // 给属性框 / 资源管理器让过路的面板，用户回来点它时重新置顶。
+            // 注意**不能**在 WM_MOUSEMOVE 里恢复：属性框是别进程的模态窗口，
+            // 弹出来后鼠标还停在面板上，一抖就恢复置顶，面板立刻又盖住属性框。
+            restore_topmost();
             on_mouse_down(hwnd, x_of(lp), y_of(lp));
             LRESULT(0)
         }
@@ -1276,6 +1283,39 @@ fn repaint(hwnd: HWND) {
     }
     canvas.fill_round_rect(0, 0, w, h, radius, bg, alpha);
 
+    // 完全不透明的面板才能让文字走 ClearType 直出（半透明时底色不可知）。
+    //
+    // 两个坑（都是被毛玻璃踩出来的）：
+    // ① 不能只看上面那个 alpha：开毛玻璃时底图是**不透明的屏幕快照**，
+    //    压上一层半透明底色之后画布 alpha 还是 255，直出完全成立 —— 早先按
+    //    `alpha == 255` 判断，一开毛玻璃文字就退回灰度抗锯齿，12px 小字立刻发虚
+    //    （用户看到的是「换个字体就模糊了」，其实是毛玻璃开关）。
+    // ② 也不能拿 cfg 里的 `bg` 当 ClearType 的底色：毛玻璃面板的真实颜色是
+    //    「底图 × 0.36 + 底色 × 0.64」，和 bg 差得很远，拿 bg 去算会在字周围
+    //    糊出一圈亮边。所以直接取画布上真正的颜色（三点平均）当底色。
+    let (text_bg, canvas_opaque) = {
+        let sample = |fx: f32| -> Option<(u8, u8, u8)> {
+            let sx = ((w as f32 * fx) as i32).clamp(0, w - 1);
+            let sy = (h / 2).clamp(0, h - 1);
+            let o = (sy * w + sx) as usize * 4;
+            match canvas.px.get(o + 3) {
+                Some(255) => Some((canvas.px[o + 2], canvas.px[o + 1], canvas.px[o])),
+                _ => None,
+            }
+        };
+        let picks: Vec<(u8, u8, u8)> = [0.5, 0.3, 0.7].iter().filter_map(|f| sample(*f)).collect();
+        if picks.len() < 3 {
+            (bg, false)
+        } else {
+            let n = picks.len() as u32;
+            let avg = |k: usize| -> u8 {
+                (picks.iter().map(|p| [p.0, p.1, p.2][k] as u32).sum::<u32>() / n) as u8
+            };
+            ((avg(0), avg(1), avg(2)), true)
+        }
+    };
+    crate::render::set_text_mode(text_bg, canvas_opaque);
+
     // —— 头部 ——
     let title = cfg
         .boxes
@@ -1371,6 +1411,34 @@ fn ink_rect(bmp: &crate::render::TextBitmap) -> Option<(i32, i32, i32, i32)> {
     (x1 >= 0).then_some((x0, y0, x1 + 1 - x0, y1 + 1 - y0))
 }
 
+/// 画一段文字。
+///
+/// 弹窗**完全不透明**时走 ClearType 直出 —— 亚像素抗锯齿保留了笔画落在半像素时
+/// 的位置信息，12px 中文才立得住（旧版 WebView2 的清晰度就是这么来的）。
+/// 半透明 / 毛玻璃时底色不可知，退回灰度覆盖率 + alpha 合成。
+///
+/// `fallback` 是调用方为了排版（墨迹居中、宽度判断）已经渲染好的灰度位图，
+/// 两种位图尺寸一致，位置可以直接共用。
+fn put_text(
+    canvas: &mut Canvas,
+    x: i32,
+    y: i32,
+    s: &str,
+    size: i32,
+    bold: bool,
+    color: (u8, u8, u8),
+    fallback: &crate::render::Text,
+) {
+    let (bg, opaque) = crate::render::text_mode();
+    if opaque {
+        if let Some(t) = crate::render::text_on(s, size, bold, bg, color) {
+            canvas.blit_text_on(x, y, &t);
+            return;
+        }
+    }
+    canvas.blend_text(x, y, &fallback.bmp, color);
+}
+
 /// 标题文字的位图 + 它的墨迹框 `(x, y, w, h)`（位图内坐标）。
 ///
 /// 「改名」热区宽度、图标个数小牌的位置、垂直居中都用它。用**墨迹**而不是
@@ -1404,7 +1472,16 @@ fn draw_head(
     if let Some(txt) = &title_txt {
         // 墨迹左边贴 tr.left、墨迹中线贴头部中线 —— 不同名字、不同字数的标题
         // 起笔位置和视觉重心都一致，看着才「规矩」
-        canvas.blend_text(tr.left - ix, (head_h() - ih) / 2 - iy, &txt.bmp, fg);
+        put_text(
+            canvas,
+            tr.left - ix,
+            (head_h() - ih) / 2 - iy,
+            title,
+            px(13.0),
+            false,
+            fg,
+            txt,
+        );
     }
 
     // 图标个数：标题右边一个圆角小牌（改名时藏起来 —— 改名窗正好盖在那儿）
@@ -1417,11 +1494,15 @@ fn draw_head(
             let bh = px(17.0);
             let by = (head_h() - bh) / 2;
             canvas.fill_round_rect(cx, by, bw, bh, bh as f32 / 2.0, fg, 30);
-            canvas.blend_text(
+            put_text(
+                canvas,
                 cx + (bw - iw) / 2 - ix,
                 by + (bh - ih) / 2 - iy,
-                &txt.bmp,
+                &count.to_string(),
+                px(11.0),
+                false,
                 muted,
+                &txt,
             );
         }
     }
@@ -1440,12 +1521,22 @@ fn draw_head(
         if let Some(txt) = crate::render::text("有更新", px(10.0), true) {
             let (ix, iy, iw, ih) =
                 ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
-            canvas.blend_text(
+            // 这块是实心蓝底，直出要按蓝底算，不然白字边缘会发灰
+            let saved = crate::render::text_mode();
+            if saved.1 {
+                crate::render::set_text_mode(base, true);
+            }
+            put_text(
+                canvas,
                 ur.left + bw / 2 - (ix + iw / 2),
                 ur.top + bh / 2 - (iy + ih / 2),
-                &txt.bmp,
+                "有更新",
+                px(10.0),
+                true,
                 (255, 255, 255),
+                &txt,
             );
+            crate::render::set_text_mode(saved.0, saved.1);
         }
     }
 
@@ -1465,11 +1556,15 @@ fn draw_head(
             let (ix, iy, iw, ih) =
                 ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
             // 让墨迹框中心落在按钮中心，而不是让位图左上角对齐
-            canvas.blend_text(
+            put_text(
+                canvas,
                 r.left + bw / 2 - (ix + iw / 2),
                 r.top + bh / 2 - (iy + ih / 2),
-                &txt.bmp,
+                glyph,
+                size,
+                false,
                 muted,
+                &txt,
             );
         }
     }
@@ -1485,11 +1580,15 @@ fn draw_empty_hint(canvas: &mut Canvas, w: i32, h: i32, muted: (u8, u8, u8)) {
     for (i, line) in lines.iter().enumerate() {
         if let Some(txt) = crate::render::text(line, px(12.0), false) {
             let (ix, _, iw, _) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
-            canvas.blend_text(
+            put_text(
+                canvas,
                 (w - iw) / 2 - ix,
                 top + i as i32 * (txt.h + px(4.0)),
-                &txt.bmp,
+                line,
+                px(12.0),
+                false,
                 muted,
+                &txt,
             );
         }
     }
@@ -1518,48 +1617,93 @@ fn draw_cell(
         let tmp = fit(img, size);
         canvas.blend_icon(icon_x + (size - tmp.w) / 2, icon_y, &tmp);
     }
-    // 名字：按像素宽度截断，中文一个字宽、英文半个字宽，
-    // 所以中文能显示 6 个、英文能显示十来个，比原来多不少。
+    // 名字：最多折两行，第三行开始用省略号收掉。
+    // 行高和字距都按旧版 CSS 来，图标那一行的 y 不动 —— 只占一行的名字和
+    // 占两行的名字，图标始终在同一个高度上，一屏看过去才是齐的。
     let max_w = cell_w() - px(8.0);
-    if let Some(txt) = fit_label(&it.name, max_w) {
-        // 按墨迹居中：`txt.w` 多算的那几像素会让名字整体偏左
-        let (ix, _, iw, _) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
-        canvas.blend_text(
-            cx + (cell_w() - iw) / 2 - ix,
-            icon_y + size + px(D_CELL_GAP),
-            &txt.bmp,
-            fg,
-        );
+    let top = icon_y + size + px(D_CELL_GAP);
+    let step = px(D_LABEL_LINE);
+    for (i, line) in label_lines(&it.name, max_w).iter().enumerate() {
+        if let Some(txt) = crate::render::text(line, label_px(), false) {
+            // 按墨迹居中：`txt.w` 多算的那几像素会让名字整体偏左
+            let (ix, _, iw, _) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
+            put_text(
+                canvas,
+                cx + (cell_w() - iw) / 2 - ix,
+                top + i as i32 * step,
+                line,
+                label_px(),
+                false,
+                fg,
+                &txt,
+            );
+        }
     }
 }
 
-/// 图标名：按像素宽度截断（超了就加省略号）
-fn fit_label(name: &str, max_w: i32) -> Option<crate::render::Text> {
-    // 放不放得下按**墨迹**宽度判，不能按 `t.w` —— 那是 `GetTextExtentPoint32W`
-    // 量的，对西文比实际进位多算一成多，名字会提前被省略号砍掉
-    // （旧版「HiBitUninstaller」是完整的，新版只剩「HiBitUninstal…」）。
-    let fits = |t: &crate::render::Text| {
-        let (_, _, iw, _) = ink_rect(&t.bmp).unwrap_or((0, 0, t.bmp.w, t.bmp.h));
-        iw <= max_w
-    };
-    let mut s: String = name.chars().take(24).collect();
-    if let Some(t) = crate::render::text(&s, label_px(), false) {
-        if fits(&t) {
-            return Some(t);
-        }
+/// 图标名折行：最多两行，放不下就用省略号收掉。
+///
+/// 规则照旧版 CSS（`-webkit-line-clamp: 2` + `overflow-wrap: anywhere`）：
+/// 有空格就在空格处断（英文名别把单词劈两半），没空格就逐字断（中文本来就能
+/// 在任意字间断行）。宽度一律用**真实进位**（`render::char_widths`）判断。
+fn label_lines(name: &str, max_w: i32) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.is_empty() || max_w <= 0 {
+        return Vec::new();
     }
-    // 放不下就一个字一个字地砍，末尾补省略号
-    while !s.is_empty() {
-        s.pop();
-        let with = format!("{s}…");
-        if let Some(t) = crate::render::text(&with, label_px(), false) {
-            if fits(&t) {
-                return Some(t);
+    let widths = crate::render::char_widths(name, label_px(), false);
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() && out.len() < 2 {
+        // 这一行最多能塞几个字
+        let mut w = 0;
+        let mut end = start;
+        let mut space_at = None;
+        while end < chars.len() {
+            if w + widths[end] > max_w && end > start {
+                break;
+            }
+            w += widths[end];
+            end += 1;
+            if chars[end - 1] == ' ' {
+                space_at = Some(end - 1);
             }
         }
+        // 还有下文时，英文名优先断在空格处（汉字没有空格，自然走逐字断）
+        let mut cut = match space_at {
+            Some(k) if k > start && end < chars.len() => k,
+            _ => end,
+        };
+        if cut <= start {
+            cut = start + 1;
+        }
+        if cut < chars.len() && out.len() == 1 {
+            // 只剩这一行了，还得塞下省略号
+            let ell = crate::render::measure_exact("…", label_px(), false);
+            let mut w2 = 0;
+            let mut e = start;
+            while e < chars.len() && w2 + widths[e] + ell <= max_w {
+                w2 += widths[e];
+                e += 1;
+            }
+            if e == start {
+                e = start + 1;
+            }
+            let mut s: String = chars[start..e].iter().collect();
+            s.push('…');
+            out.push(s);
+            return out;
+        }
+        let line: String = chars[start..cut].iter().collect();
+        out.push(line.trim_end().to_string());
+        start = cut;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
     }
-    crate::render::text("…", label_px(), false)
+    out
 }
+
 
 /// 画一个 1 像素的边框
 fn stroke_rect(canvas: &mut Canvas, r: &RECT, color: (u8, u8, u8), alpha: u8) {
@@ -1597,6 +1741,50 @@ fn fit(src: &IconBmp, size: i32) -> IconBmp {
 /// 面板窗口句柄（右键菜单里开改名窗要拿它当 owner）
 pub fn hwnd() -> Option<HWND> {
     state().lock().unwrap().hwnd
+}
+
+/// 面板临时退出置顶后，等一个「用户回到面板」的时机再抬回去
+static TOP_RESTORE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 让面板暂时退出置顶。
+///
+/// 面板一直是 `WS_EX_TOPMOST`，打开资源管理器、文件属性框这类**别的进程**
+/// 的窗口会被它压住（那些窗口没有 owner 关系，系统不会替我们排 z 序）。
+/// 先退出置顶，等用户**回来点面板**（`restore_topmost`）再抬回来 ——
+/// 用户去看属性框时面板不挡路，回来操作时它又回到最前。
+pub fn lower_topmost() {
+    let Some(h) = hwnd() else { return };
+    TOP_RESTORE_PENDING.store(true, Ordering::Release);
+    unsafe {
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 回到置顶（只有 `lower_topmost` 之后第一次调用才真的动窗口）
+pub fn restore_topmost() {
+    if !TOP_RESTORE_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let Some(h) = hwnd() else { return };
+    unsafe {
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
 }
 
 /// 面板当前的界面缩放（右键菜单里新建的改名窗要跟着同一个系数）
@@ -1884,5 +2072,44 @@ mod tests {
             head_hit_at(tr.right + 20, (tr.top + tr.bottom) / 2, w, name_w),
             None
         );
+    }
+
+    #[test]
+    fn 图标名最多折两行() {
+        let max_w = cell_w() - px(8.0);
+        // 短名字一行放得下
+        let one = label_lines("系统工具", max_w);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], "系统工具");
+        // 中文长名：折两行，不丢字
+        let two = label_lines("嘉立创EDA(专业版)", max_w);
+        assert!(two.len() >= 1 && two.len() <= 2, "{two:?}");
+        if two.len() == 2 {
+            assert_eq!(format!("{}{}", two[0], two[1]).replace(' ', ""), "嘉立创EDA(专业版)");
+        }
+        // 超长的：第二行必须带省略号收尾
+        let mut long = String::new();
+        for _ in 0..8 {
+            long.push_str("很长的图标名字");
+        }
+        let cut = label_lines(&long, max_w);
+        assert_eq!(cut.len(), 2);
+        assert!(cut[1].ends_with('…'), "{cut:?}");
+        // 每一行的真实宽度都不能超出格子
+        for line in &cut {
+            assert!(
+                crate::render::measure_exact(line, label_px(), false) <= max_w + 2,
+                "行宽超了：{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn 图标名行高不会顶到下一格() {
+        // 图标 + 名字两行必须落在格子高度里，否则行与行会叠在一起
+        let two_lines = px(D_CELL_PAD) + icon_size() + px(D_CELL_GAP)
+            + px(D_LABEL_LINE)
+            + crate::render::measure_text("图标名", label_px(), false).1;
+        assert!(two_lines <= cell_h(), "{two_lines} > {}", cell_h());
     }
 }

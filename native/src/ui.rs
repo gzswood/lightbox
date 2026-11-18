@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Gdi::{CreatePen, PS_SOLID};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, GetDC, ReleaseDC, BITMAPINFO,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, GetDC, ReleaseDC, BITMAPINFO,
     BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
 };
 
@@ -36,6 +36,8 @@ pub struct Buf {
     old: HGDIOBJ,
     w: i32,
     h: i32,
+    /// 位图像素起点（自上而下，32 位 BGRA）。抗锯齿图形直接写这块内存
+    bits: *mut u8,
 }
 
 impl Buf {
@@ -71,13 +73,29 @@ impl Buf {
             };
             let old = SelectObject(mem, HGDIOBJ(hbmp.0));
             let _ = ReleaseDC(None, screen);
-            Some(Buf { dc: mem, bmp: hbmp, old, w, h })
+            Some(Buf {
+                dc: mem,
+                bmp: hbmp,
+                old,
+                w,
+                h,
+                bits: bits as *mut u8,
+            })
         }
     }
 
     /// 在这张离屏位图上画
     pub fn hdc(&self) -> HDC {
         self.dc
+    }
+
+    /// 像素直写通道（抗锯齿图形用）。位图建不出来时这里是空指针，调用方会退回 GDI
+    pub fn surface(&self) -> Surface {
+        Surface {
+            ptr: self.bits,
+            w: self.w,
+            h: self.h,
+        }
     }
 
     /// 一次性贴到目标 DC
@@ -108,6 +126,64 @@ pub enum Align {
     Right,
 }
 
+/// 可直接写像素的目标：离屏位图的一块 32 位 BGRA 内存（自上而下）
+///
+/// GDI 的 `RoundRect` 只能画出整数像素的直角台阶 —— 开关那种「胶囊 + 圆钮」
+/// 全是曲线，台阶一眼就能看出来（用户说的「颗粒感」）。要平滑就得自己算
+/// 每个像素的覆盖率再混色，这条通道就是给它用的。
+#[derive(Clone, Copy)]
+pub struct Surface {
+    ptr: *mut u8,
+    w: i32,
+    h: i32,
+}
+
+impl Surface {
+    fn is_valid(&self) -> bool {
+        !self.ptr.is_null() && self.w > 0 && self.h > 0
+    }
+
+    /// 把一个颜色按覆盖率 `cov`(0..1) 混到 (x, y)
+    ///
+    /// 先 `GdiFlush`：GDI 有命令缓冲，不刷的话刚用 GDI 画完的像素可能还没落到
+    /// 这块内存上，读出来的底色是旧值，圆角边缘就会混错颜色。
+    fn blend(&self, x: i32, y: i32, color: (u8, u8, u8), cov: f32) {
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return;
+        }
+        let o = ((y * self.w + x) * 4) as usize;
+        // 位图是 B, G, R, A 顺序，A 由 BitBlt 忽略，不动它
+        let src = [color.2, color.1, color.0];
+        unsafe {
+            let p = self.ptr.add(o);
+            for (i, sc) in src.iter().enumerate() {
+                let d = *p.add(i) as f32;
+                let v = d + (*sc as f32 - d) * cov;
+                *p.add(i) = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    fn flush(&self) {
+        unsafe {
+            let _ = GdiFlush();
+        }
+    }
+
+    /// 读一个像素（测试截图用）
+    #[cfg(test)]
+    pub(crate) fn read(&self, o: usize) -> [u8; 4] {
+        unsafe {
+            [
+                *self.ptr.add(o),
+                *self.ptr.add(o + 1),
+                *self.ptr.add(o + 2),
+                *self.ptr.add(o + 3),
+            ]
+        }
+    }
+}
+
 /// RGB → COLORREF（注意是 0x00BBGGRR，和常见的 0xRRGGBB 正好相反）
 pub fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
@@ -121,6 +197,14 @@ pub struct Gfx {
     px: i32,
     bold: bool,
     family: String,
+    /// 像素直写通道（离屏位图才有；直接画窗口时为 None）
+    surface: Option<Surface>,
+    /// 视口纵向偏移：外观 / 功能页用 `SetViewportOrgEx` 整体上移，
+    /// 逐像素写入不认视口，得自己补上这个偏移
+    vp_y: i32,
+    /// 内容区的上下边界（设备像素）。逐像素写入也不认 GDI 裁剪区，
+    /// 整页滚动时开关会被画到页脚上 —— 这里手动照着裁
+    clip_y: Option<(i32, i32)>,
 }
 
 impl Gfx {
@@ -134,14 +218,33 @@ impl Gfx {
                 old,
                 px: 14,
                 bold: false,
-                family: "Microsoft YaHei UI".into(),
+                family: UI_FONT.into(),
+                surface: None,
+                vp_y: 0,
+                clip_y: None,
             }
         }
     }
 
+    /// 挂上像素直写通道（`Buf::surface()`）。没挂或者位图建失败时，
+    /// 抗锯齿图形会自动退回 GDI 的直角版本。
+    pub fn attach(&mut self, s: Surface) {
+        self.surface = if s.is_valid() { Some(s) } else { None };
+    }
+
+    /// 同步 GDI 视口的纵向偏移（换了 `SetViewportOrgEx` 就要跟着改）
+    pub fn viewport_y(&mut self, dy: i32) {
+        self.vp_y = dy;
+    }
+
+    /// 同步 GDI 裁剪区的上下边界（`IntersectClipRect` 之后调用；解除时传 None）
+    pub fn clip_y(&mut self, band: Option<(i32, i32)>) {
+        self.clip_y = band;
+    }
+
     /// 换字号（粗体可选），字体保持默认
     pub fn font(&mut self, px: i32, bold: bool) {
-        self.font_named(px, bold, "Microsoft YaHei UI");
+        self.font_named(px, bold, UI_FONT);
     }
 
     /// 换字号 / 粗体 / 字体名。外观页的字体预览要用它按用户选的字体画样例。
@@ -208,6 +311,49 @@ impl Gfx {
             SelectObject(self.hdc, op);
             let _ = DeleteObject(HGDIOBJ(brush.0));
             let _ = DeleteObject(HGDIOBJ(pen.0));
+        }
+    }
+
+    /// 抗锯齿圆角矩形（逐像素覆盖率，边缘平滑）
+    ///
+    /// 和 `fill_round` 的关系：那个走 GDI `RoundRect`，只有整数像素台阶；
+    /// 曲线多的形状（开关的胶囊轨道、圆钮）用它就能看出锯齿。这里在离屏
+    /// 位图上按有符号距离场算覆盖率混色，效果等同 `render.rs` 里分层窗口
+    /// 那套画法。
+    pub fn fill_round_aa(&self, x: i32, y: i32, w: i32, h: i32, radius: i32, c: (u8, u8, u8)) {
+        let Some(s) = self.surface else {
+            self.fill_round(x, y, w, h, radius, c);
+            return;
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let y = y + self.vp_y;
+        let hw = w as f32 * 0.5;
+        let hh = h as f32 * 0.5;
+        let cx = x as f32 + hw;
+        let cy = y as f32 + hh;
+        let rad = (radius as f32).clamp(0.0, hw.min(hh));
+        s.flush();
+        let x0 = x.max(0);
+        let mut y0 = y.max(0);
+        let x1 = (x + w).min(s.w);
+        let mut y1 = (y + h).min(s.h);
+        if let Some((c0, c1)) = self.clip_y {
+            y0 = y0.max(c0);
+            y1 = y1.min(c1);
+        }
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let d =
+                    crate::render::sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, rad);
+                // 半像素过渡带：内部 1、外部 0，正好压在边缘上
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                s.blend(px, py, c, cov);
+            }
         }
     }
 
@@ -405,12 +551,15 @@ impl Gfx {
     }
 
     /// 画一个开关：轨道 + 圆钮。`on` 为真时是蓝色。
+    ///
+    /// 轨道和圆钮都是纯曲线，走抗锯齿版本 —— GDI 的 `RoundRect` 在这上面会
+    /// 留下明显的台阶（轨道两端和圆钮一圈都不圆）。
     pub fn switch(&self, x: i32, y: i32, w: i32, h: i32, on: bool) {
         let track = if on { (47, 122, 245) } else { (120, 124, 132) };
-        self.fill_round(x, y, w, h, h / 2, track);
+        self.fill_round_aa(x, y, w, h, h / 2, track);
         let knob = h - 6;
         let kx = if on { x + w - knob - 3 } else { x + 3 };
-        self.fill_round(kx, y + 3, knob, knob, knob / 2, (255, 255, 255));
+        self.fill_round_aa(kx, y + 3, knob, knob, knob / 2, (255, 255, 255));
     }
 
     /// 画一个颜色小块（圆角 + 细边，颜色浅的时候也要看得见轮廓）
@@ -430,6 +579,16 @@ impl Drop for Gfx {
     }
 }
 
+/// 普通窗口（设置页 / 取色器）的正文字体。
+///
+/// 旧版是 WebView2，`body` 的 font-family 是
+/// `"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui` ——
+/// 西文走 Segoe UI、中文靠 GDI 的字体链接回退到微软雅黑。原生版早先**整个**用
+/// `Microsoft YaHei UI`，西文数字也跟着变成雅黑的拉丁字形，和旧版一比就不像了
+/// （版本号、路径、hex 这些西文串最明显）。这里改回 `Segoe UI`：西文回 Segoe UI，
+/// 中文由 GDI 自动链接到微软雅黑，两边观感都和旧版一致。
+pub const UI_FONT: &str = "Segoe UI";
+
 /// 建一支字体。`px` 是字符高度（正数）。
 ///
 /// 这里用 ClearType（亚像素）抗锯齿：ui 模块只服务于设置页 / 取色器这类
@@ -438,7 +597,7 @@ impl Drop for Gfx {
 /// 长条和弹出面板是分层窗口（逐像素 alpha），在那边用 ClearType 会在边缘
 /// 留下彩色描边，所以那边继续走灰度抗锯齿（`render.rs`）。
 pub fn create_font(px: i32, bold: bool) -> windows::Win32::Graphics::Gdi::HFONT {
-    create_font_named(px, bold, "Microsoft YaHei UI")
+    create_font_named(px, bold, UI_FONT)
 }
 
 /// 指定字体名的版本：字体名不存在时 GDI 会自己回退，不会失败。
@@ -499,3 +658,4 @@ pub fn ellipsize(s: &str, max_w: i32, measure: impl Fn(&str) -> i32) -> String {
         format!("{out}…")
     }
 }
+

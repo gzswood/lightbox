@@ -801,6 +801,15 @@ fn to_window_xy(screen_x: i32, screen_y: i32) -> (i32, i32) {
     }
 }
 
+/// 长条窗口句柄。
+///
+/// 系统对话框要拿它当 owner 才能压在长条上面 —— 长条在任务栏模式 /
+/// 勾了置顶时是 `WS_EX_TOPMOST`，owner 传托盘那个隐藏窗口的话，
+/// 弹窗会被长条盖掉一截。
+pub fn hwnd() -> Option<HWND> {
+    state().lock().unwrap().hwnd
+}
+
 /// 从配置重建分段
 pub fn refresh() {
     let cfg: Config = app().cfg.lock().unwrap().clone();
@@ -1100,6 +1109,8 @@ fn paint(hwnd: HWND, w: i32, h: i32) {
     // 底板：整条一个胶囊（圆角半径 = 高度的一半，看起来就是个药丸）
     let radius = (h as f32 / 2.0).min(20.0);
     canvas.fill_round_rect(0, 0, w, h, radius, bg, 255);
+    // 长条底板是实心的，名字可以走 ClearType 直出（和旧版一样锐）
+    crate::render::set_text_mode(bg, true);
 
     // 悬停高亮
     if let Some(hv) = hover {
@@ -1140,7 +1151,12 @@ fn paint(hwnd: HWND, w: i32, h: i32) {
         if !seg.label.is_empty() {
             // 参考软件的任务栏样式：微软雅黑 600、字号 = 任务栏厚度 × 0.30
             if let Some(txt) = crate::render::bar_text(&seg.label, text_px) {
-                canvas.blend_text(icon_x + icon + GAP, (h - txt.h) / 2, &txt.bmp, fg);
+                let tx = icon_x + icon + GAP;
+                let ty = (h - txt.h) / 2;
+                match crate::render::bar_text_on(&seg.label, text_px, bg, fg) {
+                    Some(t) => canvas.blit_text_on(tx, ty, &t),
+                    None => canvas.blend_text(tx, ty, &txt.bmp, fg),
+                }
             }
         }
     }
