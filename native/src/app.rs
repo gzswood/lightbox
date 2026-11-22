@@ -75,6 +75,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_TIMER => {
+            ensure_tray();
+            check_taskbar_restart();
             crate::bar::on_tick();
             LRESULT(0)
         }
@@ -90,9 +92,77 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
+/// 托盘图标补装。
+///
+/// 启动时任务栏可能还没准备好（比如资源管理器刚崩过、正被系统重启），
+/// 这时 `Shell_NotifyIcon(NIM_ADD)` 会失败，程序就没有托盘图标了。
+/// 每秒重试，半分钟内装上就停。
+fn ensure_tray() {
+    use std::sync::atomic::AtomicU32;
+    static TRIES: AtomicU32 = AtomicU32::new(0);
+    if app().tray.lock().unwrap().is_some() {
+        TRIES.store(0, Ordering::Relaxed);
+        return;
+    }
+    if TRIES.fetch_add(1, Ordering::Relaxed) >= 30 {
+        return;
+    }
+    let Some(h) = *app().hwnd.lock().unwrap() else {
+        return;
+    };
+    if let Ok(t) = Tray::install(h, "LightBox") {
+        *app().tray.lock().unwrap() = Some(t);
+        log::info("托盘图标已补装");
+    }
+}
+
+/// 资源管理器重启（任务栏换成了另一个窗口）之后：补回托盘图标、把长条重挂回去。
+///
+/// 外壳崩溃时 Windows 会立刻把它重启，新任务栏是一个新窗口：托盘图标全部消失，
+/// Win10 的长条（`Shell_TrayWnd` 的子窗口）还会被系统连带销毁。不补这一步，
+/// 程序的界面就再也不回来，而进程仍占着单实例互斥体 —— 用户双击也没反应。
+fn check_taskbar_restart() {
+    use std::sync::atomic::{AtomicIsize, AtomicU32};
+    static LAST_TB: AtomicIsize = AtomicIsize::new(0);
+    // 托盘图标还没补上（新任务栏刚起来时不接受 NIM_ADD，要隔一秒再试）
+    static TRAY_PENDING: AtomicBool = AtomicBool::new(false);
+    // 已经重试了几次
+    static TRAY_TRIES: AtomicU32 = AtomicU32::new(0);
+
+    // 任务栏正在重启的那几秒拿不到句柄，跳过，等下一次 tick
+    if let Some(tb) = crate::taskbar::taskbar() {
+        let cur = tb.0 as isize;
+        let prev = LAST_TB.swap(cur, Ordering::Relaxed);
+        // prev == 0 只是第一次记录，不是「换过了」
+        if prev != 0 && prev != cur {
+            log::info("任务栏换了窗口（资源管理器重启过）：补托盘图标、重挂长条");
+            TRAY_PENDING.store(true, Ordering::Relaxed);
+            TRAY_TRIES.store(0, Ordering::Relaxed);
+            crate::bar::revive();
+        }
+    }
+
+    // 托盘图标补登记：失败就下一 tick 再试，最多 10 次
+    if TRAY_PENDING.load(Ordering::Relaxed) {
+        let tries = TRAY_TRIES.fetch_add(1, Ordering::Relaxed);
+        if tries >= 10 {
+            log::info("补托盘图标连续失败，放弃");
+            TRAY_PENDING.store(false, Ordering::Relaxed);
+            return;
+        }
+        let done = match app().tray.lock().unwrap().as_ref() {
+            Some(t) => t.reinstall(),
+            // 本来就没装上托盘图标（启动时就失败了），没什么可补的
+            None => true,
+        };
+        if done {
+            TRAY_PENDING.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 /// 建一个隐藏窗口，作为托盘和全局消息的宿主
-fn create_host_window() -> Result<HWND, String> {
-    unsafe {
+fn create_host_window() -> Result<HWND, String> {    unsafe {
         let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         let cls = crate::util::wide(CLASS_NAME);
         let wc = WNDCLASSW {

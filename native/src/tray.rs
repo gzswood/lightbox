@@ -95,6 +95,24 @@ impl Tray {
         }
         Ok(Tray { nid, owned })
     }
+
+    /// 资源管理器重启后，托盘图标会随旧任务栏一起消失 —— 重新登记一遍。
+    ///
+    /// 图标本身（HICON）还是原来那个，`nid` 里的窗口句柄和回调消息也没变，
+    /// 直接 `NIM_ADD` 即可。新任务栏刚起来的那一两秒还没准备好接图标，
+    /// 这时会失败，调用方隔一秒重试即可。
+    pub fn reinstall(&self) -> bool {
+        unsafe {
+            if !Shell_NotifyIconW(NIM_ADD, &self.nid).as_bool() {
+                return false;
+            }
+            let mut nid = self.nid;
+            nid.Anonymous.uVersion = 4;
+            let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            crate::log::info("资源管理器重启：托盘图标已补回");
+            true
+        }
+    }
 }
 
 impl Drop for Tray {

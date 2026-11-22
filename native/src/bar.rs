@@ -12,7 +12,7 @@
 //! 整条是**一个**胶囊，嵌在任务栏里。点哪一段就弹出哪个盒子。
 //! 新建收纳盒走右键菜单（长条上不再留「+」）。
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -33,7 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, RegisterClassW,
     SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, WindowFromPoint,
-    GA_ROOT, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
+    GA_ROOT, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST,
+    IDC_ARROW,
     IDC_HAND, MA_NOACTIVATE, SC_MINIMIZE, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE,
     SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_CONTEXTMENU, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
@@ -625,7 +626,14 @@ fn watchdog(hwnd: HWND) {
         // Win10 的长条是任务栏的**子窗口**，z-order 由任务栏管、也压不到任务栏之上，
         // 「被任务栏盖住」这条判据只在 Win11 的顶层贴条上成立。
         let win11 = crate::taskbar::is_win11();
-        let lost = !is_topmost(hwnd) || covered_by_desktop(hwnd) || (win11 && covered_by_taskbar(hwnd));
+        // Win10 的长条是任务栏的**子窗口**，层级由任务栏排，它本来就不是置顶窗口。
+        // 把「不是置顶」当成「被盖住」会让看门狗每 200ms 空抬一次 —— 既白花 CPU，
+        // 又是每秒五次对着任务栏子窗口改 z-order（外壳 XAML 那边容易受影响）。
+        let lost = if win11 {
+            !is_topmost(hwnd) || covered_by_desktop(hwnd) || covered_by_taskbar(hwnd)
+        } else {
+            covered_by_desktop(hwnd)
+        };
         if lost {
             let first = {
                 let mut s = state().lock().unwrap();
@@ -752,9 +760,80 @@ pub fn init() -> Result<(), String> {
     }
 }
 
+/// 长条窗口还活着吗
+fn window_alive() -> bool {
+    match state().lock().unwrap().hwnd {
+        Some(h) => unsafe { IsWindow(Some(h)).as_bool() },
+        None => false,
+    }
+}
+
+/// 把长条从「没了」的状态救回来。
+///
+/// 资源管理器崩溃后 Windows 会立刻重启它，新的任务栏是一个**新窗口**：
+/// Win10 上长条是 `Shell_TrayWnd` 的子窗口、Win11 上长条被任务栏 own，
+/// 这两种关系都会在任务栏消失时把长条一起带走 —— 窗口被系统销毁，
+/// 进程却还在（只剩托盘宿主窗口空转），用户看到的就是「软件突然不见了，
+/// 双击也起不来」（单实例互斥体被这个空壳进程占着）。
+pub fn revive() {
+    if window_alive() {
+        // 窗口还在：重排一次就会重新 pin 到新任务栏上、摆好位置并重画
+        layout_and_paint();
+        return;
+    }
+    rebuild();
+}
+
+/// 重建时别死循环：连续失败 5 次就放弃，免得每秒刷一条日志
+fn rebuild_with_backoff() {
+    static FAILS: AtomicU32 = AtomicU32::new(0);
+    if FAILS.load(Ordering::Relaxed) >= 5 {
+        // 真建不出来了就别硬撑：留在后台空转只会占着单实例互斥体，
+        // 用户双击 exe 也没反应。主动退出，至少能重新启动。
+        log::info("长条连续重建失败，退出程序（用户可重新启动）");
+        crate::app::quit();
+        return;
+    }
+    rebuild();
+    if window_alive() {
+        FAILS.store(0, Ordering::Relaxed);
+    } else {
+        FAILS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 长条窗口已被销毁：把状态清干净，重建一个并挂回任务栏
+fn rebuild() {
+    log::info("长条窗口已消失（多半是资源管理器重启过），重新创建");
+    let keep = {
+        let mut s = state().lock().unwrap();
+        s.hwnd = None;
+        // 旧的拖放目标是野句柄，直接丢掉；init() 会重新登记
+        s.drop_target = None;
+        s.hover = None;
+        s.pressed = false;
+        s.drag_moved = false;
+        // 重建后要重新显示一次，否则 SetWindowPos 不带 SWP_SHOWWINDOW，窗口是隐的
+        s.shown_once = false;
+        s.was_lost = false;
+        s.pin_detached = false;
+        s.layout_sig.clear();
+        s.keep
+    };
+    if let Err(e) = init() {
+        log::info(&format!("重建长条窗口失败：{e}"));
+        return;
+    }
+    layout_and_paint();
+    // 用户点过「隐藏主界面」的，重建后也别自己冒出来
+    if !keep {
+        hide();
+    }
+    log::info("长条窗口已重建并挂回任务栏");
+}
+
 /// 屏幕坐标落在哪个分段上（拖放用）
-pub fn box_id_at_screen(sx: i32, sy: i32) -> Option<String> {
-    let (origin, segs) = {
+pub fn box_id_at_screen(sx: i32, sy: i32) -> Option<String> {    let (origin, segs) = {
         let s = state().lock().unwrap();
         (s.origin, s.segs.clone())
     };
@@ -1578,6 +1657,12 @@ pub fn hide() {
 
 /// 每秒滴答：显示器布局或任务栏变了就重新排一次
 pub fn on_tick() {
+    // 长条窗口被系统销毁了就重建 —— 资源管理器重启会把它一起带走，
+    // 这也兜住了「句柄数值被复用、看门狗看不出来」的情况。
+    if !window_alive() {
+        rebuild_with_backoff();
+        return;
+    }
     let mut sig = geom::monitors()
         .iter()
         .map(|m| {
