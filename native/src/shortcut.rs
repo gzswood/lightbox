@@ -15,6 +15,7 @@
 //! 把文件本身交给 ShellExecute。
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use windows::core::{BOOL, Interface};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE, WPARAM};
@@ -45,6 +46,56 @@ pub struct Shortcut {
     pub args: String,
     /// 工作目录（.lnk 自己记的）
     pub workdir: Option<String>,
+}
+
+/// 启动耗时探针：只在「打印诊断信息」打开时落一行日志。
+///
+/// 用户反馈「点某些程序时鼠标会卡一下」，要分清是**我们**在 UI 线程里
+/// 被 `CreateProcess` / `ShellExecute` 同步阻塞，还是目标程序自己的启动
+/// 行为（UAC 安全桌面、SmartScreen 查询、切换显示模式）。不埋点只能猜。
+///
+/// 开关关着时 `mark` 直接返回，不留任何开销；Drop 里统一输出，
+/// 所以函数里的每条 return 分支都能覆盖到。
+struct Probe {
+    what: String,
+    t0: Instant,
+    marks: Vec<(&'static str, u128)>,
+}
+
+impl Probe {
+    fn new(what: &str) -> Self {
+        Self {
+            what: what.to_string(),
+            t0: Instant::now(),
+            marks: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if !crate::log::enabled() {
+            return;
+        }
+        self.marks.push((name, self.t0.elapsed().as_millis()));
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if self.marks.is_empty() {
+            return;
+        }
+        let parts: Vec<String> = self
+            .marks
+            .iter()
+            .map(|(n, ms)| format!("{n}={ms}ms"))
+            .collect();
+        crate::log::info(&format!(
+            "启动耗时「{}」总 {}ms｜{}",
+            self.what,
+            self.t0.elapsed().as_millis(),
+            parts.join(" ")
+        ));
+    }
 }
 
 /// 解析 .lnk。失败返回 None（调用方退回直接丢给 shell）。
@@ -262,14 +313,26 @@ fn is_elevation_required(e: &windows::core::Error) -> bool {
 /// 启动一个快捷方式（.lnk）或任意可执行 / 文档。
 ///
 /// 返回 Err 时带具体原因，调用方直接给用户看。
-pub fn open(path: &str) -> Result<(), String> {    let p = Path::new(path);
+pub fn open(path: &str) -> Result<(), String> {
+    // 日志里只留文件名：整条路径太长，也可能带用户名
+    let label = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let mut probe = Probe::new(&label);
+
+    let p = Path::new(path);
     if !p.exists() {
+        probe.mark("exists-不存在");
         return Err("文件已不存在".into());
     }
+    probe.mark("exists");
 
     if let Some(sc) = resolve_lnk(p) {
+        probe.mark("解析lnk");
         let target = PathBuf::from(&sc.target);
         if target.exists() {
+            probe.mark("目标存在");
             // 工作目录：优先用 .lnk 自己记的；没记就用目标程序所在目录。
             // 这一条就是「某些软件从收纳盒里打不开」的关键之一。
             let workdir = sc
@@ -282,6 +345,7 @@ pub fn open(path: &str) -> Result<(), String> {    let p = Path::new(path);
                         .map(|d| d.to_string_lossy().to_string())
                         .filter(|d| Path::new(d).is_dir())
                 });
+            probe.mark("工作目录");
 
             let is_exe = target
                 .extension()
@@ -293,7 +357,9 @@ pub fn open(path: &str) -> Result<(), String> {    let p = Path::new(path);
                 .unwrap_or(false);
 
             if is_exe {
-                match unsafe { create_process(&sc.target, &sc.args, workdir.as_deref()) } {
+                let r = unsafe { create_process(&sc.target, &sc.args, workdir.as_deref()) };
+                probe.mark("CreateProcess");
+                match r {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         // 需要管理员权限：CreateProcess 拉不动，交给 shell 去弹 UAC。
@@ -302,55 +368,71 @@ pub fn open(path: &str) -> Result<(), String> {    let p = Path::new(path);
                         if is_elevation_required(&e)
                             && unsafe { shell_exec(path, "", None) }
                         {
+                            probe.mark("shell-提权");
                             return Ok(());
                         }
+                        probe.mark("shell-提权失败");
                         // 其它拉不起来的情况（缺 DLL 之类）：先试 shell 按文件关联兜底。
                         if unsafe { shell_exec(&sc.target, &sc.args, workdir.as_deref()) } {
+                            probe.mark("shell-按关联");
                             return Ok(());
                         }
+                        probe.mark("shell-按关联失败");
                         // 再退一步：把 .lnk 整体交给 shell，和资源管理器双击完全一致。
                         if unsafe { shell_exec(path, "", None) } {
+                            probe.mark("shell-整条lnk");
                             return Ok(());
                         }
+                        probe.mark("shell-整条lnk失败");
                         return Err(format!("启动失败：{e}"));
                     }
                 }
-            } else if unsafe { shell_exec(&sc.target, &sc.args, workdir.as_deref()) } {
-                return Ok(());
+            } else {
+                let ok = unsafe { shell_exec(&sc.target, &sc.args, workdir.as_deref()) };
+                probe.mark("shell-文档");
+                if ok {
+                    return Ok(());
+                }
             }
         } else {
+            probe.mark("目标不存在");
             // 目标程序已经不在了（卸载 / 换盘 / UWP 应用的占位目标）。
             // 但 .lnk 本身还在，交给 shell 往往照样能启动（UWP 就是这种情况：
             // 目标字段是空的或指向一个虚拟路径，shell 走 AppUserModelID 启动）。
             if unsafe { shell_exec(path, "", None) } {
+                probe.mark("shell-UWP");
                 return Ok(());
             }
+            probe.mark("shell-UWP失败");
             return Err(format!("快捷方式指向的程序已不存在：{}", sc.target));
         }
         // 解析出来但直接拉起失败（例如目标需要 shell 处理），
         // 退回把 .lnk 整体交给 shell，和资源管理器双击完全一致。
+    } else {
+        probe.mark("解析lnk-退回");
     }
 
-    unsafe {
-        let r = ShellExecuteW(
+    let r = unsafe {
+        ShellExecuteW(
             None,
             &windows::core::HSTRING::from("open"),
             &windows::core::HSTRING::from(path),
             None,
             None,
             SW_SHOWNORMAL,
-        );
-        if r.0 as isize > 32 {
-            Ok(())
-        } else {
-            Err(match r.0 as isize {
-                2 => "找不到文件或关联程序".to_string(),
-                3 => "找不到路径".to_string(),
-                5 => "拒绝访问".to_string(),
-                31 => "没有关联的打开方式".to_string(),
-                _ => format!("启动失败（ShellExecute 返回 {}）", r.0 as isize),
-            })
-        }
+        )
+    };
+    probe.mark("ShellExecuteW");
+    if r.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(match r.0 as isize {
+            2 => "找不到文件或关联程序".to_string(),
+            3 => "找不到路径".to_string(),
+            5 => "拒绝访问".to_string(),
+            31 => "没有关联的打开方式".to_string(),
+            _ => format!("启动失败（ShellExecute 返回 {}）", r.0 as isize),
+        })
     }
 }
 

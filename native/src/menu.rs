@@ -606,16 +606,17 @@ pub fn items_menu(box_id: &str, items: &[Item]) {
     let picked = popup(&menu);
     match picked {
         Some(Act::OpenItems) => {
-            let mut ok = 0;
-            for it in items {
-                match crate::shortcut::open(&it.path) {
-                    Ok(()) => ok += 1,
-                    Err(e) => log::info(&format!("启动失败：{}（{e}）", it.path)),
+            // 和面板单击同一套：启动可能被 shell 层同步阻塞（UWP / 提权 / SmartScreen），
+            // 全部丢到后台线程，UI 线程立刻收起面板返回。
+            let paths: Vec<String> = items.iter().map(|it| it.path.clone()).collect();
+            crate::panel::close();
+            std::thread::spawn(move || {
+                for p in paths {
+                    if let Err(e) = crate::shortcut::open(&p) {
+                        log::info(&format!("启动失败：{p}（{e}）"));
+                    }
                 }
-            }
-            if ok > 0 {
-                crate::panel::close();
-            }
+            });
         }
         Some(Act::RevealItem) => {
             // 连点几下会开出好几个资源管理器窗口，1.2 秒内只认第一次

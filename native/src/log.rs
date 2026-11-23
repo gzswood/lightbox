@@ -97,6 +97,14 @@ fn stamp() -> String {
     }
 }
 
+/// 日志开关当前是否打开。
+///
+/// 给「埋点前先判断」的调用方用：关着的时候连时间戳和字符串拼接都不做，
+/// 保证诊断埋点对正常使用零开销。
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// 写一行日志（开关关着时什么都不做）
 pub fn info(msg: &str) {
     if !ENABLED.load(Ordering::Relaxed) {

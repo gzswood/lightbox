@@ -1153,16 +1153,32 @@ fn launch_item(idx: usize) {
     let Some(it) = s.items.get(idx) else { return };
     let path = it.path.clone();
     drop(s);
-    // 走 shortcut 模块：.lnk 会先解析出目标程序和工作目录再启动，
-    // 否则依赖 cwd / 环境变量的程序（Electron 一类）会秒退，表现为「点了没反应」。
-    match crate::shortcut::open(&path) {
-        Ok(()) => {
-            // 启动成功就收起面板：启动器类工具的常规交互，
-            // 也免得启动的程序抢了前台后面板还杵在那儿。
-            close();
-        }
-        Err(e) => log::info(&format!("启动失败：{path}（{e}）")),
+
+    // 文件本身都不在了就先收手，面板留着，让用户能改/删这个图标
+    if !std::path::Path::new(&path).exists() {
+        log::info(&format!("启动失败：{path}（文件已不存在）"));
+        return;
     }
+
+    // 先收起面板，启动本身交给后台线程。
+    //
+    // 为什么不在 UI 线程里直接启动：走 shortcut 模块时，普通 .lnk（解析出
+    // exe）是 CreateProcess，很快；但 **UWP / Store 应用**、`.url`、
+    // 指向已卸载程序的 .lnk、以及需要提权的程序会落到 ShellExecuteW ——
+    // 它要过 shell 的 AppInfo 服务、SmartScreen 信誉查询，必要时还要弹 UAC，
+    // 同步阻塞几百毫秒到一秒多。这个阻塞压在 UI 线程上，表现就是
+    // 「点了以后鼠标卡死一下、界面整个不响应」，因为主线程的消息循环停了。
+    //
+    // 面板本身就是分层窗口 + topmost，主线程一停，重绘、看门狗、光标都跟着停，
+    // 用户的体感比普通窗口卡一下更明显。挪到后台线程后，UI 线程立刻返回。
+    //
+    // 失败在原来也只是写日志（不弹窗），异步化不损失任何提示。
+    close();
+
+    std::thread::spawn(move || match crate::shortcut::open(&path) {
+        Ok(()) => {}
+        Err(e) => log::info(&format!("启动失败：{path}（{e}）")),
+    });
 }
 
 /// 把面板里的图标往外拖（OLE 拖放）。拖到桌面上放手，桌面会把它移回去。
