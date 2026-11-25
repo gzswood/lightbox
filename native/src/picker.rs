@@ -38,6 +38,8 @@ const CLASS_NAME: &str = "LightBoxPicker";
 const MAG_CLASS: &str = "LightBoxMagnifier";
 /// 光标闪烁的计时器编号
 const CARET_TIMER: usize = 1;
+/// 放大镜跟随鼠标的计时器编号
+const MAG_TIMER: usize = 2;
 
 /// 常用色（10 列 × 2 行）
 const PRESETS: [&str; 20] = [
@@ -108,6 +110,8 @@ struct Picker {
     blink: bool,
     /// 正在吸管取色
     picking: bool,
+    /// 放大镜上一次落点（没挪动就跳过重绘，省得 15ms 一次空转）
+    mag_pos: (i32, i32),
     /// 按下了吸管按钮（松手时还在按钮上才启动取色）
     armed: bool,
 }
@@ -133,6 +137,7 @@ fn state() -> &'static Mutex<Picker> {
             typed: false,
             blink: true,
             picking: false,
+            mag_pos: (i32::MIN, i32::MIN),
             armed: false,
         })
     })
@@ -488,29 +493,28 @@ fn create_window(height: i32, scale: f32, owner: HWND) -> Result<HWND, String> {
     }
 }
 
+/// 圆角：跟「圆角窗口」开关走。
+///
+/// 两种系统都靠 `SetWindowRgn` 硬裁（原因见 `settings::round_corners`：
+/// Win11 的 DWM 圆角只圆边框，客户区还是方的，四角会露白直角）。
 fn round_corners(hwnd: HWND, w: i32, h: i32) {
-    let cfg = app().cfg.lock().unwrap().clone();
+    let radius = app().cfg.lock().unwrap().panel_radius;
     unsafe {
-        if crate::taskbar::is_win11() {
-            let pref = if cfg.panel_radius {
-                windows::Win32::Graphics::Dwm::DWMWCP_ROUND
-            } else {
-                windows::Win32::Graphics::Dwm::DWMWCP_DONOTROUND
-            };
-            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-                hwnd,
-                windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
-                &pref as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-        } else {
-            // 先把上一次的区域清掉，再按开关决定要不要圆角
-            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
-            if cfg.panel_radius {
-                let region =
-                    windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, 20, 20);
-                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true);
-            }
+        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+            &windows::Win32::Graphics::Dwm::DWMWCP_DONOTROUND as *const _
+                as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // 先把上一次的区域清掉，再按开关决定要不要圆角
+        let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
+        if radius {
+            // 半径和自绘那圈描边必须一致（见 `settings::corner_radius`）
+            let r = (8.0 * display_scale()).round().max(4.0) as i32;
+            let region =
+                windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2);
+            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true);
         }
     }
 }
@@ -543,6 +547,10 @@ fn paint(hwnd: HWND) {
             None => hdc,
         };
         let mut g = Gfx::new(dc);
+        // 色卡 / 按钮的圆角走像素直写通道画抗锯齿（没有离屏位图就自动退回 GDI）
+        if let Some(b) = &buf {
+            g.attach(b.surface());
+        }
         let r = |v: f32| (v * scale).round() as i32;
         let w = r(DW);
         let pad = r(DPAD);
@@ -555,6 +563,19 @@ fn paint(hwnd: HWND) {
         let edge = theme::mix(bg, (0, 0, 0), 0.42);
 
         g.fill_rect(0, 0, cw, ch, bg);
+        // 窗口边缘描边：和设置页同一套 —— 圆角裁区是 1 像素台阶，
+        // 靠这圈抗锯齿描边把它压住，看起来才是平滑的边。
+        if app().cfg.lock().unwrap().panel_radius {
+            g.stroke_round_aa(
+                0,
+                0,
+                cw,
+                ch,
+                r(8.0),
+                theme::mix(bg, fg, 0.32),
+                1,
+            );
+        }
         g.font(r(13.0), true);
         g.text(
             pad,
@@ -571,7 +592,7 @@ fn paint(hwnd: HWND) {
             .map(|(_, r)| *r)
             .unwrap_or_default();
         if hover == Some(Hit::Close) {
-            g.fill_round(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, r(6.0), theme::mix(bg, fg, 0.14));
+            g.fill_round_aa(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, r(6.0), theme::mix(bg, fg, 0.14));
         }
         g.font(r(13.0), false);
         g.text(cr.left, cr.top, cr.right - cr.left, cr.bottom - cr.top, "✕", fg, Align::Center);
@@ -585,10 +606,10 @@ fn paint(hwnd: HWND) {
             let rgb = crate::util::parse_hex(c).unwrap_or((0, 0, 0));
             let cw = rect.right - rect.left;
             let ch = rect.bottom - rect.top;
-            g.fill_round(rect.left, rect.top, cw, ch, r(5.0), rgb);
-            g.stroke_round(rect.left, rect.top, cw, ch, r(5.0), edge, 1);
+            g.fill_round_aa(rect.left, rect.top, cw, ch, r(5.0), rgb);
+            g.stroke_round_aa(rect.left, rect.top, cw, ch, r(5.0), edge, 1);
             if hover == Some(Hit::Preset(i)) {
-                g.stroke_round(
+                g.stroke_round_aa(
                     rect.left - r(2.0),
                     rect.top - r(2.0),
                     cw + r(4.0),
@@ -613,12 +634,12 @@ fn paint(hwnd: HWND) {
             let px = sv_pixels(h, sv_w, sv_h);
             blit_bgra(dc, sv.left, sv.top, sv_w, sv_h, &px);
             // 色卡描边：SV 方块和灰色底之间要有一条分界
-            g.stroke_round(sv.left, sv.top, sv_w, sv_h, 0, edge, 1);
+            g.stroke_round_aa(sv.left, sv.top, sv_w, sv_h, 0, edge, 1);
             // 光标圈
             let cx = sv.left + (sv_w as f32 * s_).round() as i32;
             let cy = sv.bottom - 1 - (sv_h as f32 * v).round() as i32;
-            g.stroke_round(cx - r(5.0), cy - r(5.0), r(10.0), r(10.0), r(5.0), (255, 255, 255), 2);
-            g.stroke_round(cx - r(6.0), cy - r(6.0), r(12.0), r(12.0), r(6.0), (0, 0, 0), 1);
+            g.stroke_round_aa(cx - r(5.0), cy - r(5.0), r(10.0), r(10.0), r(5.0), (255, 255, 255), 2);
+            g.stroke_round_aa(cx - r(6.0), cy - r(6.0), r(12.0), r(12.0), r(6.0), (0, 0, 0), 1);
         }
 
         // 色相条
@@ -631,19 +652,19 @@ fn paint(hwnd: HWND) {
         if hue_w > 0 {
             let px = hue_pixels(hue_w, hue.bottom - hue.top);
             blit_bgra(dc, hue.left, hue.top, hue_w, hue.bottom - hue.top, &px);
-            g.stroke_round(hue.left, hue.top, hue_w, hue.bottom - hue.top, 0, edge, 1);
+            g.stroke_round_aa(hue.left, hue.top, hue_w, hue.bottom - hue.top, 0, edge, 1);
             let (h, _, _) = theme::rgb_to_hsv(color);
             let cx = hue.left + ((hue_w as f32 - 1.0) * h / 360.0).round() as i32;
-            g.stroke_round(cx - r(4.0), hue.top - r(2.0), r(8.0), hue.bottom - hue.top + r(4.0), r(4.0), (255, 255, 255), 2);
-            g.stroke_round(cx - r(5.0), hue.top - r(3.0), r(10.0), hue.bottom - hue.top + r(6.0), r(5.0), (0, 0, 0), 1);
+            g.stroke_round_aa(cx - r(4.0), hue.top - r(2.0), r(8.0), hue.bottom - hue.top + r(4.0), r(4.0), (255, 255, 255), 2);
+            g.stroke_round_aa(cx - r(5.0), hue.top - r(3.0), r(10.0), hue.bottom - hue.top + r(6.0), r(5.0), (0, 0, 0), 1);
         }
 
         // 底部：当前色 + hex + 吸管 + 完成
         let hex_y = hue.bottom + r(10.0);
         let hex_x = pad + r(32.0);
         let hex_w = w - pad - r(96.0) - hex_x;
-        g.fill_round(hex_x, hex_y, hex_w, r(DHEX), r(6.0), sunken);
-        g.stroke_round(hex_x, hex_y, hex_w, r(DHEX), r(6.0), theme::mix(bg, (0, 0, 0), 0.18), 1);
+        g.fill_round_aa(hex_x, hex_y, hex_w, r(DHEX), r(6.0), sunken);
+        g.stroke_round_aa(hex_x, hex_y, hex_w, r(DHEX), r(6.0), theme::mix(bg, (0, 0, 0), 0.18), 1);
         g.font(r(13.0), false);
         let text_x = hex_x + r(8.0);
         g.text(text_x, hex_y, hex_w - r(16.0), r(DHEX), &hex, fg, Align::Left);
@@ -657,8 +678,8 @@ fn paint(hwnd: HWND) {
             g.fill_rect(cx, hex_y + r(5.0), 2, r(DHEX) - r(10.0), fg);
         }
         // 当前颜色的小方块（同样带一条深边，白 / 浅色也看得见）
-        g.fill_round(pad, hex_y + r(2.0), r(24.0), r(24.0), r(4.0), color);
-        g.stroke_round(pad, hex_y + r(2.0), r(24.0), r(24.0), r(4.0), edge, 1);
+        g.fill_round_aa(pad, hex_y + r(2.0), r(24.0), r(24.0), r(4.0), color);
+        g.stroke_round_aa(pad, hex_y + r(2.0), r(24.0), r(24.0), r(4.0), edge, 1);
 
         let pip = hits
             .iter()
@@ -667,7 +688,7 @@ fn paint(hwnd: HWND) {
             .unwrap_or_default();
         let pip_hot = hover == Some(Hit::Pipette);
         if pip_hot {
-            g.fill_round(
+            g.fill_round_aa(
                 pip.left,
                 pip.top,
                 pip.right - pip.left,
@@ -691,7 +712,7 @@ fn paint(hwnd: HWND) {
             .map(|(_, r)| *r)
             .unwrap_or_default();
         if hover == Some(Hit::Done) {
-            g.fill_round(done.left, done.top, done.right - done.left, done.bottom - done.top, r(6.0), accent);
+            g.fill_round_aa(done.left, done.top, done.right - done.left, done.bottom - done.top, r(6.0), accent);
         }
         g.font(r(12.0), false);
         // 悬停时按钮是蓝底，字得跟着蓝底走（不然深色字压在深蓝上看不清）
@@ -756,7 +777,7 @@ fn draw_pipette(g: &Gfx, cx: f32, cy: f32, s: f32, fg: (u8, u8, u8)) {
         for d in [d0, d1] {
             let (px, py) = xy(d, 0.0);
             let rr = f(hw).round() as i32;
-            g.fill_round(px - rr, py - rr, rr * 2, rr * 2, rr, fg);
+            g.fill_round_aa(px - rr, py - rr, rr * 2, rr * 2, rr, fg);
         }
     };
 
@@ -773,7 +794,7 @@ fn draw_pipette(g: &Gfx, cx: f32, cy: f32, s: f32, fg: (u8, u8, u8)) {
     let (qx, qy) = xy(18.4, 0.0);
     let (dx, dy) = (qx as f32 + ux * f(1.7), qy as f32 + uy * f(1.7));
     let rr = f(1.4).round() as i32;
-    g.fill_round(dx as i32 - rr, dy as i32 - rr, rr * 2, rr * 2, rr, fg);
+    g.fill_round_aa(dx as i32 - rr, dy as i32 - rr, rr * 2, rr * 2, rr, fg);
 }
 
 /// 吸管位图：4× 超采样后按块平均，得到不透明 BGRA（已合成到底色上）
@@ -1287,6 +1308,8 @@ fn begin_pick() {
         let mut s = state().lock().unwrap();
         s.mag = Some(mag);
         s.picking = true;
+        // 新的一轮：清掉上次的落点，第一次 update 必定摆一次位置
+        s.mag_pos = (i32::MIN, i32::MIN);
     }
     unsafe {
         let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(pick_hook), None, 0).ok();
@@ -1343,9 +1366,11 @@ unsafe extern "system" fn pick_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
     if code == HC_ACTION as i32 {
         match wp.0 as u32 {
             WM_MOUSEMOVE => {
-                // 十字光标：钩子跑在目标窗口处理消息之前，这时设才留得住
+                // 十字光标：钩子跑在目标窗口处理消息之前，这时设才留得住。
+                // 放大镜的**位置**不在这里更新 —— 这个回调必须尽快返回，
+                // 超时一次系统就会摘掉整个钩子（连点选都失效）；移动交给
+                // 放大镜自己的 15ms 计时器。
                 let _ = SetCursor(LoadCursorW(None, IDC_CROSS).ok());
-                update_magnifier();
             }
             WM_LBUTTONUP => {
                 let mut pt = POINT::default();
@@ -1361,24 +1386,35 @@ unsafe extern "system" fn pick_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
 }
 
 /// 放大镜跟着鼠标走，并刷新显示
+///
+/// 由放大镜自己的 15ms 计时器驱动（`MAG_TIMER`）。光标没挪动就直接返回 ——
+/// 不然吸管待机时每秒 60 多次取屏重绘，白烧 CPU。
 fn update_magnifier() {
-    let mag = state().lock().unwrap().mag;
-    let Some(m) = mag else { return };
-    let mut pt = POINT::default();
-    unsafe {
-        let _ = GetCursorPos(&mut pt);
-    }
-    let size = (MAG_SAMPLE * MAG_ZOOM + 12) as i32;
-    // 放在光标的右下；贴到屏幕边就翻到另一边
-    let mut x = pt.x + 24;
-    let mut y = pt.y + 24;
-    let virt = crate::geom::virtual_rect();
-    if x + size > virt.right {
-        x = pt.x - size - 24;
-    }
-    if y + size > virt.bottom {
-        y = pt.y - size - 24;
-    }
+    let mag = {
+        let mut s = state().lock().unwrap();
+        let Some(m) = s.mag else { return };
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let size = (MAG_SAMPLE * MAG_ZOOM + 12) as i32;
+        // 放在光标的右下；贴到屏幕边就翻到另一边
+        let mut x = pt.x + 24;
+        let mut y = pt.y + 24;
+        let virt = crate::geom::virtual_rect();
+        if x + size > virt.right {
+            x = pt.x - size - 24;
+        }
+        if y + size > virt.bottom {
+            y = pt.y - size - 24;
+        }
+        if s.mag_pos == (x, y) {
+            return;
+        }
+        s.mag_pos = (x, y);
+        (m, x, y, size)
+    };
+    let (m, x, y, size) = mag;
     unsafe {
         let _ = SetWindowPos(m, None, x, y, size, size, SWP_NOACTIVATE);
         let _ = InvalidateRect(Some(m), None, false);
@@ -1400,7 +1436,7 @@ fn create_magnifier() -> Result<HWND, String> {
         let size = (MAG_SAMPLE * MAG_ZOOM + 12) as i32;
         // WS_EX_TRANSPARENT：鼠标能穿过去，吸到的是放大镜**底下**那个像素
         // WS_EX_NOACTIVATE：不吃焦点，不打断用户正在做的事
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
             windows::core::PCWSTR(cls.as_ptr()),
             windows::core::PCWSTR::null(),
@@ -1414,13 +1450,29 @@ fn create_magnifier() -> Result<HWND, String> {
             Some(hinstance.into()),
             None,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // 跟随鼠标靠**自己的计时器**，不靠钩子转发的移动事件：
+        // 鼠标钩子的回调有超时限制（`LowLevelHooksTimeout`，默认几百毫秒），
+        // 一旦回调里做了取屏 + 重绘这种重活、超时一次，系统会**悄悄摘掉钩子**，
+        // 表现就是「放大镜钉在原地不动了」（Win10 上遇到过，Win11 因为更快没露）。
+        // 钩子现在只负责按键，移动交给这个 15ms 的计时器。
+        let _ = SetTimer(Some(hwnd), MAG_TIMER, 15, None);
+        Ok(hwnd)
     }
 }
 
 unsafe extern "system" fn mag_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1),
+        WM_TIMER => {
+            // 15ms 挪一次：放大镜跟着光标，顺带把底下那圈像素重取一遍
+            update_magnifier();
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), MAG_TIMER);
+            LRESULT(0)
+        }
         WM_PAINT => {
             paint_magnifier(hwnd);
             LRESULT(0)
@@ -1541,10 +1593,10 @@ fn paint_magnifier(hwnd: HWND) {
             // 中心格描边（白框 + 黑框，看得清选中的是哪一格）
             let cx = 6 + (n / 2) * zoom;
             let cy = 6 + (n / 2) * zoom;
-            g.stroke_round(cx - 1, cy - 1, zoom + 2, zoom + 2, 0, (255, 255, 255), 2);
-            g.stroke_round(cx - 2, cy - 2, zoom + 4, zoom + 4, 0, (0, 0, 0), 1);
+            g.stroke_round_aa(cx - 1, cy - 1, zoom + 2, zoom + 2, 0, (255, 255, 255), 2);
+            g.stroke_round_aa(cx - 2, cy - 2, zoom + 4, zoom + 4, 0, (0, 0, 0), 1);
         }
-        g.stroke_round(0, 0, size, size, 6, (0x60, 0x66, 0x72), 1);
+        g.stroke_round_aa(0, 0, size, size, 6, (0x60, 0x66, 0x72), 1);
         let _ = EndPaint(hwnd, &ps);
     }
 }

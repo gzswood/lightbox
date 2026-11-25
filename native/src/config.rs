@@ -87,10 +87,13 @@ pub struct Config {
     /// 长条状态（位置 / 是否嵌任务栏 / 滚动偏移）
     #[serde(default)]
     pub bar: BarConfig,
-    /// 弹出面板背景的**透明度百分比**（0 = 完全不透明，50 = 最透）。数字越大越透明。
+    /// 弹出面板背景的**透明度百分比**（0 = 完全不透明，50 = 最透）。
     ///
-    /// 旧字段名是 `panel_opacity`（0.35~1.0 的 alpha），这里用 alias 兼容老配置：
-    /// 老值 1.0 读进来就是 1%，视觉上仍然接近不透明，不会突然变透明。
+    /// **已固定为 0**：设置页不再提供这一项（半透明实际用下来不实用 —— 桌面透上来
+    /// 之后浅色底糊成一片）。字段保留只为兼容老 config.json，读到别的值会在
+    /// `load()` 里纠正回 0。
+    ///
+    /// 旧字段名是 `panel_opacity`（0.35~1.0 的 alpha），这里用 alias 兼容老配置。
     #[serde(default = "default_transparency", alias = "panel_opacity")]
     pub panel_transparency: f32,
     /// 收纳盒背景色（#RRGGBB）
@@ -115,12 +118,11 @@ pub struct Config {
     /// 从下一次切屏开始生效。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_ref: Option<LayoutRef>,
-    /// 弹出面板文字的字体名（系统已安装的字体 face name）。
-    /// 老配置没有这一项 → 默认「微软雅黑」。
+    /// 弹出面板文字的字体名。**已固定为微软雅黑**，设置页不再提供修改；
+    /// 字段保留只为兼容老 config.json（读到别的值会在 `load()` 里纠正回默认）。
     #[serde(default = "default_panel_font")]
     pub panel_font: String,
-    /// 弹出面板文字的基准字号（96 DPI 下的 px，默认 12 = 原来图标名写死的大小）。
-    /// 面板里其它文字按「原字号 / 12 × 这个值」等比缩放，标题/标签/提示的层级不变。
+    /// 弹出面板文字的基准字号（96 DPI 下的 px）。**已固定为 12**，同上。
     #[serde(default = "default_panel_font_size")]
     pub panel_font_size: f32,
     /// 打印诊断信息：把排障日志写进 `lightbox.log`。
@@ -131,9 +133,8 @@ pub struct Config {
     pub diagnostics: bool,
 }
 
-/// 弹窗字体设置的默认与取值范围。
-/// 默认用中文名「微软雅黑」：和设置页下拉框里看到的、用户认得的名字一致
-/// （GDI 的 CreateFontW / EnumFontFamiliesExW 对中文名和英文名都能识别）。
+/// 弹窗字体的固定值（设置页已不再提供修改）。
+/// 用中文名「微软雅黑」：和用户认得的名字一致，GDI 的 CreateFontW 也认。
 pub fn default_panel_font() -> String {
     "微软雅黑".into()
 }
@@ -367,6 +368,18 @@ pub fn load() -> Config {
                 if !keep.exists() {
                     let _ = fs::copy(&p, &keep);
                 }
+                save(&cfg);
+            }
+            // 弹窗字体已固定（微软雅黑 / 12px）：老配置里存过别的字体或字号，
+            // 直接纠正回固定值。不值得为这个涨 CONFIG_VERSION 触发整份迁移。
+            if cfg.panel_font != default_panel_font() || cfg.panel_font_size != FONT_SIZE_BASE {
+                cfg.panel_font = default_panel_font();
+                cfg.panel_font_size = FONT_SIZE_BASE;
+                save(&cfg);
+            }
+            // 面板透明度同理：已固定完全不透明，老配置里的 25% / 50% 一律纠正回来。
+            if cfg.panel_transparency != default_transparency() {
+                cfg.panel_transparency = default_transparency();
                 save(&cfg);
             }
             return cfg;

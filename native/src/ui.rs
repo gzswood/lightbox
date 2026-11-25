@@ -343,12 +343,85 @@ impl Gfx {
             y0 = y0.max(c0);
             y1 = y1.min(c1);
         }
+        // 只有四个角要算覆盖率：中间那条「十字」区域（横带 + 竖带）是满覆盖，
+        // 直接整块混上去。设置页一帧要画十几个圆角块，全算 SDF 会白花一倍时间。
+        let ri = rad.ceil() as i32;
+        let (ix0, ix1) = (x + ri, x + w - ri);
+        let (iy0, iy1) = (y + ri, y + h - ri);
         for py in y0..y1 {
+            let band_h = py >= iy0 && py < iy1;
             for px in x0..x1 {
+                if band_h || (px >= ix0 && px < ix1) {
+                    s.blend(px, py, c, 1.0);
+                    continue;
+                }
                 let d =
                     crate::render::sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, rad);
                 // 半像素过渡带：内部 1、外部 0，正好压在边缘上
                 let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                s.blend(px, py, c, cov);
+            }
+        }
+    }
+
+    /// 抗锯齿圆角描边：沿圆角矩形的**外缘**向内一圈 `t` 像素宽
+    ///
+    /// 和 `stroke_round` 的关系同上（GDI `RoundRect` 只有整数台阶）。
+    /// 窗口最外圈那条「防撞色描边」必须用这一版：它原来是一圈 1 像素的
+    /// 深灰台阶，正好压在 `SetWindowRgn` 的硬裁锯齿上，两重台阶叠起来就是
+    /// 用户说的「圆角颗粒感」。
+    pub fn stroke_round_aa(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        radius: i32,
+        c: (u8, u8, u8),
+        t: i32,
+    ) {
+        let Some(s) = self.surface else {
+            self.stroke_round(x, y, w, h, radius, c, t.max(1));
+            return;
+        };
+        if w <= 0 || h <= 0 || t <= 0 {
+            return;
+        }
+        let y = y + self.vp_y;
+        let hw = w as f32 * 0.5;
+        let hh = h as f32 * 0.5;
+        let cx = x as f32 + hw;
+        let cy = y as f32 + hh;
+        let rad = (radius as f32).clamp(0.0, hw.min(hh));
+        let t = t as f32;
+        s.flush();
+        let x0 = x.max(0);
+        let mut y0 = y.max(0);
+        let x1 = (x + w).min(s.w);
+        let mut y1 = (y + h).min(s.h);
+        if let Some((c0, c1)) = self.clip_y {
+            y0 = y0.max(c0);
+            y1 = y1.min(c1);
+        }
+        // 只扫贴着边界的一条窄带，内部整块跳过
+        let band = (t + 1.0).ceil() as i32;
+        let (bx0, bx1) = (x + band, x + w - band);
+        let (by0, by1) = (y + band, y + h - band);
+        for py in y0..y1 {
+            let edge_v = py < by0 || py >= by1;
+            for px in x0..x1 {
+                if !(edge_v || px < bx0 || px >= bx1) {
+                    continue;
+                }
+                let d =
+                    crate::render::sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, rad);
+                // 外缘 1、向内 `t` 像素处 0：两条边都做半像素过渡
+                let outer = (0.5 - d).clamp(0.0, 1.0);
+                let inner = (0.5 - (d + t)).clamp(0.0, 1.0);
+                let cov = outer - inner;
                 if cov <= 0.0 {
                     continue;
                 }
@@ -564,9 +637,9 @@ impl Gfx {
 
     /// 画一个颜色小块（圆角 + 细边，颜色浅的时候也要看得见轮廓）
     pub fn swatch(&self, x: i32, y: i32, w: i32, h: i32, c: (u8, u8, u8)) {
-        self.fill_round(x, y, w, h, 4, c);
+        self.fill_round_aa(x, y, w, h, 4, c);
         let edge = crate::theme::mix(c, (0, 0, 0), 0.25);
-        self.stroke_round(x, y, w, h, 4, edge, 1);
+        self.stroke_round_aa(x, y, w, h, 4, edge, 1);
     }
 }
 

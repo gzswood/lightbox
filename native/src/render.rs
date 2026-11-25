@@ -268,11 +268,19 @@ impl Canvas {
 
     /// 贴一张「已经是最终颜色」的文字位图（ClearType 直出）。
     ///
-    /// 两条规矩：
-    /// 1. 只写**被字压到**的像素（和底色一模一样的就是空白处），否则选中高亮、
+    /// 三条规矩：
+    /// 1. 只写**被字压到**的像素（和底色一样的就是空白处），否则选中高亮、
     ///    分隔线、圆角这些底下的东西会被文字位图整块盖掉；
-    /// 2. 只往**不透明**的底子上写 —— 半透明面板、毛玻璃、圆角边缘保持原样。
+    /// 2. 写进去的像素一律**不透明**（`alpha = 255`）。半透明面板上如果不这样，
+    ///    字的实心部分会跟着面板一起变淡，12px 小字当场糊成一团灰 ——
+    ///    用户报的「一开透明度字就糊了」就是这个；
+    /// 3. 完全透明的地方（圆角外面）不写，免得把字画到窗口外面去。
+    ///
+    /// ClearType 的极淡过渡（跟底色只差几级的那圈）也按空白处理：它们写上去会
+    /// 变成一个个近底色的小点，在半透明底上看着像字的周围起了毛边。
     pub fn blit_text_on(&mut self, x: i32, y: i32, t: &TextOn) {
+        /// 和底色差在这级以内就算空白（ClearType 边缘的抖动就在这个范围内）
+        const NEAR: i32 = 6;
         let (bb, bg, br) = (t.bg.2, t.bg.1, t.bg.0);
         for sy in 0..t.h {
             let dy = y + sy;
@@ -286,16 +294,18 @@ impl Canvas {
                 }
                 let s = ((sy * t.w + sx) * 4) as usize;
                 let (b, g, r) = (t.bgra[s], t.bgra[s + 1], t.bgra[s + 2]);
-                if b == bb && g == bg && r == br {
+                let near = |a: u8, c: u8| (a as i32 - c as i32).abs() <= NEAR;
+                if near(b, bb) && near(g, bg) && near(r, br) {
                     continue; // 空白处：底下的东西照旧
                 }
                 let o = ((dy * self.w + dx) * 4) as usize;
-                if self.px[o + 3] != 255 {
+                if self.px[o + 3] == 0 {
                     continue;
                 }
                 self.px[o] = b;
                 self.px[o + 1] = g;
                 self.px[o + 2] = r;
+                self.px[o + 3] = 255;
             }
         }
     }
@@ -357,9 +367,9 @@ fn gamma_lut() -> &'static [u8; 256] {
 const BAR_FONT_FAMILY: &str = "Microsoft YaHei";
 const BAR_FONT_WEIGHT: i32 = 600;
 
-/// 分层窗口文字的全局字体设置。设置页「外观 → 弹窗字体」应用后调 `set_font()`，
-/// 启动时从 config.json 载入。这里存一份全局值，是为了不让每个绘制点都去
-/// 取配置锁（文字渲染本来就在主线程热路径上）。
+/// 分层窗口文字的全局字体设置。字体已固定（微软雅黑 12px），
+/// 启动时由 `main` 写入一次，设置页「应用 / 确定」再写一次清缓存。
+/// 存一份全局值，是为了不让每个绘制点都去取配置锁（文字渲染在主线程热路径上）。
 #[derive(Clone)]
 pub struct FontCfg {
     pub family: String,

@@ -124,9 +124,9 @@ fn main() {
         cfg.bar.x,
         cfg.bar.y
     ));
-    // 弹窗字体：启动时先把 config.json 里的值灌进文字渲染器，
-    // 之后设置页「应用 / 确定」会再调一次并清缓存。
-    render::set_font(&cfg.panel_font, cfg.panel_font_size);
+    // 弹窗字体已固定（微软雅黑 12px），不再从 config.json 读用户选择；
+    // 这里初始化一次，设置页「应用 / 确定」也会再调（清文字缓存）。
+    render::set_font(&config::default_panel_font(), config::FONT_SIZE_BASE);
     *app().cfg.lock().unwrap() = cfg;
 
     if let Err(e) = bar::init() {

@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH, HDC, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -129,19 +129,9 @@ pub fn open(target: Target, name: &str, at: RECT, scale: f32, owner: HWND) {
     let centered = matches!(target, Target::Item { .. });
     let r = |v: f32| (v * scale).round() as i32;
     let pad = r(D_PAD);
-    // 改名框也跟着「外观 → 弹窗字体」走：字体名 + 字号倍率都取当前配置，
-    // 窗口高度同步放大，否则字号调大后 EDIT 会把字裁掉。
-    let (family, font_scale) = {
-        let cfg = crate::app::app().cfg.lock().unwrap();
-        (
-            cfg.panel_font.clone(),
-            (cfg.panel_font_size.clamp(
-                crate::config::FONT_SIZE_MIN,
-                crate::config::FONT_SIZE_MAX,
-            ) / crate::config::FONT_SIZE_BASE)
-                .max(0.5),
-        )
-    };
+    // 改名框跟着弹窗字体走（已固定为微软雅黑 12px，倍率恒为 1）
+    let family = crate::config::default_panel_font();
+    let font_scale = 1.0f32;
     let edit_h = (D_EDIT_H * scale * font_scale).round() as i32;
     let h = edit_h + pad * 2;
     // 宽度：跟着名字长度走（至少 120），**不**按面板标题区宽度封顶 ——
@@ -410,29 +400,24 @@ fn create_window(x: i32, y: i32, w: i32, h: i32, owner: HWND) -> Result<HWND, St
     }
 }
 
-/// 圆角：跟「圆角窗口」开关走
+/// 圆角：跟「圆角窗口」开关走。
+///
+/// 两种系统都靠 `SetWindowRgn` 硬裁：Win11 的 DWM 圆角只圆它那 1px 边框，
+/// 客户区还是方的，这个窗口整块不透明自绘，四角就会露白直角（和设置页同一个毛病）。
 fn round_corners(hwnd: HWND, w: i32, h: i32) {
-    let cfg = app().cfg.lock().unwrap().clone();
+    let radius = app().cfg.lock().unwrap().panel_radius;
     unsafe {
-        if crate::taskbar::is_win11() {
-            let pref = if cfg.panel_radius {
-                DWMWCP_ROUND
-            } else {
-                DWMWCP_DONOTROUND
-            };
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &pref as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-        } else {
-            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
-            if cfg.panel_radius {
-                let region =
-                    windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16);
-                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true);
-            }
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &DWMWCP_DONOTROUND as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
+        if radius {
+            let region =
+                windows::Win32::Graphics::Gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16);
+            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true);
         }
     }
 }

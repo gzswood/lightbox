@@ -1266,15 +1266,10 @@ fn repaint(hwnd: HWND) {
     // 标题和图标名就得跟着变深，不然看不清。
     let fg = crate::theme::text_on(bg);
     let muted = crate::theme::muted_on(bg);
-    // 透明度百分比：0 = 完全不透明，50 = 最透。
-    // 开了毛玻璃底板本来就更透（底下是玻璃，不是实色），老版就是这么算的。
-    let t = cfg.panel_transparency.clamp(0.0, 100.0) / 100.0;
-    let base = if cfg.panel_acrylic {
-        0.64 - t * 0.28
-    } else {
-        1.0 - t
-    };
-    let alpha = (255.0 * base).round().clamp(0.0, 255.0) as u8;
+    // 底板固定完全不透明：透明度那一项已经去掉（半透明之后桌面透上来，
+    // 浅色底和深色壁纸一撞，字和底子都糊，实际用下来不值当）。
+    // 只有开毛玻璃时底板本身要留一点透明度，否则底下那张模糊快照完全看不见。
+    let alpha = if cfg.panel_acrylic { 163 } else { 255 };
 
     let mut canvas = Canvas::new(w, h);
     let radius = if cfg.panel_radius {
@@ -1294,17 +1289,13 @@ fn repaint(hwnd: HWND) {
     }
     canvas.fill_round_rect(0, 0, w, h, radius, bg, alpha);
 
-    // 完全不透明的面板才能让文字走 ClearType 直出（半透明时底色不可知）。
+    // 文字走 ClearType 直出（灰度抗锯齿在 12px 中文上会糊成一团灰）。
     //
-    // 两个坑（都是被毛玻璃踩出来的）：
-    // ① 不能只看上面那个 alpha：开毛玻璃时底图是**不透明的屏幕快照**，
-    //    压上一层半透明底色之后画布 alpha 还是 255，直出完全成立 —— 早先按
-    //    `alpha == 255` 判断，一开毛玻璃文字就退回灰度抗锯齿，12px 小字立刻发虚
-    //    （用户看到的是「换个字体就模糊了」，其实是毛玻璃开关）。
-    // ② 也不能拿 cfg 里的 `bg` 当 ClearType 的底色：毛玻璃面板的真实颜色是
-    //    「底图 × 0.36 + 底色 × 0.64」，和 bg 差得很远，拿 bg 去算会在字周围
-    //    糊出一圈亮边。所以直接取画布上真正的颜色（三点平均）当底色。
-    let (text_bg, canvas_opaque) = {
+    // 直出必须知道字底下真正的颜色，不能拿 cfg 里的 `bg` 顶替：毛玻璃面板的真实
+    // 颜色是「底图 × 0.36 + 底色 × 0.64」，和 bg 差得很远，拿 bg 去算会在字周围
+    // 糊出一圈亮边。所以直接取画布上真正的颜色（三点平均）当底色。
+    // 只认 alpha == 255 的采样点：圆角外那一圈是透明的，不能拿来平均。
+    let text_bg = {
         let sample = |fx: f32| -> Option<(u8, u8, u8)> {
             let sx = ((w as f32 * fx) as i32).clamp(0, w - 1);
             let sy = (h / 2).clamp(0, h - 1);
@@ -1316,16 +1307,16 @@ fn repaint(hwnd: HWND) {
         };
         let picks: Vec<(u8, u8, u8)> = [0.5, 0.3, 0.7].iter().filter_map(|f| sample(*f)).collect();
         if picks.len() < 3 {
-            (bg, false)
+            bg
         } else {
             let n = picks.len() as u32;
             let avg = |k: usize| -> u8 {
                 (picks.iter().map(|p| [p.0, p.1, p.2][k] as u32).sum::<u32>() / n) as u8
             };
-            ((avg(0), avg(1), avg(2)), true)
+            (avg(0), avg(1), avg(2))
         }
     };
-    crate::render::set_text_mode(text_bg, canvas_opaque);
+    crate::render::set_text_mode(text_bg, true);
 
     // —— 头部 ——
     let title = cfg
@@ -1367,10 +1358,10 @@ fn repaint(hwnd: HWND) {
                 draw_cell(&mut canvas, it, cx + t.dx, cy + t.dy, true, false, fg);
             }
         }
-        // 落点提示：把要落进去的那几格点亮
+        // 落点提示：把要落进去的那几格点亮（同样按底板反色，浅底不会看不见）
         for k in 0..batch_len {
             let (tx, ty) = cell_origin(at + k, cols);
-            canvas.fill_round_rect(tx, ty, cell_w(), cell_h(), 12.0, (255, 255, 255), 46);
+            canvas.fill_round_rect(tx, ty, cell_w(), cell_h(), 12.0, fg, 44);
         }
     }
 
@@ -1456,7 +1447,7 @@ fn put_text(
 /// `GetTextExtentPoint32W` 量出来的宽高 —— 后者对中文会多算几像素、上方还带
 /// ascent 空白，小牌会离名字远出小半个字，字也会整体偏下。
 fn title_text(title: &str) -> (Option<crate::render::Text>, (i32, i32, i32, i32)) {
-    match crate::render::text(title, px(13.0), false) {
+    match crate::render::text(title, px(13.0), true) {
         Some(t) => {
             let ink = ink_rect(&t.bmp).unwrap_or((0, 0, t.bmp.w, t.bmp.h));
             (Some(t), ink)
@@ -1476,9 +1467,7 @@ fn draw_head(
 ) {
     let (tr, mr, cr) = head_hits(w);
 
-    // 盒子名：字重用 Regular —— 旧版 CSS 是 `font-size: 13px; font-weight: 500`，
-    // 而雅黑只有 Regular / Bold 两档，500 落地就是 Regular。GDI 的 Bold 在 13px
-    // 中文上笔画会糊成一坨，反倒不如细体干净（用户对比旧版截图就是这个观感）。
+    // 盒子名：Bold（用户要求标题加粗、更好认）。
     let (title_txt, (ix, iy, iw, ih)) = title_text(title);
     if let Some(txt) = &title_txt {
         // 墨迹左边贴 tr.left、墨迹中线贴头部中线 —— 不同名字、不同字数的标题
@@ -1489,7 +1478,7 @@ fn draw_head(
             (head_h() - ih) / 2 - iy,
             title,
             px(13.0),
-            false,
+            true,
             fg,
             txt,
         );
@@ -1498,8 +1487,8 @@ fn draw_head(
     // 图标个数：标题右边一个圆角小牌（改名时藏起来 —— 改名窗正好盖在那儿）
     if !crate::rename::renaming_box() {
         let cx = tr.left + iw + px(8.0);
-        // 旧版是 11px 常规体（CSS 没设 font-weight，就是 400）
-        if let Some(txt) = crate::render::text(&count.to_string(), px(11.0), false) {
+        // 和标题一样用粗体，两者视觉重量才一致
+        if let Some(txt) = crate::render::text(&count.to_string(), px(11.0), true) {
             let (ix, iy, iw, ih) = ink_rect(&txt.bmp).unwrap_or((0, 0, txt.bmp.w, txt.bmp.h));
             let bw = iw + px(14.0);
             let bh = px(17.0);
@@ -1511,7 +1500,7 @@ fn draw_head(
                 by + (bh - ih) / 2 - iy,
                 &count.to_string(),
                 px(11.0),
-                false,
+                true,
                 muted,
                 &txt,
             );
@@ -1619,7 +1608,9 @@ fn draw_cell(
     if selected {
         canvas.fill_round_rect(cx, cy, cell_w(), cell_h(), 12.0, SEL_COLOR, 80);
     } else if hovered {
-        canvas.fill_round_rect(cx, cy, cell_w(), cell_h(), 12.0, (255, 255, 255), 28);
+        // 悬停底色借文字色当叠加色：浅底用墨、深底用白，永远和底板反着来。
+        // 早先写死「白色 28」，浅灰面板上叠一层白等于没画，悬停看着像没反应。
+        canvas.fill_round_rect(cx, cy, cell_w(), cell_h(), 12.0, fg, 30);
     }
     let size = icon_size();
     let icon_x = cx + (cell_w() - size) / 2;

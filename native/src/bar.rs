@@ -33,7 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, RegisterClassW,
     SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, WindowFromPoint,
-    GA_ROOT, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_TOP, HWND_TOPMOST,
+    GA_ROOT, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST,
     IDC_ARROW,
     IDC_HAND, MA_NOACTIVATE, SC_MINIMIZE, SIZE_MINIMIZED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE,
@@ -448,7 +449,32 @@ fn restore_without_activate(hwnd: HWND) {
     }
 }
 
-/// 把长条重新摆正：显示 + 置顶 + 立刻重画。
+/// 长条该不该待在置顶带。
+///
+/// 任务栏模式必须（贴条要压住任务栏）；桌面模式只在用户勾了「置顶」时才该进
+/// —— 否则它就是个普通浮动窗口，被别的窗口盖住是正常的。
+fn need_topmost(in_bar: bool, user_topmost: bool) -> bool {
+    in_bar || user_topmost
+}
+
+/// 把长条从置顶带降回普通层（位置、大小、显隐都不动）。
+///
+/// 用在「用户没勾置顶，但窗口不知怎么成了 topmost」的兜底上。
+fn lower_to_normal(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
+        );
+    }
+}
+
+/// 把长条重新摆正：显示 + 按当前模式摆层级 + 立刻重画。
 ///
 /// 用在「系统刚把长条藏起来」的反弹路径上（见 `WM_SHOWWINDOW`）。
 fn reassert(hwnd: HWND) {
@@ -457,18 +483,42 @@ fn reassert(hwnd: HWND) {
     }
     log::info("长条被系统藏起来，强制重新显示");
     restore_without_activate(hwnd);
+    // 锁的顺序统一成「先 cfg 后 state」，别和别处反着来形成死锁
+    let user_topmost = app().cfg.lock().unwrap().bar.topmost;
+    let in_bar = state().lock().unwrap().in_bar;
     unsafe {
-        // SWP_SHOWWINDOW 会连 WS_VISIBLE 一起重新断言一遍 —— 有些「隐式隐藏」
-        // （owner 被藏、任务栏重排）只看 IsWindowVisible 是看不出来的。
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW,
-        );
+        // 以前这里无条件 `HWND_TOPMOST`，任务栏模式下是对的（贴条要压住任务栏），
+        // 但在**桌面模式**下就是 bug：长条只是浮在桌面上的普通窗口，一旦被系统
+        // 藏过一次（切虚拟桌面、Win+D、锁屏恢复、显示器休眠…都会走这条反弹路径），
+        // 就会被永久抬进置顶带，之后盖住所有窗口 —— 用户看到的就是
+        // 「没设置置顶，主界面却总在最前面」，而且只能重启程序才恢复。
+        //
+        // 现在按模式来：任务栏模式或用户勾了置顶才进置顶带；桌面模式只恢复显示，
+        // 用 SWP_NOZORDER 保持它原来的层级。
+        // SWP_SHOWWINDOW 还要留着：它会把 WS_VISIBLE 一起重新断言一遍 —— 有些
+        // 「隐式隐藏」（owner 被藏、任务栏重排）只看 IsWindowVisible 是看不出来的。
+        if need_topmost(in_bar, user_topmost) {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW,
+            );
+        } else {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOZORDER
+                    | SWP_SHOWWINDOW,
+            );
+        }
     }
     repaint(hwnd);
 }
@@ -667,6 +717,13 @@ fn watchdog(hwnd: HWND) {
         if covered_by_desktop(hwnd) {
             raise_topmost(hwnd);
             state().lock().unwrap().raised_for_desktop = true;
+        } else if is_topmost(hwnd) {
+            // 兜底：用户没勾置顶，长条就不该留在置顶带。
+            // 有几条路径会把它设成 topmost 却没人降回（系统把窗口藏起来后的
+            // `reassert`、旧版本遗留状态、被抬升后「显示桌面」的状态没对上），
+            // 表现就是「没设置置顶却盖住所有窗口」。这里每 200ms 查一次，发现就降回来。
+            lower_to_normal(hwnd);
+            log::info("看门狗：长条没勾置顶却成了置顶窗口，降回普通层");
         }
         return;
     }
@@ -1200,7 +1257,10 @@ fn paint(hwnd: HWND, w: i32, h: i32) {
             },
         };
         if hw > 4 {
-            canvas.fill_round_rect(hx + 2, 2, hw - 4, h - 4, radius.min(12.0), (255, 255, 255), 26);
+            // 悬停底色按底板反着来：浅底压墨、深底压白。
+            // 原来写死「白色 26」，浅色底板上等于没画（用户截图里浅灰长条几乎看不到悬停），
+            // 深色底板上也偏淡，所以顺手把透明度提了一档。
+            canvas.fill_round_rect(hx + 2, 2, hw - 4, h - 4, radius.min(12.0), fg, 40);
         }
     }
 
@@ -1697,5 +1757,21 @@ pub fn on_tick() {
     };
     if changed {
         layout_and_paint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::need_topmost;
+
+    /// 桌面模式下没勾「置顶」时不该进置顶带 —— 以前 `reassert` 无条件
+    /// `HWND_TOPMOST`，被系统藏过一次（切虚拟桌面 / Win+D / 锁屏恢复）
+    /// 就永久置顶，盖住所有窗口。
+    #[test]
+    fn 桌面模式没勾置顶不进置顶带() {
+        assert!(!need_topmost(false, false));
+        assert!(need_topmost(false, true));
+        assert!(need_topmost(true, false));
+        assert!(need_topmost(true, true));
     }
 }
