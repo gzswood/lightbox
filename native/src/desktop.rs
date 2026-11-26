@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_COPY_ALLOWED};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     ShellExecuteW, SHChangeNotify, SHGetKnownFolderPath, FOLDERID_Desktop, SHCNE_CREATE,
@@ -23,6 +24,47 @@ const SMTO_ABORTIFHUNG: u32 = 0x0002;
 /// 上次安排刷新的时刻（毫秒）。用来把连续拖放合并成一次刷新。
 static LAST_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
 
+
+/// 把文件搬到另一个位置（「解散收纳盒」把图标放回桌面就走这里）。
+///
+/// 为什么不用 `fs::rename`：跨卷（数据在 E:、桌面在 C:）时它必然失败，
+/// 旧代码靠 `copy + remove` 兜底，却有两个坑 ——
+/// ① 复制成功但源文件删不掉时，桌面会多出一份、盒子里还留着（用户看到「没反应」，
+///    其实桌面已经堆了副本）；② 文件被索引器 / 杀软短暂占用时一次就放弃。
+/// 这里改用系统自带的 `MoveFileExW(MOVEFILE_COPY_ALLOWED)`（跨卷由系统内部
+/// 复制并删源），失败重试 3 次；仍走 copy 兜底时，**副本落下去而源删不掉就删掉副本**，
+/// 保证「要么整份搬走、要么原地不动」。
+pub fn move_to_desktop(src: &Path, dst: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+        let s = wide(&src.to_string_lossy());
+        let d = wide(&dst.to_string_lossy());
+        unsafe {
+            match MoveFileExW(
+                windows::core::PCWSTR(s.as_ptr()),
+                windows::core::PCWSTR(d.as_ptr()),
+                MOVEFILE_COPY_ALLOWED,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e.message(),
+            }
+        }
+        // 兜底：老办法。副本落下去但源文件删不掉时，把副本收回来
+        if std::fs::copy(src, dst).is_ok() {
+            return match std::fs::remove_file(src) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(dst);
+                    Err(format!("已复制但删不掉源文件：{e}"))
+                }
+            };
+        }
+    }
+    Err(last)
+}
 
 /// 桌面目录（真实路径，OneDrive 重定向也能对上）
 pub fn desktop_dir() -> PathBuf {

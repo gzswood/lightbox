@@ -774,12 +774,16 @@ pub fn sort_by_name(cfg: &mut Config, id: &str) {
 
 /// 解散收纳盒：盒子里所有快捷方式移回桌面，**盒子本身留着**（变成空盒）。
 /// 返回移回去的个数。
-pub fn restore_all(id: &str) -> usize {
+/// 解散收纳盒：盒子里所有快捷方式移回桌面，**盒子本身留着**（变成空盒）。
+/// 返回（成功数, 失败数）—— 失败要如实告诉用户，不能静默吞掉。
+pub fn restore_all(id: &str) -> (usize, usize) {
     let dir = box_dir(id);
     let desktop = desktop::desktop_dir();
-    let mut n = 0;
+    crate::log::info(&format!("解散 {id}：{} → 桌面 {:?}", dir.display(), desktop));
+    let (mut ok, mut bad) = (0usize, 0usize);
     let Ok(rd) = fs::read_dir(&dir) else {
-        return 0;
+        crate::log::info(&format!("解散 {id}：读不了盒子目录"));
+        return (0, 0);
     };
     for entry in rd.flatten() {
         let p = entry.path();
@@ -790,17 +794,91 @@ pub fn restore_all(id: &str) -> usize {
             continue;
         };
         let dst = unique_target(&desktop, file);
-        let moved = fs::rename(&p, &dst).is_ok()
-            || (fs::copy(&p, &dst).is_ok() && fs::remove_file(&p).is_ok());
-        if moved {
-            desktop::notify_appeared(&dst);
-            n += 1;
+        match desktop::move_to_desktop(&p, &dst) {
+            Ok(()) => {
+                desktop::notify_appeared(&dst);
+                ok += 1;
+            }
+            Err(e) => {
+                bad += 1;
+                crate::log::info(&format!("解散 {id}：{file} 没搬成（{e}）"));
+            }
         }
     }
-    if n > 0 {
+    if ok > 0 {
         desktop::schedule_refresh();
     }
-    n
+    crate::log::info(&format!("解散 {id}：成功 {ok} 个，失败 {bad} 个"));
+    (ok, bad)
+}
+
+/// 排障用：`--dissolve <盒名|id>` 逐个探测「解散收纳盒」能不能成功。
+///
+/// **只探测、不移动**：把每个快捷方式复制到临时目录（验证源文件读得出来）
+/// 再立刻删掉，然后用写方式打开一次（看有没有被别的进程锁住），
+/// 最后看目标桌面目录在不在。解散失败时用这个能看出卡在哪一步。
+pub fn dissolve_probe(key: &str) {
+    let cfg = load_raw();
+    let Some(b) = cfg.boxes.iter().find(|b| b.id == key || b.name == key) else {
+        println!("找不到收纳盒：{key}");
+        return;
+    };
+    let dir = box_dir(&b.id);
+    let desktop = desktop::desktop_dir();
+    println!("收纳盒：{}（{}）", b.name, b.id);
+    println!("盒子目录：{}", dir.display());
+    println!("桌面目录：{:?}（存在：{}）", desktop, desktop.is_dir());
+    let Ok(rd) = fs::read_dir(&dir) else {
+        println!("✗ 读不了盒子目录");
+        return;
+    };
+    let tmp = std::env::temp_dir();
+    let (mut ok, mut bad) = (0, 0);
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() || !is_shortcut(&p) {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        // ① 源文件读得出来吗（copy 到临时目录再删掉）
+        let probe = tmp.join(format!("lb-probe-{}.tmp", uuid::Uuid::new_v4()));
+        let readable = match fs::copy(&p, &probe) {
+            Ok(_) => {
+                let _ = fs::remove_file(&probe);
+                true
+            }
+            Err(e) => {
+                println!("  ✗ {name}：读失败（{e}）");
+                false
+            }
+        };
+        // ② 有没有被别的进程独占（写方式打开一次就关）
+        let locked = std::fs::OpenOptions::new().write(true).open(&p).is_err();
+        // ③ 桌面目录可用、同名文件不冲突
+        let target = unique_target(&desktop, &name);
+        let dst_ok = desktop.is_dir() && !target.exists();
+        if readable && dst_ok {
+            ok += 1;
+            println!(
+                "  · {name}：可读{}",
+                if locked {
+                    "，但被独占/只读（删除会失败）"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            bad += 1;
+            if !dst_ok {
+                println!("  ✗ {name}：桌面目标不可用（{}）", target.display());
+            }
+        }
+    }
+    println!("合计：可搬回 {ok} 个，有问题 {bad} 个");
 }
 
 /// 盒子里的文件被拖走或删掉之后，顺序表里已经不存在的条目要清掉，

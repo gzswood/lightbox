@@ -68,6 +68,10 @@ fn main() {
         println!("配置文件：{}", root.join("config.json").display());
         println!("收纳目录：{}", root.join("boxes").display());
         println!("日志文件：{}", root.join("lightbox.log").display());
+        // 桌面目录用 Debug 打（带引号）：排障时要看清有没有尾随空格 ——
+        // 注册表里的「桌面」值末尾带个空格，目标路径就会变成一个不存在的目录，
+        // 「解散收纳盒」把图标搬回桌面就会全部失败且没有任何提示。
+        println!("桌面目录：{:?}", crate::desktop::desktop_dir());
         return;
     }
     // `--dump-config`：把读到的配置原样打出来（排障用：看迁移有没有出错）
@@ -77,6 +81,16 @@ fn main() {
         match serde_json::to_string_pretty(&cfg) {
             Ok(t) => println!("{t}"),
             Err(e) => println!("序列化失败：{e}"),
+        }
+        return;
+    }
+    // `--dissolve <盒名|id>`：逐个探测盒子里的快捷方式能不能搬回桌面（只探测、不动文件）
+    if let Some(pos) = args.iter().position(|a| a == "--dissolve") {
+        let key = args.get(pos + 1).cloned().unwrap_or_default();
+        if key.is_empty() {
+            println!("用法：lightbox.exe --dissolve <盒名或盒子 id>");
+        } else {
+            config::dissolve_probe(&key);
         }
         return;
     }

@@ -367,10 +367,15 @@ pub fn box_menu(idx: usize) {
             )) {
                 return;
             }
-            let n = config::restore_all(&id);
+            let (n, bad) = config::restore_all(&id);
             crate::bar::refresh();
             crate::panel::reload();
-            log::info(&format!("解散收纳盒：{n} 个图标已放回桌面"));
+            log::info(&format!("解散收纳盒：{n} 个图标已放回桌面（失败 {bad}）"));
+            if bad > 0 {
+                warn(&format!(
+                    "有 {bad} 个图标没能放回桌面（文件可能正被其他程序占用）。\n盒子里的图标保持原样，稍后再试一次即可。"
+                ));
+            }
         }
         Some(Act::DeleteBox) => {
             if count > 0 {
@@ -557,10 +562,15 @@ pub fn panel_header_menu(box_id: &str, with_paste: bool) {
             )) {
                 return;
             }
-            let n = config::restore_all(box_id);
+            let (n, bad) = config::restore_all(box_id);
             crate::bar::refresh();
             crate::panel::reload();
-            log::info(&format!("解散收纳盒：{n} 个图标已放回桌面"));
+            log::info(&format!("解散收纳盒：{n} 个图标已放回桌面（失败 {bad}）"));
+            if bad > 0 {
+                warn(&format!(
+                    "有 {bad} 个图标没能放回桌面（文件可能正被其他程序占用）。\n盒子里的图标保持原样，稍后再试一次即可。"
+                ));
+            }
         }
         _ => {}
     }

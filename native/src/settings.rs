@@ -1566,15 +1566,16 @@ fn paint(hwnd: HWND) {
         }
 
         // 防撞色描边：设置页和弹窗底色相同，叠在一起分不清前后。
-        // 沿圆角**外缘**描一圈（抗锯齿版本）：这一圈同时把 `SetWindowRgn`
-        // 硬裁出来的 1 像素台阶盖掉了大半 —— 最外那圈像素本来就是「底色 ×
-        // 描边色」的过渡，看着是边缘，不是锯齿。
+        //
+        // 这一圈是**以裁区边界为中线**画的（内外各半个像素），外半边被
+        // `SetWindowRgn` 的硬裁切掉了，留在窗口里的是一条半调的软边 ——
+        // 硬裁出来的 1 像素台阶因此被压掉一大半，不至于一眼看到一格一格的。
         let edge_rad = if draft.panel_radius {
             corner_radius(scale)
         } else {
             0
         };
-        g.stroke_round_aa(0, 0, cw, ch, edge_rad, theme::mix(bg, col.fg, 0.32), 1);
+        g.stroke_round_edge_aa(0, 0, cw, ch, edge_rad, theme::mix(bg, col.fg, 0.32), 1);
 
         // 一次性贴到窗口：用户只看到画完的一帧，中间态不会露出来
         drop(g);
@@ -2322,9 +2323,14 @@ fn draw_button(
             None,
         ),
     };
-    g.fill_round_aa(x, y, w, h, c.r(7.0), fill);
+    // 圆角半径 5（不是 7）：26 高的按钮上 7 的圆弧太长，1 像素描边在弧上
+    // 会摊成「一格深一格浅」，用户说的圆角颗粒感就是这么来的。收到 5 以后
+    // 弧短了，描边在整条边上都是一个像素的墨，看着才干净（Windows 自己的
+    // 按钮半径也是这个量级）。
+    let radius = c.r(5.0);
+    g.fill_round_aa(x, y, w, h, radius, fill);
     if let Some(bd) = border {
-        g.stroke_round_aa(x, y, w, h, c.r(7.0), bd, 1);
+        g.stroke_round_aa(x, y, w, h, radius, bd, 1);
     }
     g.font(c.r(12.0), false);
     g.text(x, y, w, h, label, text, Align::Center);
@@ -2844,7 +2850,7 @@ fn dissolve_box(i: usize) {
     ) {
         return;
     }
-    let n = config::restore_all(&id);
+    let (n, bad) = config::restore_all(&id);
     // 顺序表里的文件名已经不在了，顺手清掉，免得留下空洞
     {
         let mut s = state().lock().unwrap();
@@ -2852,8 +2858,16 @@ fn dissolve_box(i: usize) {
     }
     crate::bar::refresh();
     crate::panel::reload();
-    log::info(&format!("解散收纳盒 {name}：{n} 个图标已放回桌面"));
+    log::info(&format!("解散收纳盒 {name}：{n} 个图标已放回桌面（失败 {bad}）"));
     repaint();
+    if bad > 0 {
+        crate::dialog::tell(
+            None,
+            &format!(
+                "有 {bad} 个图标没能放回桌面（文件可能正被其他程序占用）。\n盒子里的图标保持原样，稍后再试一次即可。"
+            ),
+        );
+    }
 }
 
 /// 删除：只有空盒子能删（和右键菜单里的规则一致）

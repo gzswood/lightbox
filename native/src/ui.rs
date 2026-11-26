@@ -169,19 +169,6 @@ impl Surface {
             let _ = GdiFlush();
         }
     }
-
-    /// 读一个像素（测试截图用）
-    #[cfg(test)]
-    pub(crate) fn read(&self, o: usize) -> [u8; 4] {
-        unsafe {
-            [
-                *self.ptr.add(o),
-                *self.ptr.add(o + 1),
-                *self.ptr.add(o + 2),
-                *self.ptr.add(o + 3),
-            ]
-        }
-    }
 }
 
 /// RGB → COLORREF（注意是 0x00BBGGRR，和常见的 0xRRGGBB 正好相反）
@@ -367,12 +354,12 @@ impl Gfx {
         }
     }
 
-    /// 抗锯齿圆角描边：沿圆角矩形的**外缘**向内一圈 `t` 像素宽
+    /// 抗锯齿圆角描边：沿圆角矩形的**内缘**画一圈 `t` 像素宽的边。
     ///
     /// 和 `stroke_round` 的关系同上（GDI `RoundRect` 只有整数台阶）。
-    /// 窗口最外圈那条「防撞色描边」必须用这一版：它原来是一圈 1 像素的
-    /// 深灰台阶，正好压在 `SetWindowRgn` 的硬裁锯齿上，两重台阶叠起来就是
-    /// 用户说的「圆角颗粒感」。
+    /// 控件边框（白底按钮 / 输入框 / 分段选择）都用这一版：直线边上正好落满
+    /// 一个像素、整条边墨色一致；圆弧上外侧多出来的那半个像素是羽化过渡，
+    /// 看着才是「一条线」而不是「一串点」。
     pub fn stroke_round_aa(
         &self,
         x: i32,
@@ -422,6 +409,67 @@ impl Gfx {
                 let outer = (0.5 - d).clamp(0.0, 1.0);
                 let inner = (0.5 - (d + t)).clamp(0.0, 1.0);
                 let cov = outer - inner;
+                if cov <= 0.0 {
+                    continue;
+                }
+                s.blend(px, py, c, cov);
+            }
+        }
+    }
+
+    /// 抗锯齿圆角描边：以**矩形边界**为中线，内外各铺半个像素。
+    ///
+    /// 只给「窗口最外圈」用。窗口是用 `SetWindowRgn` 硬裁出来的，外缘那道
+    /// 1 像素台阶去不掉；把边框画成以边界为中线的软边，留在这里的那半边
+    /// 只有一半墨量，台阶和桌面的反差能小掉三分之一，看着没那么毛。
+    pub fn stroke_round_edge_aa(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        radius: i32,
+        c: (u8, u8, u8),
+        t: i32,
+    ) {
+        let Some(s) = self.surface else {
+            self.stroke_round(x, y, w, h, radius, c, t.max(1));
+            return;
+        };
+        if w <= 0 || h <= 0 || t <= 0 {
+            return;
+        }
+        let y = y + self.vp_y;
+        let hw = w as f32 * 0.5;
+        let hh = h as f32 * 0.5;
+        let cx = x as f32 + hw;
+        let cy = y as f32 + hh;
+        let rad = (radius as f32).clamp(0.0, hw.min(hh));
+        let t = t as f32;
+        s.flush();
+        // 中线压在边界上：内外各要扫出去半个像素（留 1 像素余量）
+        let x0 = (x - 1).max(0);
+        let mut y0 = (y - 1).max(0);
+        let x1 = (x + w + 1).min(s.w);
+        let mut y1 = (y + h + 1).min(s.h);
+        if let Some((c0, c1)) = self.clip_y {
+            y0 = y0.max(c0);
+            y1 = y1.min(c1);
+        }
+        let band = (t * 0.5 + 1.5).ceil() as i32;
+        let (bx0, bx1) = (x + band, x + w - band);
+        let (by0, by1) = (y + band, y + h - band);
+        let half = t * 0.5;
+        for py in y0..y1 {
+            let edge_v = py < by0 || py >= by1;
+            for px in x0..x1 {
+                if !(edge_v || px < bx0 || px >= bx1) {
+                    continue;
+                }
+                let d =
+                    crate::render::sd_round_rect(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hw, hh, rad);
+                // |d| = half 处满墨，再往外半个像素淡出
+                let cov = (half + 0.5 - d.abs()).clamp(0.0, 1.0);
                 if cov <= 0.0 {
                     continue;
                 }
@@ -731,4 +779,6 @@ pub fn ellipsize(s: &str, max_w: i32, measure: impl Fn(&str) -> i32) -> String {
         format!("{out}…")
     }
 }
+
+
 

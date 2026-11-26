@@ -23,12 +23,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow,
     GetParent, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, LoadCursorW, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC,
-    WINDOW_EX_STYLE, WM_ACTIVATE, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, LoadCursorW, PostMessageW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC,
+    HWND_TOPMOST, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND,
     WM_IME_COMPOSITION, WM_KEYDOWN, WM_SETFONT, WM_SETTEXT, WNDCLASSW, WS_CHILD,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE, IDC_ARROW, SW_SHOW,
-    SWP_SHOWWINDOW, WA_INACTIVE, WNDPROC,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WA_INACTIVE, WNDPROC,
 };
 
 use crate::app::app;
@@ -74,6 +74,13 @@ struct RenameState {
     brush: Option<HBRUSH>,
     /// 正在提交：防止「提交 → 销毁 → 失焦 → 再提交」递归
     committing: bool,
+    /// 这个窗口真正被激活过没有。
+    ///
+    /// 打开的那一瞬间如果本进程拿不到前台权限（`SetForegroundWindow` 会被系统
+    /// 静默拒绝），窗口会先收到一次 `WM_ACTIVATE(WA_INACTIVE)`。旧代码不管这个，
+    /// 上来就当成「用户点到别处」提交并关窗 —— 名字没改、窗口也没了，
+    /// 用户看到的就是「点名字毫无反应」，而且只有当前台不是本程序时才会犯。
+    activated: bool,
     /// 刚刚用输入法选了一个词
     ///
     /// 选词那一下的回车是「把词送进输入框」，不是「提交名字」——
@@ -95,6 +102,7 @@ fn state() -> &'static Mutex<RenameState> {
             font: None,
             brush: None,
             committing: false,
+            activated: false,
             ime_word: false,
         })
     })
@@ -108,7 +116,18 @@ static EDIT_ORIG: OnceLock<WNDPROC> = OnceLock::new();
 /// 面板的鼠标钩子、键盘钩子都要靠它**让路**：改名的时候 Esc / Ctrl+A 归输入框，
 /// 点输入框也不算「点了面板外面」。
 pub fn is_open() -> bool {
-    state().lock().unwrap().hwnd.is_some()
+    let h = state().lock().unwrap().hwnd;
+    match h {
+        // 句柄还得真是活着的窗口：万一某次窗口被系统/别的代码销毁而状态没清，
+        // 面板就会一直以为「改名中」，左键点击全被当成「提交」吞掉，看起来像点不动。
+        Some(h) if unsafe { IsWindow(Some(h)).as_bool() } => true,
+        Some(_) => {
+            log::info("改名窗句柄已失效，清掉残留状态");
+            close();
+            false
+        }
+        None => false,
+    }
 }
 
 /// 正在改的是不是**盒子名**。
@@ -161,14 +180,31 @@ pub fn open(target: Target, name: &str, at: RECT, scale: f32, owner: HWND) {
         s.edit = Some(edit);
         s.target = Some(target);
         s.committing = false;
+        s.activated = false;
     }
     unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_SHOWWINDOW);
+        // 显式提到置顶组最前面：面板自己也是 TOPMOST，谁最后 SetWindowPos 谁在上面，
+        // 只靠「owned 窗口压 owner」在某些时候会输给面板自己的重新置顶。
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            w,
+            h,
+            SWP_SHOWWINDOW,
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
         // 焦点给输入框，并全选：直接打字就是改名
         focus_edit(hwnd, edit);
         let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
     }
+    log::info(&format!(
+        "改名窗已打开：({x},{y}) {}x{}，可见={}",
+        w,
+        h,
+        unsafe { IsWindowVisible(hwnd).as_bool() }
+    ));
     // 标题旁边的数字牌让给改名窗
     crate::panel::refresh_head();
 }
@@ -200,6 +236,7 @@ pub fn close() {
         s.edit = None;
         s.target = None;
         s.committing = false;
+        s.activated = false;
         let f = s.font.take();
         let b = s.brush.take();
         (h, f, b)
@@ -217,6 +254,37 @@ pub fn close() {
     }
     // 数字牌回来
     crate::panel::refresh_head();
+}
+
+/// 把改名窗重新提到最前，返回有没有真的提到。
+///
+/// 面板也是 `WS_EX_TOPMOST`，重新置顶（`restore_topmost`）时会把改名窗压到下面；
+/// 用户看不见输入框，再点标题就以为「点了没反应」。点标题时走这里把它抬回来。
+pub fn raise() -> bool {
+    let (hwnd, edit) = {
+        let s = state().lock().unwrap();
+        (s.hwnd, s.edit)
+    };
+    let Some(h) = hwnd else { return false };
+    if !unsafe { IsWindow(Some(h)).as_bool() } {
+        return false;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            h,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        let _ = ShowWindow(h, SW_SHOW);
+    }
+    if let Some(e) = edit {
+        unsafe { focus_edit(h, e) };
+    }
+    true
 }
 
 /// 提交名字（面板里点别处收起编辑时也要用，所以放开给同 crate 调用）
@@ -338,8 +406,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_ACTIVATE => {
-            // 失去焦点 = 用户点到别处去了 → 就此提交
-            if (wp.0 & 0xffff) as u32 == WA_INACTIVE as u32 {
+            // 失去焦点 = 用户点到别处去了 → 就此提交。
+            // 但**必须先真的激活过一次**：打开瞬间拿不到前台权限时系统会先甩一个
+            // WA_INACTIVE 过来，那时候提交等于白点一下就把编辑关掉。
+            let inactive = (wp.0 & 0xffff) as u32 == WA_INACTIVE as u32;
+            let activated = {
+                let mut s = state().lock().unwrap();
+                if !inactive {
+                    s.activated = true;
+                }
+                s.activated
+            };
+            if inactive && activated {
                 commit();
             }
             LRESULT(0)

@@ -544,6 +544,13 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         if crate::menu::is_open() {
             return CallNextHookEx(None, code, wp, lp);
         }
+        // 系统弹窗（确认框 / 提示框）开着的时候也不算：它们是**面板的附属窗口**，
+        // 点「确定」那一下若被当成「点了面板外面」，面板会被销毁，
+        // 挂在它下面的 MessageBox 跟着没了，`MessageBoxW` 返回的不是 IDOK —— 
+        // 调用方看到的就是「确认了但什么也没发生」。
+        if crate::dialog::is_open() {
+            return CallNextHookEx(None, code, wp, lp);
+        }
         // 改名窗开着的时候，键盘和鼠标都归它 —— 点输入框不算「点了外面」
         if crate::rename::is_open() {
             return CallNextHookEx(None, code, wp, lp);
@@ -607,6 +614,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LR
     if code == HC_ACTION as i32 && (wp.0 as u32) == WM_KEYDOWN {
         // 改名窗开着的时候键盘归它：Esc 是「撤销改名」，不是「关面板」
         if crate::rename::is_open() {
+            return CallNextHookEx(None, code, wp, lp);
+        }
+        // 系统弹窗开着：Esc 是「取消弹窗」，Ctrl+A 也是弹窗里的事
+        if crate::dialog::is_open() {
             return CallNextHookEx(None, code, wp, lp);
         }
         if cursor_in_panel() {
@@ -687,6 +698,18 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
     // 第一次点击只用来收起编辑，免得顺手误开程序 / 误触菜单。
     // （点改名窗自己不会走到这里；点到别的程序由 WM_ACTIVATE 负责提交。）
     if crate::rename::is_open() {
+        // 点的是标题 = 正在改的就是盒子名：把改名窗重新提到最前，编辑状态留着。
+        // 面板自己也是 TOPMOST，抢焦点时会把改名窗压到下面 —— 用户看不见输入框，
+        // 再点名字就以为「点了没反应」。
+        let on_title = {
+            let s = state().lock().unwrap();
+            head_hit_at(x, y, s.win_w, s.title_w) == Some(HeadHit::Title)
+        };
+        if on_title && crate::rename::raise() {
+            crate::log::info("面板左键：点在标题上，把改名窗重新提到最前");
+            return;
+        }
+        crate::log::info("面板左键：改名窗还开着，这一下只用来提交名字");
         crate::rename::commit();
         return;
     }
@@ -885,6 +908,14 @@ fn on_mouse_up(hwnd: HWND, x: i32, y: i32) {
                     right: origin.x + title.right,
                     bottom: origin.y + title.bottom,
                 };
+                crate::log::info(&format!(
+                    "点标题要改名：win_w={w} title_w={} at=({},{},{},{})",
+                    state().lock().unwrap().title_w,
+                    at.left,
+                    at.top,
+                    at.right,
+                    at.bottom
+                ));
                 crate::rename::open(
                     crate::rename::Target::Box(id),
                     &name,
@@ -1787,6 +1818,8 @@ pub fn restore_topmost() {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+    // 面板抬回置顶组最前面之后，正在编辑的改名窗要跟着回到面板上面
+    crate::rename::raise();
 }
 
 /// 面板当前的界面缩放（右键菜单里新建的改名窗要跟着同一个系数）
