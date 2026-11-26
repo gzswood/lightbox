@@ -36,7 +36,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
     GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic,
-    LoadCursorW, RegisterClassW, SendMessageW, SetCursor,
+    LoadCursorW, RegisterClassW, SendMessageW, SetCursor, KillTimer, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, HICON, ICON_BIG, ICON_SMALL,
     IDC_ARROW, IDC_HAND, SM_CXICON, SM_CXSMICON,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
@@ -48,7 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_SETICON,
     WM_SETTEXT,
-    WM_SYSCOMMAND, SC_CLOSE,
+    WM_SYSCOMMAND, WM_TIMER, SC_CLOSE,
     WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST,
     WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP,
 };
@@ -128,6 +128,33 @@ const DSCROLL_W: f32 = 5.0;
 /// 5 个汉字约 55，两侧各留 16，视觉上不再顶到边。
 const DROWBTN_W: f32 = 88.0;
 /// 关于页「更新信息」文本框（只有查到新版本时才画），在检查更新按钮下方
+/// 关于页底部那枚「收纳盒」图标的边长（逻辑像素）。
+///
+/// 底边贴着内容区下沿、水平居中；点一下盒子会吐出彩色的 LightBox 字母。
+const DLOGO: f32 = 110.0;
+/// 底座离内容区下沿的距离。
+///
+/// 悬停光晕是画在图标外面的（左右下各外扩 10），贴到下沿就会被内容区的裁剪区
+/// 切掉一块 —— 看着像"悬停效果被下边界吃掉"。这里整体上移，让光晕完整露出来。
+const DLOGO_LIFT: f32 = 14.0;
+/// 盒子动画定时器（16ms ≈ 60fps）。只在动画期间存在，静止时 KillTimer。
+const TIMER_LOGO: usize = 2;
+/// 一次开合动画的总时长（毫秒）。超了就把时钟停掉。
+const LOGO_TOTAL: f32 = 320.0;
+/// 从盒子里吐出来的那串字母（逐个画，才能各自飞）
+const LOGO_WORD: [&str; 8] = ["L", "i", "g", "h", "t", "B", "o", "x"];
+/// 八个字母的颜色：红 橙 金 绿 青 蓝 紫 粉
+const LOGO_COLORS: [(u8, u8, u8); 8] = [
+    (0xED, 0x7B, 0x00),
+    (0x43, 0x60, 0xA8),
+    (0xFC, 0xCE, 0x00),
+    (0x3C, 0xC6, 0xED),
+    (0xFF, 0x7D, 0x5E),
+    (0x8E, 0xC2, 0x1F),
+    (0x3B, 0x73, 0x96),
+    (0x8E, 0x02, 0x44),
+];
+
 const DNOTES_TOP: f32 = 268.0;
 const DNOTES_BOTTOM: f32 = 490.0;
 const DNOTES_LINE: f32 = 18.0;
@@ -196,9 +223,73 @@ enum Hit {
     Download,
     /// 关于页的开源链接：点一下用系统浏览器打开
     OpenLink,
+    /// 关于页底部那枚收纳盒：点一下吐出 / 收回彩色字母
+    LogoBox,
     Apply,
     Cancel,
     Ok,
+}
+
+/// 关于页底座（收纳盒图标 + 吐出来的字母）的动画状态。
+///
+/// 八个字母不是整块淡入，而是**逐字错开起飞**：每个字晚一拍，收起时倒序，
+/// 最后一个字先被吞掉。整条时间轴只由一个 `clock`（毫秒）推，
+/// 静止时是 `None` —— 这时定时器可以停掉，不占 CPU。
+#[derive(Clone, Copy, Default)]
+struct LogoAnim {
+    /// 字母最终是否展开
+    open: bool,
+    /// 动画时钟（毫秒）；None = 完全静止
+    clock: Option<f32>,
+    /// 悬停过渡 0..1（0=原大，1=放大到最大 + 光晕最亮）
+    hover: f32,
+    /// 悬停目标（鼠标是不是停在盒子上）
+    hover_on: bool,
+}
+
+impl LogoAnim {
+    /// 第 `i` 个字当前展开程度（0 = 收在盒里，1 = 到位；缓动后可能略大于 1，用于回弹）
+    fn letter_p(&self, i: usize) -> f32 {
+        let last = (LOGO_WORD.len() - 1) as f32;
+        // 起飞间隔 / 单字耗时：展开略慢，收回略快。
+        // 2026-11-26 用户要求整体提速一倍：两组数字各减半（总时长 640 → 320）。
+        let (gap, dur) = if self.open {
+            (20.0, 170.0)
+        } else {
+            (17.0, 150.0)
+        };
+        // 收起时倒序，最后那个字先往回缩
+        let delay = if self.open {
+            i as f32 * gap
+        } else {
+            (last - i as f32) * gap
+        };
+        let t = match self.clock {
+            Some(ms) => ((ms - delay) / dur).clamp(0.0, 1.0),
+            // 静止 = 时间轴已经走完：展开时 p=1，收起时 p=0，两种都靠下面的公式得出
+            None => 1.0,
+        };
+        if self.open {
+            // 末尾轻微过冲再落回，弹出去更有劲
+            ease_out_back(t)
+        } else {
+            // 先慢后快地缩回盒口
+            1.0 - t * t
+        }
+    }
+}
+
+/// 回弹缓动：结尾略微超过 1 再落回（`easeOutBack`）
+fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.70158;
+    const C3: f32 = C1 + 1.0;
+    let u = t - 1.0;
+    1.0 + C3 * u * u * u + C1 * u * u
+}
+
+/// 整数插值（`t` 允许大于 1，overshoot 时就是冲过头再回来）
+fn lerp_i(a: i32, b: i32, t: f32) -> i32 {
+    a + ((b - a) as f32 * t).round() as i32
 }
 
 /// 布局结果：命中区域 + 收纳盒列表每一行的矩形（绘制和点击共用）
@@ -296,6 +387,8 @@ struct Settings {
     font: Option<HFONT>,
     /// 自己造的窗口图标（标题栏那两枚 HICON），换掉时要 DestroyIcon
     icons: Vec<HICON>,
+    /// 关于页底座的动画状态（是否展开、悬停过渡）
+    logo: LogoAnim,
 }
 
 static STATE: OnceLock<Mutex<Settings>> = OnceLock::new();
@@ -323,6 +416,7 @@ fn state() -> &'static Mutex<Settings> {
             brush: None,
             font: None,
             icons: Vec::new(),
+            logo: LogoAnim::default(),
         })
     })
 }
@@ -895,6 +989,22 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                     },
                 ));
             }
+            // 底部那枚收纳盒：离内容区下沿留出 `DLOGO_LIFT`（悬停光晕要露全）、水平居中。
+            // 有更新说明时整块让位 —— 说明框正好压在这块地方。
+            if !has_update {
+                let (_, cbot) = content_band(scale);
+                let mid = (cx + cr) / 2;
+                let half = r(DLOGO) / 2;
+                hits.push((
+                    Hit::LogoBox,
+                    RECT {
+                        left: mid - half,
+                        top: cbot - r(DLOGO_LIFT) - r(DLOGO),
+                        right: mid + half,
+                        bottom: cbot - r(DLOGO_LIFT),
+                    },
+                ));
+            }
         }
     }
 
@@ -906,9 +1016,13 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
 }
 
 /// 不随内容平移、也不受内容区上下边界限制的命中区：
-/// 侧栏、页脚「应用 / 取消 / 确定」都是窗口固定件，画在原始坐标上。
+/// 侧栏、页脚「应用 / 取消 / 确定」都是窗口固定件，画在原始坐标上；
+/// 关于页底部那枚收纳盒也是钉死的（整页虽然整体上移过，它的矩形按屏幕坐标给）。
 fn pinned_hit(h: &Hit) -> bool {
-    matches!(h, Hit::Nav(_) | Hit::Apply | Hit::Cancel | Hit::Ok)
+    matches!(
+        h,
+        Hit::Nav(_) | Hit::Apply | Hit::Cancel | Hit::Ok | Hit::LogoBox
+    )
 }
 
 /// 鼠标在某点落在哪个可点区域（从后往前找 = 小块优先于整行）
@@ -1021,6 +1135,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            // 只有关于页那道底座动画在用定时器（16ms 一帧），别的定时器交回系统
+            if wp.0 == TIMER_LOGO {
+                on_logo_tick(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_LBUTTONDOWN => {
             on_mouse_down(hwnd, x_of(lp), y_of(lp));
             LRESULT(0)
@@ -1094,8 +1216,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let icons = {
                 let mut s = state().lock().unwrap();
                 s.hwnd = None;
+                // 窗口可能在动画半途被关掉：把时钟和悬停清干净，
+                // 不然下次打开会停在半空中的一帧上（定时器已经没了，永远动不了）
+                s.logo.clock = None;
+                s.logo.hover = 0.0;
+                s.logo.hover_on = false;
                 std::mem::take(&mut s.icons)
             };
+            // 动画定时器随窗口走，这里显式收一次，别留半帧状态
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_LOGO);
+            }
             // 自己造的窗口图标，窗口没了就得自己销毁
             unsafe {
                 for h in icons {
@@ -1105,6 +1236,51 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// 点一下底座：展开 / 收起字母。两个方向都从 0 重新计时。
+fn toggle_logo(hwnd: HWND) {
+    {
+        let mut s = state().lock().unwrap();
+        s.logo.open = !s.logo.open;
+        s.logo.clock = Some(0.0);
+    }
+    ensure_logo_timer(hwnd);
+}
+
+/// 动画期间挂 16ms 定时器。停下时由 `on_logo_tick` 自己 KillTimer
+fn ensure_logo_timer(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_LOGO, 16, None);
+    }
+}
+
+/// 底座动画的一帧：推进时钟 + 悬停过渡，都到终点了就把定时器关掉。
+///
+/// 只在动画期间存在定时器 —— 静止时这个页面完全不占 CPU。
+fn on_logo_tick(hwnd: HWND) {
+    let running = {
+        let mut s = state().lock().unwrap();
+        if let Some(ms) = s.logo.clock {
+            let next = ms + 16.0;
+            s.logo.clock = if next > LOGO_TOTAL { None } else { Some(next) };
+        }
+        // 悬停过渡：每帧靠近目标 35%，8 帧左右到位，再小就吸附到底
+        let target = if s.logo.hover_on { 1.0 } else { 0.0 };
+        let d = target - s.logo.hover;
+        if d.abs() < 0.02 {
+            s.logo.hover = target;
+        } else {
+            s.logo.hover += d * 0.35;
+        }
+        s.logo.clock.is_some() || s.logo.hover != target
+    };
+    repaint();
+    if !running {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_LOGO);
+        }
     }
 }
 
@@ -1395,6 +1571,7 @@ fn paint(hwnd: HWND) {
         auto_on,
         auto_orig,
         notes_scroll,
+        logo,
     ) = {
         let s = state().lock().unwrap();
         (
@@ -1408,6 +1585,7 @@ fn paint(hwnd: HWND) {
             s.autostart,
             s.autostart_orig,
             s.notes_scroll,
+            s.logo,
         )
     };
     let is_dirty = draft != orig || auto_on != auto_orig;
@@ -1523,7 +1701,16 @@ fn paint(hwnd: HWND) {
             ),
             Tab::Look => paint_look(&mut g, &c, &lay, &col, &draft, hover),
             Tab::Features => paint_features(&mut g, &c, &lay, &col, &draft, hover, auto_on),
-            Tab::About => paint_about(&mut g, &c, &lay, &col, hover, has_update, notes_scroll),
+            Tab::About => paint_about(
+                &mut g,
+                &c,
+                &lay,
+                &col,
+                hover,
+                has_update,
+                notes_scroll,
+                logo,
+            ),
         }
         if dy != 0 {
             let _ = SetViewportOrgEx(dc, 0, 0, None);
@@ -1993,6 +2180,7 @@ fn paint_about(
     hover: Option<Hit>,
     has_update: bool,
     notes_scroll: usize,
+    logo: LogoAnim,
 ) {
     let r = |v: f32| c.r(v);
 
@@ -2094,6 +2282,120 @@ fn paint_about(
     // 有更新时在按钮下方展示清单里的完整信息（滚轮可翻）
     if has_update {
         paint_update_box(g, c, col, notes_scroll);
+    } else {
+        // 没有更新说明时这块本来是空的，放一枚会吐字母的收纳盒
+        paint_logo(g, c, col, logo);
+    }
+}
+
+/// 关于页底部的收纳盒 + 从它嘴里飞出来的「LightBox」。
+///
+/// 绘制顺序是**先字母后盒子**：字母起点在盒口中心，被后画的盒子盖住，
+/// 看着就像从盒子里冒出来；收起时反向缩回同一个点，等于被吞回去。
+fn paint_logo(g: &mut Gfx, c: &Ctx, col: &Colors, anim: LogoAnim) {
+    let r = |v: f32| c.r(v);
+    let (_, cbot) = content_band(c.scale);
+    let mid = (c.cx + c.cr) / 2;
+    // 悬停时底边不动、往上长 6px（量化到整数像素，图标位图按尺寸缓存，别让它每帧新建）
+    let grow = (anim.hover * r(6.0) as f32).round() as i32;
+    let side = r(DLOGO) + grow;
+    if side <= 0 {
+        return;
+    }
+    let left = mid - side / 2;
+    // 底边不贴内容区下沿，往上让出 `DLOGO_LIFT`，否则悬停光晕的下半圈会被裁剪区切掉
+    let top = cbot - r(DLOGO_LIFT) - side;
+
+    // 关于页整页被视口原点整体上移过（见 content_shift）。这里一律按**屏幕**坐标算，
+    // 所以先把视口偏移临时清掉，画完再还原 —— 否则图标会比命中区高出 10px，
+    // 而且位图贴图到底吃不吃视口偏移不用再赌。
+    let dy = content_shift(Tab::About, c.scale);
+    if dy != 0 {
+        unsafe {
+            let _ = SetViewportOrgEx(g.hdc, 0, 0, None);
+        }
+        g.viewport_y(0);
+    }
+
+    // 光晕：没有 alpha 通道，只能往背景色里混主色来假装「柔和」
+    if anim.hover > 0.01 {
+        let k = 0.10 * anim.hover;
+        g.fill_round_aa(
+            left - r(10.0),
+            top - r(10.0),
+            side + r(20.0),
+            side + r(20.0),
+            r(30.0),
+            theme::mix(col.bg, col.accent, k),
+        );
+        g.fill_round_aa(
+            left - r(5.0),
+            top - r(5.0),
+            side + r(10.0),
+            side + r(10.0),
+            r(24.0),
+            theme::mix(col.bg, col.accent, k * 1.6),
+        );
+    }
+
+    paint_logo_letters(g, c, col, anim, mid, top, side);
+
+    // 默认「收纳盒」图标（蓝盒身 + 浅蓝盒盖 + 白卡扣），和任务栏胶囊、列表里是同一枚。
+    // 这里必须**按 alpha 逐像素混**：图标四周是透明的，悬停光晕就画在它下面，
+    // 走「烤进纯色背板再 BitBlt」会盖出一块底色方块（见 Gfx::draw_bgra）。
+    let glyph = icons::box_glyph(side);
+    g.draw_bgra(
+        left + (side - glyph.w) / 2,
+        top + (side - glyph.h) / 2,
+        glyph.w,
+        glyph.h,
+        &glyph.px,
+    );
+
+    // 还原视口偏移，后面（页脚等）还要接着按平移后的坐标画
+    if dy != 0 {
+        unsafe {
+            let _ = SetViewportOrgEx(g.hdc, 0, dy, None);
+        }
+        g.viewport_y(dy);
+    }
+}
+
+/// 八个字母：各自从盒口飞到自己那一格，中间高两边低排成一道弧
+fn paint_logo_letters(
+    g: &mut Gfx,
+    c: &Ctx,
+    col: &Colors,
+    anim: LogoAnim,
+    mid: i32,
+    top: i32,
+    side: i32,
+) {
+    let r = |v: f32| c.r(v);
+    // 字号 / 步距 / 字框 / 弧高按 18→36 等比翻倍（用户 2026-11-26 要求放大 2 倍）：
+    // 8 个字母 × 44 步距 ≈ 352px，内容区宽 476px，两侧还留得下余量。
+    let step = r(44.0);
+    let fh = r(56.0);
+    // 起点：盒口中心（落后画的盒子挡住，看不见）
+    let y0 = top + side / 2 - fh / 2;
+    // 终点：盒子上方一条浅弧
+    let y1 = top - r(8.0) - fh;
+    let n = (LOGO_WORD.len() - 1) as f32;
+    g.font(r(36.0), true);
+    for (i, word) in LOGO_WORD.iter().enumerate() {
+        let p = anim.letter_p(i);
+        if p <= 0.002 {
+            continue;
+        }
+        let t = i as f32 / n;
+        // 弧顶在中间：中间的字多飞 20px 高
+        let arc = ((t * std::f32::consts::PI).sin() * r(20.0) as f32).round() as i32;
+        let slot_x = mid + (((i as f32) - n / 2.0) * step as f32).round() as i32;
+        let x = lerp_i(mid - step / 2, slot_x, p);
+        let y = lerp_i(y0, y1 - arc, p);
+        // 颜色从背景色「淡入」到实色 —— 没有 alpha，这样等于淡入
+        let color = theme::mix(col.bg, LOGO_COLORS[i], p.clamp(0.0, 1.0));
+        g.text(x, y, step, fh, word, color, Align::Center);
     }
 }
 
@@ -2596,6 +2898,7 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
             // 点链接直接用系统浏览器打开仓库
             let _ = desktop::shell_open(ABOUT_ROWS[0].1);
         }
+        Hit::LogoBox => toggle_logo(hwnd),
         Hit::Apply => {
             if dirty() {
                 apply_changes();
@@ -2668,6 +2971,20 @@ fn on_mouse_move(hwnd: HWND, x: i32, y: i32) {
             let _ = SetCursor(cur);
         }
         repaint();
+    }
+
+    // 底座悬停：放大 + 光晕交给定时器做过渡，鼠标一移开就反向退回去
+    let want = hit == Some(Hit::LogoBox);
+    let start = {
+        let mut s = state().lock().unwrap();
+        let changed = s.logo.hover_on != want;
+        if changed {
+            s.logo.hover_on = want;
+        }
+        changed
+    };
+    if start {
+        ensure_logo_timer(hwnd);
     }
 }
 
@@ -3348,6 +3665,59 @@ mod tests {
             let ok = hit(&lay, Hit::Ok);
             assert!(ok.top >= cbot, "{tab:?} 页的「确定」应在内容区下方");
         }
+    }
+
+    /// 关于页底部那枚收纳盒：离内容区下沿留出悬挂量（悬停光晕要露全）、居中，
+    /// 有更新说明时让位
+    #[test]
+    fn 底座离内容区下沿留悬挂量() {
+        let (_, cbot) = content_band(1.0);
+        let lay = layout(1.0, Tab::About, 3, 0, false);
+        let rect = hit(&lay, Hit::LogoBox);
+        assert_eq!(rect.bottom, cbot - DLOGO_LIFT as i32, "底边没让出光晕的位置");
+        // 悬停光晕外扩 10（见 paint_logo），必须还在内容区里，不能被裁掉
+        assert!(
+            rect.bottom + 10 <= cbot,
+            "光晕下沿 {} 会被内容区下沿 {cbot} 切掉",
+            rect.bottom + 10
+        );
+        assert_eq!(rect.right - rect.left, DLOGO as i32);
+        // 有更新说明时这块让给说明框，不能再压上去
+        let upd = layout(1.0, Tab::About, 3, 0, true);
+        assert!(
+            upd.hits.iter().all(|(h, _)| *h != Hit::LogoBox),
+            "有更新时不该画底座"
+        );
+    }
+
+    /// 回弹缓动：两端归位，中途允许冲过 1（字母会稍微跳过头再落回）
+    #[test]
+    fn 回弹缓动端点正确() {
+        assert!((ease_out_back(0.0)).abs() < 1e-4);
+        assert!((ease_out_back(1.0) - 1.0).abs() < 1e-4);
+        assert!(ease_out_back(0.9) > 1.0, "应该有过冲");
+        // 收起时倒序：过 100ms 时最后一格已经开始缩，第一个还没动
+        let closing = LogoAnim {
+            open: false,
+            clock: Some(100.0),
+            hover: 0.0,
+            hover_on: false,
+        };
+        assert!(closing.letter_p(7) < closing.letter_p(0));
+        // 静止时的两个端点
+        let out = LogoAnim {
+            open: true,
+            clock: None,
+            hover: 0.0,
+            hover_on: false,
+        };
+        assert_eq!(out.letter_p(0), 1.0);
+        let shut = LogoAnim {
+            open: false,
+            clock: None,
+            ..out
+        };
+        assert_eq!(shut.letter_p(0), 0.0);
     }
 
     /// 侧栏吸附位置与当前页无关：切到外观 / 功能页后，鼠标位置不能偏

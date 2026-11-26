@@ -454,6 +454,51 @@ impl Gfx {
         }
     }
 
+    /// 贴一张 BGRA 位图，**按 alpha 逐像素混**到画布上。
+    ///
+    /// 和「把图标烤进某个底色再 BitBlt」的老做法（见 `settings::blit_bgra`）不同：
+    /// 那个只能给一个固定底色当背板，图标四周的透明像素会被填成那个颜色 ——
+    /// 底下一旦有光晕/渐变，就会露出一个纯色方块。这里直接和已经画好的像素
+    /// 混合，透明处完全透出背景。
+    ///
+    /// `px` 是 B, G, R, A 顺序（和 `IconBmp` 一致）。
+    pub fn draw_bgra(&self, x: i32, y: i32, w: i32, h: i32, px: &[u8]) {
+        let Some(s) = self.surface else {
+            // 没有像素直写通道时画不了（宁可什么都不画，也不留一块黑方块）
+            return;
+        };
+        if w <= 0 || h <= 0 || px.len() < (w * h * 4) as usize {
+            return;
+        }
+        // 逐像素写入不认视口偏移，得自己补上
+        let y = y + self.vp_y;
+        // 刚用 GDI 画完的光晕可能还在命令缓冲里，不刷就读到旧底色
+        s.flush();
+        for py in 0..h {
+            let dy = y + py;
+            if dy < 0 || dy >= s.h {
+                continue;
+            }
+            if let Some((c0, c1)) = self.clip_y {
+                if dy < c0 || dy >= c1 {
+                    continue;
+                }
+            }
+            for sx in 0..w {
+                let dx = x + sx;
+                if dx < 0 || dx >= s.w {
+                    continue;
+                }
+                let i = ((py * w + sx) * 4) as usize;
+                let a = px[i + 3] as f32;
+                if a <= 0.0 {
+                    continue;
+                }
+                s.blend(dx, dy, (px[i + 2], px[i + 1], px[i]), a / 255.0);
+            }
+        }
+    }
+
     /// 一条横线
     pub fn hline(&self, x1: i32, x2: i32, y: i32, c: (u8, u8, u8)) {
         unsafe {

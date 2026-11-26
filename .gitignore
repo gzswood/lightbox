@@ -41,3 +41,8 @@ desktop.ini
 
 # 本地排查时抓的临时二进制（无引用，纯垃圾）
 tmp_*.bin
+
+# 本地素材：生成图 / 未接入代码的横幅（约 5 MB，公开仓库不存）
+# 代码里 `include_bytes!` 用到的图标在 native/assets/，不受影响
+assets/
+generated-images/
