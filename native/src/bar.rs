@@ -12,7 +12,7 @@
 //! 整条是**一个**胶囊，嵌在任务栏里。点哪一段就弹出哪个盒子。
 //! 新建收纳盒走右键菜单（长条上不再留「+」）。
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -27,7 +27,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetAncestor, GetClassNameW, GetCursorPos, GetDesktopWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetClassNameW, GetCursorPos,
+    GetDesktopWindow,
     GetShellWindow, GetTopWindow, GetWindow, GetWindowLongPtrW,
     GetWindowPlacement, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, LoadCursorW,
     PostMessageW, RegisterClassW,
@@ -63,6 +64,18 @@ const WATCHDOG_MS: u32 = 200;
 
 /// 自己给自己投递的「把长条重新摆正」消息（WM_APP + 1）
 const WM_APP_REASSERT: u32 = 0x8000 + 1;
+
+/// 切屏后自愈持续的 tick 数（on_tick 每秒一次 → 约 6 秒）。
+/// 任务栏在主屏切换 / 插拔显示器时可能花几秒才稳定到最终布局，
+/// 这段时间每秒强制重排 + 强制显示，确保任何一次过渡态把长条弄丢都能补回来。
+const HEAL_TICKS: u32 = 6;
+
+/// 「显示器布局变了」的标记。
+///
+/// `WM_DISPLAYCHANGE` 的窗口过程里只置这一个标记，**什么都不做** ——
+/// 连句柄都不碰：那条消息到达时外壳正忙着重排任务栏，在它里面调任何
+/// 跨进程的东西都可能互等死锁。真正的活在下一秒的 tick 里干。
+static DISPLAY_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// 长条离屏幕边缘的最小留白（浮在桌面上时）
 const SCREEN_MARGIN: i32 = 24;
@@ -154,6 +167,20 @@ struct BarState {
     pin_detached: bool,
     /// 上一次看门狗是不是判定「被盖住 / 被藏起来」（诊断日志只在状态翻转时记一条）
     was_lost: bool,
+    /// 切屏后的「自愈倒计时」（单位：秒）。切屏瞬间任务栏还在重排，
+    /// 当场按过渡态任务栏布局会把长条挂错 / 挪走 / 卡在隐藏态。
+    /// 所以只标记这一个计数，让接下来几秒的 tick 每秒强制重排 + 强制显示，
+    /// 覆盖任务栏从过渡态稳定的整个过程。
+    heal_ticks: u32,
+    /// 「显示器布局正在变」的过渡期（和 `heal_ticks` 一起起停）。
+    ///
+    /// 这段时间里窗口和任务栏的父子关系**一律不动**：切屏那几秒外壳线程正在
+    /// 重排任务栏，`SetParent` / 改 owner 都是跨进程同步调用，一调就可能两边
+    /// 互等到超时 —— 用户看到的是主界面整个卡死（连托盘菜单都点不出来）。
+    /// 位置、大小、重画照常做，只是先按「现在实际挂在哪儿」算坐标。
+    settling: bool,
+    /// 上一次重排是否「任务栏模式下没拿到任务栏条」（诊断日志只在翻转时记）
+    was_strip_missing: bool,
     layout_sig: String,
     /// 长条作为拖放目标（把桌面图标拖进某个分段）
     drop_target: Option<IDropTarget>,
@@ -188,6 +215,9 @@ fn state() -> &'static Mutex<BarState> {
             raised_for_desktop: false,
             pin_detached: false,
             was_lost: false,
+            heal_ticks: 0,
+            settling: false,
+            was_strip_missing: false,
             layout_sig: String::new(),
             drop_target: None,
         })
@@ -481,7 +511,7 @@ fn reassert(hwnd: HWND) {
     if !app().running.load(Ordering::Relaxed) || !state().lock().unwrap().keep {
         return;
     }
-    log::info("长条被系统藏起来，强制重新显示");
+    log::info("重新断言长条的显示与层级");
     restore_without_activate(hwnd);
     // 锁的顺序统一成「先 cfg 后 state」，别和别处反着来形成死锁
     let user_topmost = app().cfg.lock().unwrap().bar.topmost;
@@ -627,10 +657,22 @@ fn watchdog(hwnd: HWND) {
         return;
     }
     let user_topmost = app().cfg.lock().unwrap().bar.topmost;
-    let (in_bar, keep, raised, laid_out) = {
+    let (in_bar, keep, raised, laid_out, settling) = {
         let s = state().lock().unwrap();
-        (s.in_bar, s.keep, s.raised_for_desktop, s.win_w > 0)
+        (
+            s.in_bar,
+            s.keep,
+            s.raised_for_desktop,
+            s.win_w > 0,
+            s.settling,
+        )
     };
+    // 切屏过渡期：任务栏和长条的层级关系全在变，这里插一脚只会互相打架
+    // （以前任务栏条一时取不到 → 被当成桌面模式 → 每 200ms 升降一次置顶）。
+    // 过渡期交给每秒一次的「自愈」，它结束时会把层级和显隐一起定下来。
+    if settling {
+        return;
+    }
     // 用户点了「隐藏主界面」、或者还没排过版（窗口还是 10×10 的初始大小）时别动它
     if !keep || !laid_out {
         return;
@@ -859,13 +901,16 @@ fn rebuild_with_backoff() {
     }
 }
 
-/// 长条窗口已被销毁：把状态清干净，重建一个并挂回任务栏
+/// 长条窗口没了（多半是资源管理器重启 / 切屏时被外壳连带销毁）：重建一个。
+///
+/// 也可能是「窗口还活着，但已经成了看不见的僵尸」（DWM 不再合成它）——
+/// 这种情况也要先销毁旧的再建新的，否则旧窗口会留着它的看门狗定时器，
+/// 每 200ms 拿**旧句柄**去和新的 state 抢层级。
 fn rebuild() {
-    log::info("长条窗口已消失（多半是资源管理器重启过），重新创建");
-    let keep = {
+    log::info("长条窗口已消失或失效，重新创建");
+    let (keep, old) = {
         let mut s = state().lock().unwrap();
-        s.hwnd = None;
-        // 旧的拖放目标是野句柄，直接丢掉；init() 会重新登记
+        let old = s.hwnd.take();
         s.drop_target = None;
         s.hover = None;
         s.pressed = false;
@@ -875,8 +920,20 @@ fn rebuild() {
         s.was_lost = false;
         s.pin_detached = false;
         s.layout_sig.clear();
-        s.keep
+        // 过渡期里重建出来的窗口是「浮着」的（这时候不碰任务栏关系），
+        // 让自愈再走一轮，等任务栏稳下来把它挂回去
+        if s.settling {
+            s.heal_ticks = HEAL_TICKS;
+        }
+        (s.keep, old)
     };
+    if let Some(old) = old {
+        unsafe {
+            if IsWindow(Some(old)).as_bool() {
+                let _ = DestroyWindow(old);
+            }
+        }
+    }
     if let Err(e) = init() {
         log::info(&format!("重建长条窗口失败：{e}"));
         return;
@@ -1013,6 +1070,18 @@ fn layout_and_paint() {
     } else {
         crate::taskbar::strip()
     };
+    // 排障：用户是任务栏模式却拿不到任务栏条（切屏过渡态 / 任务栏在侧边或
+    // 自动隐藏），长条会退回「浮在桌面」，看着就像主界面不见了。只在状态
+    // 翻转时记一条，不刷屏。
+    {
+        let wants_bar = !cfg.bar.desktop;
+        let got_bar = strip.is_some();
+        let mut s = state().lock().unwrap();
+        if wants_bar && !got_bar && !s.was_strip_missing {
+            log::info("排障：任务栏模式下取不到任务栏条，长条退回桌面浮动（切屏过渡态常见）");
+        }
+        s.was_strip_missing = wants_bar && !got_bar;
+    }
     // 任务栏里可排的区间 [left, right)
     let mut slot = (0, 0);
     // 长条左沿能到的最左位置（拖动时的边界）
@@ -1154,17 +1223,22 @@ fn layout_and_paint() {
     };
 
     // 先把窗口挂进任务栏 / 摘出来，再决定坐标按哪个原点算。
-    // 如果 pin 没成功（拿不到任务栏 / SetParent 被拒），就不能再用子窗口坐标，
-    // 否则会被摆到屏幕最上方 —— 这时退回屏幕坐标。
-    let pinned = if strip.is_some() {
-        crate::taskbar::pin(hwnd)
-    } else {
-        crate::taskbar::unpin(hwnd);
-        false
-    };
+    //
+    // 过渡期（切屏那几秒）**一律不动**这条关系：外壳线程这时正在重排任务栏，
+    // `SetParent` / 改 owner 都是跨进程同步调用，一调就可能两边互等 —— 主界面
+    // 直接卡死。过渡期只按「现在实际挂在哪儿」摆位，等自愈最后一 tick 再挂回去。
+    if !state().lock().unwrap().settling {
+        if strip.is_some() {
+            crate::taskbar::pin(hwnd);
+        } else {
+            crate::taskbar::unpin(hwnd);
+        }
+    }
     // Win10 下长条是任务栏的**子窗口**，坐标要相对任务栏客户区；
-    // Win11 是顶层窗口（任务栏只当 owner），屏幕坐标直接用。
-    let child_of_taskbar = pinned && !crate::taskbar::is_win11();
+    // Win11 是顶层窗口，屏幕坐标直接用。
+    // 问的是**实际状态**而不是「刚才 pin 成功了吗」：过渡期跳过了 pin，
+    // 窗口却仍挂在任务栏下面，这时候必须还按子窗口算。
+    let child_of_taskbar = crate::taskbar::is_child_of_taskbar(hwnd);
     let (win_x, win_y) = if child_of_taskbar {
         let org = crate::taskbar::client_origin().unwrap_or(POINT { x: 0, y: 0 });
         (screen_x - org.x, screen_y - org.y)
@@ -1658,9 +1732,6 @@ pub fn scroll_to_end() {
 /// `IsWindowVisible` 已经是 true 就提前返回：被「显示桌面」盖住的窗口
 /// 这两个标志完全正常，可它其实看不见。
 pub fn show() {
-    let Some(hwnd) = state().lock().unwrap().hwnd else {
-        return;
-    };
     {
         let mut s = state().lock().unwrap();
         s.keep = true;
@@ -1668,6 +1739,16 @@ pub fn show() {
         // 若桌面此刻还盖着，等下面的看门狗重新判定并抬到置顶层
         s.raised_for_desktop = false;
     }
+    // 用户点名要显示：句柄要是已经被系统销毁了（任务栏重建 / 切屏），
+    // 必须先重建一个真窗口。上一版只按 state 里存的旧句柄做一堆 SetWindowPos，
+    // 作用在失效句柄上全部静默失败 —— 用户看到的就是「托盘点了没反应」。
+    if !window_alive() {
+        log::info("托盘显示：长条窗口已失效，先重建再显示");
+        rebuild();
+    }
+    let Some(hwnd) = state().lock().unwrap().hwnd else {
+        return;
+    };
     // 先重排一次：拿回正确的大小/位置，顺带把长条抬到普通窗口最上层
     // （「显示桌面」把桌面抬上去了，光这一步还不够，靠看门狗补到置顶层）
     layout_and_paint();
@@ -1697,7 +1778,44 @@ pub fn show() {
     }
     // 还被「显示桌面」盖着的话，看门狗会立刻把它补到置顶层
     watchdog(hwnd);
+    // 用户点名要显示，就无条件把 WS_VISIBLE 和层级再断言一次。
+    // 以前只按 IsWindowVisible 判断要不要恢复，可切屏 / 任务栏重建后
+    // 有「窗口其实被 owner 藏了、IsWindowVisible 还是 true」的情况，
+    // 于是点托盘菜单什么都不会发生。
+    reassert(hwnd);
     repaint(hwnd);
+    // 断言完还是看不见，就别再自欺欺人了：过渡态里外壳可能把这个窗口弄成
+    // 「活着、但 DWM 永远不合成」的僵尸，重建一个最省事。
+    // 这一步保证托盘里的「显示主界面」**永远**有用，不会点了没反应。
+    if unsafe { !IsWindowVisible(hwnd).as_bool() } {
+        log::info("托盘显示后长条仍不可见，重建窗口");
+        rebuild();
+    }
+}
+
+/// 现在是不是「显示器布局正在变」的过渡期。
+///
+/// 别的模块（任务栏重启检查）也要看这个标记：过渡期里别去碰任务栏。
+pub fn settling() -> bool {
+    state().lock().unwrap().settling
+}
+
+/// 显示器布局变化（插拔 / 单屏↔双屏 / 主屏切换 / 改分辨率或缩放）。
+///
+/// Windows 只把 `WM_DISPLAYCHANGE` 发给顶层窗口，宿主窗口收到后调这里。
+///
+/// **这里什么都不做，只置一个标记。**
+///
+/// 这条消息是在窗口过程里同步处理的，而同一时刻外壳（explorer / 任务栏）正在
+/// 重新排布任务栏：`Shell_TrayWnd` 可能刚被重建、任务栏条一时量不出来。
+/// 在这儿往下做任何一件事都是坑：
+///  · 当场重排 → 用过渡态的矩形把长条摆到旧屏幕或屏幕外（「主界面不见了」）；
+///  · 当场 `SetParent` / 改 owner → 跨进程同步调用，两边互等（「主界面卡死」）。
+///
+/// 所以真正的排在下一秒的 tick 里做，而且头几秒只摆位、不碰父子关系，
+/// 等任务栏稳下来再一次性挂回去（见 `on_tick` / `finish_heal`）。
+pub fn on_display_change() {
+    DISPLAY_DIRTY.store(true, Ordering::Relaxed);
 }
 
 /// 托盘菜单「隐藏主界面」：收起长条，并告诉看门狗别再把它拽回来。
@@ -1723,6 +1841,26 @@ pub fn on_tick() {
         rebuild_with_backoff();
         return;
     }
+    // 切屏：进入过渡期。头几秒只摆位置、重画，不动任务栏的父子关系
+    // （见 on_display_change），等任务栏稳定了再一次性挂回去。
+    if DISPLAY_DIRTY.swap(false, Ordering::Relaxed) {
+        let mut s = state().lock().unwrap();
+        s.settling = true;
+        s.heal_ticks = HEAL_TICKS;
+        s.layout_sig.clear();
+        log::info("显示器布局变化：进入过渡期，先按过渡态摆位（暂不动任务栏关系）");
+    }
+    // 自愈倒计时：这几秒里不管签名变没变都强制重排，
+    // 覆盖任务栏从过渡态稳定下来的整个过程
+    let (healing, last) = {
+        let mut s = state().lock().unwrap();
+        if s.heal_ticks > 0 {
+            s.heal_ticks -= 1;
+            (true, s.heal_ticks == 0)
+        } else {
+            (false, false)
+        }
+    };
     let mut sig = geom::monitors()
         .iter()
         .map(|m| {
@@ -1755,9 +1893,82 @@ pub fn on_tick() {
         s.layout_sig = sig;
         c
     };
-    if changed {
+    if changed || healing {
         layout_and_paint();
     }
+    if healing {
+        let alive = state().lock().unwrap().hwnd;
+        match alive {
+            Some(hwnd) => {
+                // 过渡态里任务栏经常把被它 own 的窗口顺手藏掉 / 最小化，
+                // 而「owner 被藏」这种情况 `IsWindowVisible` 看不出来 ——
+                // 所以最后一轮无条件断言一次，中途只在一眼看去真没了的时候补。
+                let hidden =
+                    unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() };
+                if hidden || last {
+                    log::info("切屏自愈：重新断言显示与层级");
+                    reassert(hwnd);
+                }
+                if last {
+                    finish_heal(hwnd);
+                }
+            }
+            // 窗口没了（下一 tick 顶部会重建）：过渡期标记也得清掉，
+            // 否则会永远卡在「正在过渡」里，之后所有重排都不再碰任务栏
+            None if last => state().lock().unwrap().settling = false,
+            None => {}
+        }
+    }
+}
+
+/// 过渡期结束：把父子关系挂回去，并确认长条真的回到屏幕上了。
+///
+/// 这一步才是「重新贴到任务栏」的时机 —— 前面几秒都刻意没碰它。
+fn finish_heal(hwnd: HWND) {
+    let keep = {
+        let mut s = state().lock().unwrap();
+        s.settling = false;
+        // 下一轮按稳定后的任务栏重算一次（过渡期的签名可能记错）
+        s.layout_sig.clear();
+        s.keep
+    };
+    if !keep {
+        // 用户自己把主界面收起来了，别借这个机会把它拽出来
+        return;
+    }
+    if !window_alive() {
+        rebuild_with_backoff();
+        return;
+    }
+    // 这一次的重排会真正重新 pin / unpin
+    layout_and_paint();
+    reassert(hwnd);
+    if !on_screen(hwnd) {
+        // 还看不见 / 位置落在所有屏幕之外：这个窗口多半已经被外壳弄成了
+        // 「活着但永远不合成」的僵尸，重建一个最省事
+        log::info("切屏自愈结束仍看不见长条，重建窗口");
+        rebuild();
+        return;
+    }
+    log::info("切屏自愈结束：长条已回到屏幕");
+    repaint(hwnd);
+}
+
+/// 长条是不是真的落在某块屏幕上、并且可见
+fn on_screen(hwnd: HWND) -> bool {
+    if unsafe { !IsWindowVisible(hwnd).as_bool() } {
+        return false;
+    }
+    let mut rc = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rc) }.is_err() {
+        return false;
+    }
+    geom::monitors().iter().any(|m| {
+        rc.right > m.rect.left
+            && rc.left < m.rect.right
+            && rc.bottom > m.rect.top
+            && rc.top < m.rect.bottom
+    })
 }
 
 #[cfg(test)]

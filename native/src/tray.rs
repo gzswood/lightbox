@@ -31,12 +31,16 @@ pub struct Tray {
     owned: Option<HICON>,
 }
 
+/// 托盘图标的原始 PNG。设置页标题栏也用它（见 `icons::png_to_hicon`），
+/// 免得 exe 里出现两枚不一样的图标。
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/tray.png");
+
 /// v0.9.33 用的托盘图标：32×32 PNG 内嵌进 exe，运行时解码成 HICON。
 ///
 /// 之前直接用 exe 资源里的应用图标（圆角方块 + 白色方框），和旧版托盘
 /// （蓝底 + 白色盒子剪影）不是同一个图，所以看起来「换了图标」。
 fn load_tray_png() -> Option<HICON> {
-    let bmp = crate::icons::decode_png_bytes(include_bytes!("../assets/tray.png"))?;
+    let bmp = crate::icons::decode_png_bytes(ICON_PNG)?;
     crate::icons::bmp_to_hicon(&bmp)
 }
 

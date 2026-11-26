@@ -336,6 +336,36 @@ unsafe fn and_mask(hicon: HICON) -> Option<Vec<bool>> {
     Some(out)
 }
 
+/// 一段 PNG → 指定边长的 HICON（设置页标题栏用托盘那枚图标）。
+///
+/// 托盘图标是 32×32；标题栏要的是 16 / 20 / 24（随 DPI），直接让系统缩
+/// 会把边缘糊掉，所以先 Lanczos 重采样到目标尺寸再转 HICON。
+pub fn png_to_hicon(raw: &[u8], size: i32) -> Option<HICON> {
+    if size <= 0 {
+        return None;
+    }
+    let img = image::load_from_memory_with_format(raw, ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    let rgba = if rgba.width() as i32 == size && rgba.height() as i32 == size {
+        rgba
+    } else {
+        image::imageops::resize(
+            &rgba,
+            size as u32,
+            size as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let mut bmp = IconBmp::empty(size, size);
+    for (i, p) in rgba.pixels().enumerate() {
+        bmp.px[i * 4] = p[2]; // B
+        bmp.px[i * 4 + 1] = p[1]; // G
+        bmp.px[i * 4 + 2] = p[0]; // R
+        bmp.px[i * 4 + 3] = p[3]; // A
+    }
+    bmp_to_hicon(&bmp)
+}
+
 /// 位图 → HICON：32bpp 带 alpha 的颜色位图 + 全 0 的掩码（透明全交给 alpha）。
 ///
 /// 托盘图标要用：v0.9.33 的托盘是内嵌的 32×32 PNG，得转成 HICON 才能挂到

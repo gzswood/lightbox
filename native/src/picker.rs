@@ -493,7 +493,7 @@ fn create_window(height: i32, scale: f32, owner: HWND) -> Result<HWND, String> {
     }
 }
 
-/// 圆角：跟「圆角窗口」开关走。
+/// 圆角：跟「窗口圆角」开关走。
 ///
 /// 两种系统都靠 `SetWindowRgn` 硬裁（原因见 `settings::round_corners`：
 /// Win11 的 DWM 圆角只圆边框，客户区还是方的，四角会露白直角）。

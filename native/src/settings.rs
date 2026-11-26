@@ -3,24 +3,24 @@
 //! 所有改动先写进 `draft`，**点「应用」或「确定」才落盘**：
 //!  · 应用 = 保存并留在窗口里；
 //!  · 确定 = 保存并关闭；
-//!  · 取消 / 右上角 ✕ / Esc = 丢弃这次的全部改动。
-//! 只有「弹出窗口底色 / 圆角」这类能立刻看见的项在 draft 里做即时预览，
+//!  · 取消 / 右上角系统关闭按钮 / Esc = 丢弃这次的全部改动。
+//! 只有「弹出窗口底色」这类能立刻看见的项在 draft 里做即时预览，
 //! 长条和面板本身要等应用后才变。
+//!
+//! 窗口本体 = **系统的标题栏 + 自绘客户区**（用户 2026-11-26 定的）：
+//! 标题栏交给系统画（只有最小化和关闭，没有最大化），窗口名就是「设置面板」，
+//! 客户区里不再自己画标题和右上角的 ✕。这样最小化/关闭/拖动/贴边全是系统行为，
+//! 不用自己维护，外观也和各家的设置窗口一致。
 //!
 //! 为什么是普通窗口而不是分层窗口：分层窗口不能当子控件的父窗口
 //! （`UpdateLayeredWindow` 会把整个窗口内容换成位图，挂下面的 EDIT 一个像素
-//! 都看不见，实测过）。盒子名要支持中文输入就必须用真正的 EDIT，所以走
-//! 普通窗口：圆角靠 `SetWindowRgn` 裁区域（Win11 的 DWM 圆角只圆边框、
-//! 客户区仍是方的，四角会露白直角），阴影 DWM 自带。
+//! 都看不见，实测过）。盒子名要支持中文输入就必须用真正的 EDIT，所以走普通窗口。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
-};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
     DeleteObject, EndPaint, GetDC, IntersectClipRect, ReleaseDC,
@@ -29,22 +29,28 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HGDIOBJ, HFONT, InvalidateRect, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, KillTimer, LoadCursorW,
-    RegisterClassW, SendMessageW, SetCursor, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, IDC_ARROW, IDC_HAND,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetClientRect,
+    GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic,
+    LoadCursorW, RegisterClassW, SendMessageW, SetCursor,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, HICON, ICON_BIG, ICON_SMALL,
+    IDC_ARROW, IDC_HAND, SM_CXICON, SM_CXSMICON,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_RESTORE,
     SW_SHOW,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_DPICHANGED,
+    WM_ERASEBKGND,
     WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_SETTEXT,
-    WM_TIMER, WNDCLASSW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFONT, WM_SETICON,
+    WM_SETTEXT,
+    WM_SYSCOMMAND, SC_CLOSE,
+    WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP,
 };
 
 use crate::app::app;
@@ -62,11 +68,7 @@ const CLASS_NAME: &str = "LightBoxSettings";
 /// `EM_SETSEL`：输入框里全选，别处没引这个常量（要开 Win32_UI_Controls 特性）
 const EM_SETSEL: u32 = 0x00B1;
 
-/// 「已复制」提示的定时器 id（1.4 秒后把提示抹掉）
-const TIMER_COPIED: usize = 1;
-const COPIED_MS: u32 = 1400;
-
-/// 关于页信息行：标签 + 值。**点一下可以复制**（开源链接另有一个「打开」）
+/// 关于页开源链接：左边是按钮标签，右边是网址（点按钮直接用浏览器打开）
 const ABOUT_ROWS: [(&str, &str); 1] = [("开源链接", "https://gitee.com/gathon/lightbox")];
 
 /// 关于页标题下面的一句简介（不用加粗，整句常规字重）
@@ -81,15 +83,19 @@ fn dimmed() -> bool {
 }
 
 // —— 尺寸（设计单位 = 96 DPI 下的逻辑像素）——
+/// 客户区宽度
 const DW: f32 = 680.0;
-/// 顶部留白：相当于一条标题栏的高度。
+/// 客户区高度。标题栏换成系统的之后，这一块不再是「整窗高度」：
+/// 外层还要加上系统标题栏（见 `outer_size`）。
 ///
-/// 页头标题原来离窗口顶只有 8，紧贴着上沿显得憋屈；这里整页内容（品牌、
-/// 导航、页头、内容区）统一下移这么多，窗口高度同步加高同样的值 ——
-/// 内容区高度不变，所以「5 个盒子不滚动」这类阈值也不受影响。
-const DTOP: f32 = 30.0;
-const DH: f32 = 560.0 + DTOP;
-const DTITLE: f32 = 52.0;
+/// 560 = 旧版的 590 客户区减掉那 30 的自绘标题栏。这样内容区高度（420）和
+/// 旧版一致，「5 个盒子不滚动」这类阈值都不用重算。
+const DH: f32 = 560.0;
+/// 左侧导航距离客户区顶的留白。
+///
+/// 「设置面板」这几个字已经搬到系统标题栏上了（2026-11-26），侧栏顶部
+/// 不再需要留 52 的位置，导航直接贴着顶走。
+const DNAV_TOP: f32 = 14.0;
 const DSIDEBAR: f32 = 160.0;
 const DPAD: f32 = 22.0;
 const DFOOT: f32 = 60.0;
@@ -99,9 +105,9 @@ const DNAV: f32 = 42.0;
 const DROW_H: f32 = 42.0;
 const DBTN_W: f32 = 84.0;
 const DBTN_H: f32 = 34.0;
-/// 内容区起始 y。页头标题 8~36、副标题 36~54，这里只留 20 的间隙 ——
-/// 原来是 110/128 起步，中间空出一大块，看着很空。
-const DCONTENT_TOP: f32 = 74.0 + DTOP;
+/// 内容区起始 y。页头标题和左侧第一个导航项同高（14~50），
+/// 下面留 12 的呼吸空间就够 —— 之前的 74 让标题和内容之间空了一大块。
+const DCONTENT_TOP: f32 = 62.0;
 /// 内容区下边界：贴着页脚分隔线（页脚线在 DH - DFOOT），留 6 的余量
 const DCONTENT_GAP: f32 = 6.0;
 /// 列表下方「+」按钮：距最后一行 8、168×34、主色底白加号
@@ -122,7 +128,7 @@ const DSCROLL_W: f32 = 5.0;
 /// 5 个汉字约 55，两侧各留 16，视觉上不再顶到边。
 const DROWBTN_W: f32 = 88.0;
 /// 关于页「更新信息」文本框（只有查到新版本时才画），在检查更新按钮下方
-const DNOTES_TOP: f32 = 286.0;
+const DNOTES_TOP: f32 = 268.0;
 const DNOTES_BOTTOM: f32 = 490.0;
 const DNOTES_LINE: f32 = 18.0;
 
@@ -150,15 +156,6 @@ impl Tab {
     fn title(self) -> &'static str {
         self.label()
     }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Tab::Boxes => "调整顺序、名称、图标与主界面形态",
-            Tab::Look => "背景色、毛玻璃与圆角",
-            Tab::Features => "开机自启、置顶、诊断与存储位置",
-            Tab::About => "版本信息与开源项目",
-        }
-    }
 }
 
 /// 开关项
@@ -176,7 +173,6 @@ enum Setting {
 /// 可以点的区域
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
-    Close,
     Nav(Tab),
     BoxRow(usize),
     BoxIcon(usize),
@@ -198,10 +194,8 @@ enum Hit {
     OpenDir,
     CheckUpdate,
     Download,
-    /// 关于页信息行（开源链接）：点一下复制
-    CopyInfo(usize),
-    /// 关于页「开源链接」右边的「打开」按钮（用系统浏览器打开 Gitee 仓库）
-    Link,
+    /// 关于页的开源链接：点一下用系统浏览器打开
+    OpenLink,
     Apply,
     Cancel,
     Ok,
@@ -238,9 +232,8 @@ fn content_shift(tab: Tab, scale: f32) -> i32 {
         // 功能页第一项是开关行，标题画在命中区上方 14 处，
         // 所以要让「命中区顶 128」落到 DCONTENT_TOP + 14，标题才贴着内容区顶。
         Tab::Features => r(DCONTENT_TOP) + r(14.0) - r(128.0),
-        // 关于页整页用的是绝对坐标（72 / 112 / 166…），窗口顶部多留出来的
-        // 那条空白只能靠整体平移补上，否则内容会顶到标题上面去。
-        Tab::About => r(DTOP),
+        // 关于页整页用的是绝对坐标（72 / 104 / 166…），第一行正好落到内容区顶
+        Tab::About => r(DCONTENT_TOP) - r(72.0),
         _ => 0,
     }
 }
@@ -299,10 +292,10 @@ struct Settings {
     edit: Option<HWND>,
     /// 正在改名字的盒子 id
     editing: Option<String>,
-    /// 关于页刚复制了第几行（显示「已复制」提示，1.4 秒后自动消掉）
-    copied: Option<usize>,
     brush: Option<HBRUSH>,
     font: Option<HFONT>,
+    /// 自己造的窗口图标（标题栏那两枚 HICON），换掉时要 DestroyIcon
+    icons: Vec<HICON>,
 }
 
 static STATE: OnceLock<Mutex<Settings>> = OnceLock::new();
@@ -327,9 +320,9 @@ fn state() -> &'static Mutex<Settings> {
             drag_win: None,
             edit: None,
             editing: None,
-            copied: None,
             brush: None,
             font: None,
+            icons: Vec::new(),
         })
     })
 }
@@ -359,8 +352,16 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
     if is_open() {
         // 切页前先把输入框里没提交的内容收掉，别让 EDIT 留在别的页上
         commit_inline_edit();
+        // 窗口被最小化了：先把它放回来。这时候「再点一次就收起」不成立 ——
+        // 用户看不见窗口，点托盘只会觉得「点了没反应」。
+        let minimized = state()
+            .lock()
+            .unwrap()
+            .hwnd
+            .map(|h| unsafe { IsIconic(h).as_bool() })
+            .unwrap_or(false);
         // 托盘「设置…」的「再点一次就收起」语义只留给原来的 open(None)
-        if box_id.is_none() && want_tab == Tab::Boxes {
+        if !minimized && box_id.is_none() && want_tab == Tab::Boxes {
             close();
             return;
         }
@@ -380,7 +381,11 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
         let hwnd = state().lock().unwrap().hwnd;
         if let Some(h) = hwnd {
             unsafe {
-                let _ = ShowWindow(h, SW_SHOW);
+                if minimized {
+                    let _ = ShowWindow(h, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(h, SW_SHOW);
+                }
                 let _ = SetFocus(Some(h));
             }
         }
@@ -431,10 +436,7 @@ fn open_inner(box_id: Option<&str>, want_tab: Tab) {
     refresh_edit_brush();
     let edit = create_edit(hwnd, scale);
     state().lock().unwrap().edit = Some(edit);
-    refresh_round();
     position(hwnd);
-    // 摆好位置之后再裁一次圆角：窗口落到鼠标那颗屏上，DPI 才定下来
-    refresh_round();
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetFocus(Some(hwnd));
@@ -598,19 +600,8 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
     let mut rows: Vec<RECT> = Vec::new();
     let mut scrollbar: Option<(RECT, RECT)> = None;
 
-    // 关闭按钮
-    hits.push((
-        Hit::Close,
-        RECT {
-            left: w - r(46.0),
-            top: r(6.0) + r(DTOP),
-            right: w - r(6.0),
-            bottom: r(42.0) + r(DTOP),
-        },
-    ));
-
-    // 左侧导航
-    let mut ny = r(DTITLE) + r(10.0) + r(DTOP);
+    // 左侧导航（窗口关闭交给系统标题栏的 ✕，不再自己画一个）
+    let mut ny = r(DNAV_TOP);
     for t in TABS {
         hits.push((
             Hit::Nav(t),
@@ -865,43 +856,32 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                 Hit::OpenDir,
                 RECT {
                     left: cr - r(80.0),
-                    top: r(284.0),
+                    // 和「存储位置」标签同一行居中：标签 y=272、高 22，中心 283；
+                    // 按钮高 30，所以顶边 268（原来 258，随标签一起下移 10）。
+                    top: r(268.0),
                     right: cr,
-                    bottom: r(314.0),
+                    bottom: r(298.0),
                 },
             ));
         }
         Tab::About => {
-            // 信息行都可以点一下复制：整行都是命中区
-            for i in 0..ABOUT_ROWS.len() {
-                let y = r(184.0) + i as i32 * r(34.0);
-                hits.push((
-                    Hit::CopyInfo(i),
-                    RECT {
-                        left: cx,
-                        top: y,
-                        right: cr,
-                        bottom: y + r(26.0),
-                    },
-                ));
-            }
-            // 「打开」压在这一行右侧：命中测试从后往前找，这一小块盖过整行
+            // 「开源链接」和「检查更新」两个按钮同款同宽、上下对齐
             hits.push((
-                Hit::Link,
+                Hit::OpenLink,
                 RECT {
-                    left: cr - r(62.0),
-                    top: r(181.0),
-                    right: cr,
-                    bottom: r(207.0),
+                    left: cx,
+                    top: r(166.0),
+                    right: cx + r(112.0),
+                    bottom: r(200.0),
                 },
             ));
             hits.push((
                 Hit::CheckUpdate,
                 RECT {
                     left: cx,
-                    top: r(240.0),
+                    top: r(222.0),
                     right: cx + r(112.0),
-                    bottom: r(274.0),
+                    bottom: r(256.0),
                 },
             ));
             if has_update {
@@ -909,9 +889,9 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
                     Hit::Download,
                     RECT {
                         left: cx + r(120.0),
-                        top: r(240.0),
+                        top: r(222.0),
                         right: cx + r(232.0),
-                        bottom: r(274.0),
+                        bottom: r(256.0),
                     },
                 ));
             }
@@ -926,12 +906,9 @@ fn layout(scale: f32, tab: Tab, box_count: usize, page: i32, has_update: bool) -
 }
 
 /// 不随内容平移、也不受内容区上下边界限制的命中区：
-/// 侧栏、关闭按钮、页脚「应用 / 取消 / 确定」都是窗口固定件，画在原始坐标上。
+/// 侧栏、页脚「应用 / 取消 / 确定」都是窗口固定件，画在原始坐标上。
 fn pinned_hit(h: &Hit) -> bool {
-    matches!(
-        h,
-        Hit::Close | Hit::Nav(_) | Hit::Apply | Hit::Cancel | Hit::Ok
-    )
+    matches!(h, Hit::Nav(_) | Hit::Apply | Hit::Cancel | Hit::Ok)
 }
 
 /// 鼠标在某点落在哪个可点区域（从后往前找 = 小块优先于整行）
@@ -1068,26 +1045,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        WM_TIMER => {
-            // 「已复制」提示到点就抹掉
-            if wp.0 == TIMER_COPIED {
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), TIMER_COPIED);
-                }
-                state().lock().unwrap().copied = None;
-                repaint();
-            }
-            LRESULT(0)
-        }
         WM_DPICHANGED => {
             // 窗口被拖到另一颗不同缩放的显示器上。系统只给一个「建议矩形」，
             // 不会替我们重排：必须按新比例把窗口尺寸重新算一遍，否则内容
             // 按新 scale 画进按旧 scale 开的窗口里 —— 100%→125% 时右侧和底部
-            // 被裁（关闭按钮、应用/取消/确定看不见），反过来则留一大片空白。
+            // 被裁（应用/取消/确定看不见），反过来则留一大片空白。
             let suggested = unsafe { *(lp.0 as *const RECT) };
             let scale = (wp.0 & 0xffff) as u32 as f32 / 96.0;
-            let w = (DW * scale).round() as i32;
-            let h = (DH * scale).round() as i32;
+            // 外层尺寸（客户区 + 新缩放下的系统标题栏）
+            let (w, h) = outer_size(scale);
             // 改名输入框是按旧比例摆的，先提交再重排，免得留一个字号和位置
             // 都对不上的浮窗；输入框的字体也一并按新比例重造
             commit_inline_edit();
@@ -1103,14 +1069,39 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            // 圆角区域按新尺寸重裁（别用 refresh_round：WM_DPICHANGED 里
-            // GetDpiForWindow 未必已经是新值，这里直接用手上的 scale）
-            round_corners(hwnd, w, h);
+            // 标题栏高度是按 DPI 算的，个别缩放比会有 1 像素偏差，实测补一下
+            fit_client(hwnd, scale);
+            // 标题栏图标也要按新 DPI 重出：16px 的图被系统拉到 20px 会发虚
+            apply_window_icon(hwnd);
             repaint();
             LRESULT(0)
         }
+        WM_SYSCOMMAND => {
+            // 系统标题栏的「关闭」：走自己的 close()，把画笔 / 字体 / 调色板
+            // 一并收干净（DefWindowProc 那条路只会 DestroyWindow，资源全靠
+            // WM_DESTROY 兜，容易漏）
+            if (wp.0 & 0xfff0) as u32 == SC_CLOSE {
+                close();
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_CLOSE => {
+            close();
+            LRESULT(0)
+        }
         WM_DESTROY => {
-            state().lock().unwrap().hwnd = None;
+            let icons = {
+                let mut s = state().lock().unwrap();
+                s.hwnd = None;
+                std::mem::take(&mut s.icons)
+            };
+            // 自己造的窗口图标，窗口没了就得自己销毁
+            unsafe {
+                for h in icons {
+                    let _ = DestroyIcon(h);
+                }
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -1125,6 +1116,116 @@ fn y_of(lp: LPARAM) -> i32 {
     ((lp.0 >> 16) & 0xffff) as i16 as i32
 }
 
+/// 设置窗口的样式：系统的标题栏 + 只有最小化 / 关闭。
+///
+///  · `WS_CAPTION` / `WS_SYSMENU`：让系统画标题栏和左上角的系统菜单；
+///  · `WS_MINIMIZEBOX`：留最小化按钮；
+///  · 不给 `WS_MAXIMIZEBOX`、也不给 `WS_THICKFRAME`：设置页是固定尺寸，
+///    最大化按钮和可拖拽的边框都不该有 —— 正好就是「最小化 + 关闭」两个按钮；
+///  · `WS_CLIPCHILDREN`：别让父窗口的绘制盖住子控件（名字输入框），
+///    双缓冲贴整张位图时会把 EDIT 一起擦掉，输入框就会一闪一闪。
+const WIN_STYLE: WINDOW_STYLE =
+    WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
+
+/// 窗口本体（含系统标题栏和边框）的尺寸。
+///
+/// 客户区必须正好是 `DW × DH`：所有布局都按客户区算尺寸，差一条标题栏
+/// 就会出现「内容被裁掉一条」或者「底部多出一条空白」。
+/// 用 `AdjustWindowRectExForDpi` 按窗口所在显示器的缩放算边框，别用
+/// 不带 DPI 的版本（它按系统 DPI 算，125% 屏上会算少几像素）。
+fn outer_size(scale: f32) -> (i32, i32) {
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: (DW * scale).round() as i32,
+        bottom: (DH * scale).round() as i32,
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(
+            &mut rc,
+            WIN_STYLE,
+            false,
+            WINDOW_EX_STYLE(WS_EX_TOPMOST.0),
+            (96.0 * scale).round() as u32,
+        );
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
+
+/// 把外层尺寸校正到「客户区正好 DW × DH」。
+///
+/// `AdjustWindowRectExForDpi` 在个别缩放比上会差 1 像素（它自己四舍五入），
+/// 而差这一点点就会让页脚按钮被裁掉半行 —— 所以建完窗再实测一次、把差额补上。
+fn fit_client(hwnd: HWND, scale: f32) {
+    let mut rc = RECT::default();
+    let mut wrc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+        let _ = GetWindowRect(hwnd, &mut wrc);
+    }
+    let dw = (DW * scale).round() as i32;
+    let dh = (DH * scale).round() as i32;
+    let dcw = dw - (rc.right - rc.left);
+    let dch = dh - (rc.bottom - rc.top);
+    if dcw == 0 && dch == 0 {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            (wrc.right - wrc.left) + dcw,
+            (wrc.bottom - wrc.top) + dch,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 标题栏 / Alt+Tab 用的窗口图标：直接借托盘那枚 PNG（和托盘图标保持同一个图）。
+///
+/// 不设的话系统会拿 exe 资源里第一个图标（圆角方块 + 白色方框），
+/// 和托盘上那枚蓝底盒子不是一张图，看着像两个程序。
+/// 尺寸按窗口 DPI 取 `SM_CXSMICON` / `SM_CXICON`，换屏（WM_DPICHANGED）后重设一次。
+fn apply_window_icon(hwnd: HWND) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        let dpi = if dpi == 0 { (96.0 * display_scale()).round() as u32 } else { dpi };
+        let small = GetSystemMetricsForDpi(SM_CXSMICON, dpi).max(16);
+        let big = GetSystemMetricsForDpi(SM_CXICON, dpi).max(32);
+        let mut made: Vec<HICON> = Vec::new();
+        for (which, size) in [(ICON_SMALL, small), (ICON_BIG, big)] {
+            if let Some(h) = crate::icons::png_to_hicon(crate::tray::ICON_PNG, size) {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(which as usize)),
+                    Some(LPARAM(h.0 as isize)),
+                );
+                made.push(h);
+            }
+        }
+        if made.is_empty() {
+            return;
+        }
+        // 换下来的旧图标是我们自己造的，必须自己销毁（系统不会管）
+        let old = std::mem::replace(&mut state().lock().unwrap().icons, made);
+        for h in old {
+            let _ = DestroyIcon(h);
+        }
+    }
+}
+
+/// 页头标题的（top, height）。
+///
+/// 和左侧第一个导航项用同一组值（`DNAV_TOP` / `DNAV - 6`）：两边字号一样、
+/// 矩形一样，文字中心线自然齐平，左栏第一项和右侧标题看着是一条线。
+fn title_box(scale: f32) -> (i32, i32) {
+    let r = |v: f32| (v * scale).round() as i32;
+    (r(DNAV_TOP), r(DNAV) - r(6.0))
+}
+
 fn create_window(scale: f32) -> Result<HWND, String> {
     unsafe {
         let hinstance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
@@ -1137,15 +1238,18 @@ fn create_window(scale: f32) -> Result<HWND, String> {
         };
         RegisterClassW(&wc);
         let owner = app().hwnd.lock().unwrap().unwrap_or_default();
-        let w = (DW * scale).round() as i32;
-        let h = (DH * scale).round() as i32;
+        let (w, h) = outer_size(scale);
+        // 标题栏上的字就是窗口名 —— 「设置面板」原来画在客户区左上角，
+        // 现在交给系统标题栏显示（2026-11-26）
+        let title = wide("设置面板");
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            // 不要 WS_EX_TOOLWINDOW：它会换成细窄的工具窗标题栏，
+            // 和普通设置窗口长得不一样。owner 是托盘那个隐藏窗口，
+            // 所以照样不会在任务栏 / Alt+Tab 里出现。
+            WS_EX_TOPMOST,
             windows::core::PCWSTR(cls.as_ptr()),
-            windows::core::PCWSTR::null(),
-            // WS_CLIPCHILDREN：别让父窗口的绘制盖住子控件（名字输入框）——
-            // 双缓冲贴整张位图时会把 EDIT 一起擦掉，输入框就会一闪一闪
-            WS_POPUP | WS_CLIPCHILDREN,
+            windows::core::PCWSTR(title.as_ptr()),
+            WIN_STYLE,
             0,
             0,
             w,
@@ -1156,61 +1260,10 @@ fn create_window(scale: f32) -> Result<HWND, String> {
             None,
         )
         .map_err(|e| e.to_string())?;
-        round_corners(hwnd, w, h);
+        fit_client(hwnd, scale);
+        apply_window_icon(hwnd);
         Ok(hwnd)
     }
-}
-
-/// 窗口圆角半径（设计单位 8，按当前缩放取整）。
-///
-/// 裁区（`SetWindowRgn`）和自绘描边必须用**同一个**半径：两边差一像素，
-/// 描边就会跑出裁区被切掉半条，或者和裁区错开一像素 —— 看着就是「圆角
-/// 边缘毛毛的」。早先一个写死 8、一个写死 10，正是那个毛病。
-fn corner_radius(scale: f32) -> i32 {
-    (8.0 * scale).round().max(4.0) as i32
-}
-
-/// 圆角：跟 draft 里的「圆角窗口」开关走，**两种系统都靠 `SetWindowRgn` 硬裁**。
-///
-/// Win11 的 DWM 圆角（`DWMWA_WINDOW_CORNER_PREFERENCE = ROUND`）只圆了它自己
-/// 那 1px 边框，客户区还是方的 —— 我们这个窗口整块是不透明自绘，四角就会露出
-/// 「白直角 + 里面一条圆角细线」（Win11 虚拟机里一眼能看到）。所以情愿用区域
-/// 硬裁（1 像素台阶，和 Win10 那套一样），形状至少是真的圆角。
-/// 相应的 DWM 圆角要显式关掉，否则两层圆角叠在一起会多出一条错位的边。
-fn round_corners(hwnd: HWND, w: i32, h: i32) {
-    let radius = state().lock().unwrap().draft.panel_radius;
-    let r = corner_radius(display_scale());
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &DWMWCP_DONOTROUND as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<i32>() as u32,
-        );
-        // 先把上一次的区域清掉，再按开关决定要不要圆角
-        let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
-        if radius {
-            let region = windows::Win32::Graphics::Gdi::CreateRoundRectRgn(
-                0,
-                0,
-                w + 1,
-                h + 1,
-                r * 2,
-                r * 2,
-            );
-            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(region), true);
-        }
-    }
-}
-
-/// 自己的圆角跟着 draft 走（预览）
-fn refresh_round() {
-    let hwnd = state().lock().unwrap().hwnd;
-    let Some(hwnd) = hwnd else { return };
-    let scale = display_scale();
-    let w = (DW * scale).round() as i32;
-    let h = (DH * scale).round() as i32;
-    round_corners(hwnd, w, h);
 }
 
 /// 换显示器后把输入框的字号换成新比例。
@@ -1314,8 +1367,8 @@ fn position(hwnd: HWND) {
     let mon = geom::work_area_at(pt.x, pt.y);
     let scale = mon.scale as f32 / 96.0;
     let r = |v: f32| (v * scale).round() as i32;
-    let w = r(DW);
-    let h = r(DH);
+    // 传的是**外层**尺寸（含系统标题栏）：SetWindowPos 要的是整窗宽高
+    let (w, h) = outer_size(scale);
     let min_x = mon.work.left + r(12.0);
     let min_y = mon.work.top + r(12.0);
     let max_x = (mon.work.right - w - r(12.0)).max(min_x);
@@ -1406,30 +1459,7 @@ fn paint(hwnd: HWND) {
         g.fill_rect(0, 0, cw, ch, bg);
         let sidebar = theme::mix(bg, col.fg, 0.045);
         g.fill_rect(0, 0, c.sx, ch, sidebar);
-        let brand = "LightBox";
-        g.font(r(14.0), true);
-        let brand_w = g.text_w(brand);
-        g.text(
-            r(20.0),
-            r(10.0) + r(DTOP),
-            c.sx - r(40.0),
-            r(30.0),
-            brand,
-            col.fg,
-            Align::Left,
-        );
-        // 版本号：贴着品牌名右侧一小段浅灰小字（排障时一眼看出装的是哪版）
-        g.font(r(11.0), false);
-        let vx = r(20.0) + brand_w + r(7.0);
-        g.text(
-            vx,
-            r(10.0) + r(DTOP),
-            c.sx - vx - r(8.0),
-            r(30.0),
-            &format!("v{}", env!("CARGO_PKG_VERSION")),
-            col.fg,
-            Align::Left,
-        );
+        // 侧栏顶部只剩一点留白：标题「设置面板」在系统标题栏上（见模块注释）
         for t in TABS {
             let Some(nr) = hit_rect(&lay, Hit::Nav(t)) else { continue };
             let active = t == tab;
@@ -1467,51 +1497,13 @@ fn paint(hwnd: HWND) {
         g.fill_rect(c.sx - 1, 0, 1, ch, col.line);
 
         // —— 页头 ——
-        let title_w = cw - c.cx - r(50.0);
-        g.font(r(17.0), true);
-        g.text(
-            c.cx,
-            r(8.0) + r(DTOP),
-            title_w,
-            r(28.0),
-            tab.title(),
-            col.fg,
-            Align::Left,
-        );
-        g.font(r(11.0), false);
-        g.text(
-            c.cx,
-            r(36.0) + r(DTOP),
-            title_w,
-            r(18.0),
-            tab.subtitle(),
-            col.muted,
-            Align::Left,
-        );
-
-        // —— 关闭按钮 ——
-        if let Some(cr) = hit_rect(&lay, Hit::Close) {
-            if hover == Some(Hit::Close) {
-                g.fill_round_aa(
-                    cr.left,
-                    cr.top,
-                    cr.right - cr.left,
-                    cr.bottom - cr.top,
-                    r(6.0),
-                    theme::mix(bg, col.fg, 0.14),
-                );
-            }
-            g.font(r(14.0), false);
-            g.text(
-                cr.left,
-                cr.top,
-                cr.right - cr.left,
-                cr.bottom - cr.top,
-                "✕",
-                col.fg,
-                Align::Center,
-            );
-        }
+        // 右上角不再自己画 ✕（系统标题栏自带），标题可以一直用到右边距。
+        // 字号和左侧导航项一样是 12（保留粗体），矩形也跟第一个导航项同高，
+        // 两边的文字中心线因此齐平。
+        let title_w = cw - c.cx - r(DPAD);
+        let (ty, th) = title_box(scale);
+        g.font(r(12.0), true);
+        g.text(c.cx, ty, title_w, th, tab.title(), col.fg, Align::Left);
 
         // —— 当前页 ——
         // 内容区裁剪：收纳盒页是整页滚动的，滚出去的半行不能画到页头 / 页脚上。
@@ -1564,18 +1556,6 @@ fn paint(hwnd: HWND) {
                 draw_button(&mut g, &c, &col, rect, label, kind, hover == Some(hit));
             }
         }
-
-        // 防撞色描边：设置页和弹窗底色相同，叠在一起分不清前后。
-        //
-        // 这一圈是**以裁区边界为中线**画的（内外各半个像素），外半边被
-        // `SetWindowRgn` 的硬裁切掉了，留在窗口里的是一条半调的软边 ——
-        // 硬裁出来的 1 像素台阶因此被压掉一大半，不至于一眼看到一格一格的。
-        let edge_rad = if draft.panel_radius {
-            corner_radius(scale)
-        } else {
-            0
-        };
-        g.stroke_round_edge_aa(0, 0, cw, ch, edge_rad, theme::mix(bg, col.fg, 0.32), 1);
 
         // 一次性贴到窗口：用户只看到画完的一帧，中间态不会露出来
         drop(g);
@@ -1941,7 +1921,7 @@ fn paint_look(
         lay,
         col,
         Hit::Switch(Setting::Radius),
-        "圆角窗口",
+        "窗口圆角",
         draft.panel_radius,
     );
 }
@@ -1985,23 +1965,21 @@ fn paint_features(
         draft.diagnostics,
     );
 
-    // 存储位置
-    g.font(r(12.0), false);
-    g.text(
-        c.cx,
-        r(262.0),
-        r(200.0),
-        r(22.0),
-        "存储位置",
-        col.fg,
-        Align::Left,
-    );
+    // 存储位置：标签与上面的开关行同款（12px 常规），路径紧跟其后，按钮在右端同一行
     let btn = hit_rect(lay, Hit::OpenDir).unwrap_or_default();
-    let pw = (btn.left - c.cx - r(10.0)).max(r(60.0));
+    // 各行开关中心：139 / 187 / 235，下一行应为 283，所以标签顶边 272（行高 22）。
+    let row_y = r(272.0);
+    let row_h = r(22.0);
+    g.font(r(12.0), false);
+    g.text(c.cx, row_y, r(200.0), row_h, "存储位置", col.fg, Align::Left);
+    let label_w = g.text_w("存储位置");
+    let gap = r(12.0);
+    let path_x = c.cx + label_w + gap;
+    let pw = (btn.left - path_x - r(10.0)).max(r(60.0));
     let dir = config::root_dir().display().to_string();
     g.font(r(11.0), false);
     let shown = ui::ellipsize(&dir, pw, |s| g.text_w(s));
-    g.text(c.cx, r(288.0), pw, r(22.0), &shown, col.muted, Align::Left);
+    g.text(path_x, row_y, pw, row_h, &shown, col.muted, Align::Left);
     if let Some(rect) = hit_rect(lay, Hit::OpenDir) {
         draw_button(g, c, col, rect, "打开目录", 1, hover == Some(Hit::OpenDir));
     }
@@ -2018,18 +1996,23 @@ fn paint_about(
 ) {
     let r = |v: f32| c.r(v);
 
-    // 和页头那行「关于」同号（17px 粗体）：原来 26px 比页标题大一圈，看着突兀
+    // 和页头那行「关于」同号（17px 粗体）；版本号紧跟在后面，用简介那号的常规字。
+    // 两个字号拼一行：先画大字量出宽度，再偏移一点画小字，竖向错开 5 让基线对齐。
     g.font(r(17.0), true);
+    g.text(c.cx, r(72.0), c.cr - c.cx, r(30.0), "LightBox", col.fg, Align::Left);
+    let name_w = g.text_w("LightBox");
+    let ver_x = c.cx + name_w + r(12.0);
+    g.font(r(12.0), false);
     g.text(
-        c.cx,
-        r(72.0),
-        c.cr - c.cx,
-        r(30.0),
-        "LightBox",
-        col.fg,
+        ver_x,
+        r(77.0),
+        (c.cr - ver_x).max(r(40.0)),
+        r(20.0),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
+        col.muted,
         Align::Left,
     );
-    // 一句简介：整句常规字重，一行放得下（标题那行已经是大号粗体 LightBox）
+    // 一句简介：整句常规字重，一行放得下
     g.font(r(12.0), false);
     g.text(
         c.cx,
@@ -2041,62 +2024,38 @@ fn paint_about(
         Align::Left,
     );
 
-    g.font(r(12.0), false);
+    // 网址和更新状态共用同一列起点：没有新版本时状态是「已是最新版本」，
+    // 两行文字因此上下对齐。按钮也同款同宽（见 layout 里的命中区）。
+    let tx = c.cx + r(120.0);
+    let tw = (c.cr - tx).max(r(40.0));
+    if let Some(rect) = hit_rect(lay, Hit::OpenLink) {
+        draw_button(
+            g,
+            c,
+            col,
+            rect,
+            "开源链接",
+            1,
+            hover == Some(Hit::OpenLink),
+        );
+    }
+    let hot = hover == Some(Hit::OpenLink);
+    g.font(r(12.0), true);
+    let shown_url = ui::ellipsize(ABOUT_ROWS[0].1, tw, |s| g.text_w(s));
     g.text(
-        c.cx,
-        r(134.0),
-        c.cr - c.cx,
-        r(20.0),
-        &format!("版本 v{}", env!("CARGO_PKG_VERSION")),
-        col.muted,
+        tx,
+        r(166.0),
+        tw,
+        r(34.0),
+        &shown_url,
+        if hot {
+            theme::mix(col.accent, col.fg, 0.2)
+        } else {
+            col.accent
+        },
         Align::Left,
     );
-    g.hline(c.cx, c.cr, r(164.0), col.line);
 
-    // 一行信息可以点一下复制（开源链接），
-    // 悬停变强调色、复制后右侧冒出「已复制」。右侧另有「打开」按钮。
-    let copied = state().lock().unwrap().copied;
-    for (i, (label, value)) in ABOUT_ROWS.iter().enumerate() {
-        let y = r(184.0) + i as i32 * r(34.0);
-        // 现在只剩「开源链接」这一行，值用强调色 + 粗体，当链接看
-        let is_link = i == 0;
-        let hot = hover == Some(Hit::CopyInfo(i));
-        g.font(r(12.0), false);
-        g.text(c.cx, y, r(90.0), r(24.0), label, col.muted, Align::Left);
-
-        // 右侧留给「打开」按钮，文字宽度要收一收
-        let right = if is_link { c.cr - r(70.0) } else { c.cr };
-        let vw = (right - (c.cx + r(96.0))).max(r(40.0));
-        g.font(r(12.0), is_link);
-        let color = if hot {
-            theme::mix(col.accent, col.fg, 0.2)
-        } else if is_link {
-            col.accent
-        } else {
-            col.fg
-        };
-        g.text(c.cx + r(96.0), y, vw, r(24.0), value, color, Align::Left);
-
-        // 「已复制」提示紧跟文字右侧，1.4 秒后自动消失
-        if copied == Some(i) {
-            let tw = g.text_w(value).min(vw);
-            g.font(r(11.0), false);
-            g.text(
-                c.cx + r(96.0) + tw + r(8.0),
-                y,
-                r(64.0),
-                r(24.0),
-                "已复制",
-                col.accent,
-                Align::Left,
-            );
-        }
-    }
-    if let Some(rect) = hit_rect(lay, Hit::Link) {
-        draw_button(g, c, col, rect, "打开", 1, hover == Some(Hit::Link));
-    }
-
-    // 「检查更新」和上面的开源链接之间靠留白分层就够
     if let Some(rect) = hit_rect(lay, Hit::CheckUpdate) {
         draw_button(
             g,
@@ -2117,14 +2076,14 @@ fn paint_about(
     let stx = if has_update {
         c.cx + r(244.0)
     } else {
-        c.cx + r(120.0)
+        tx
     };
     let sw = (c.cr - stx).max(r(40.0));
-    let shown = ui::ellipsize(&status, sw, |s| g.text_w(s));
     g.font(r(11.0), false);
+    let shown = ui::ellipsize(&status, sw, |s| g.text_w(s));
     g.text(
         stx,
-        r(240.0),
+        r(222.0),
         sw,
         r(34.0),
         &shown,
@@ -2572,16 +2531,12 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
     // 点别处 = 结束改名 / 字体输入（没在编辑时是空操作）
     commit_inline_edit();
     let Some(hit) = hit_at(x, y, scale) else {
-        // 顶栏 / 左栏空白：拖窗口
-        if y < (DTITLE * scale).round() as i32 || x < (DSIDEBAR * scale).round() as i32 {
+        // 左栏空白处还能拖窗口（标题栏已经能拖了，这儿只是顺手）
+        if x < (DSIDEBAR * scale).round() as i32 {
             start_window_drag(hwnd);
         }
         return;
     };
-    if hit == Hit::Close {
-        close();
-        return;
-    }
     if !clickable(hit) {
         return;
     }
@@ -2637,20 +2592,9 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::CheckUpdate => crate::updater::check(false),
         Hit::Download => open_download_page(),
-        Hit::CopyInfo(i) => {
-            // 点一下就把这一行的值放进剪贴板，顺手在右侧亮 1.4 秒「已复制」
-            if let Some((_, value)) = ABOUT_ROWS.get(i) {
-                if crate::util::copy_text(value) {
-                    state().lock().unwrap().copied = Some(i);
-                    repaint();
-                    unsafe {
-                        let _ = SetTimer(Some(hwnd), TIMER_COPIED, COPIED_MS, None);
-                    }
-                }
-            }
-        }
-        Hit::Link => {
-            let _ = desktop::shell_open("https://gitee.com/gathon/lightbox");
+        Hit::OpenLink => {
+            // 点链接直接用系统浏览器打开仓库
+            let _ = desktop::shell_open(ABOUT_ROWS[0].1);
         }
         Hit::Apply => {
             if dirty() {
@@ -2662,7 +2606,6 @@ fn on_mouse_down(hwnd: HWND, x: i32, y: i32) {
             apply_changes();
             close();
         }
-        Hit::Close => {}
     }
 }
 
@@ -3072,9 +3015,6 @@ fn toggle_switch(s: Setting) {
             Setting::Diagnostics => st.draft.diagnostics = !st.draft.diagnostics,
         }
     }
-    if s == Setting::Radius {
-        refresh_round();
-    }
     repaint();
 }
 
@@ -3276,7 +3216,6 @@ fn apply_changes() {
     crate::panel::apply_theme();
     crate::panel::reload();
     refresh_edit_brush();
-    refresh_round();
     repaint();
 }
 
@@ -3298,6 +3237,18 @@ mod tests {
 
     fn hit(lay: &Layout, h: Hit) -> RECT {
         hit_rect(lay, h).expect("命中区应该存在")
+    }
+
+    /// 页头标题和左侧第一个导航项同高同 y（字号都 12，标题保留粗体）
+    #[test]
+    fn 页头标题与第一个导航项齐平() {
+        let lay = layout(1.0, Tab::Boxes, 1, 0, false);
+        let nav = hit(&lay, Hit::Nav(Tab::Boxes));
+        let (ty, th) = title_box(1.0);
+        assert_eq!(ty, nav.top);
+        assert_eq!(th, nav.bottom - nav.top);
+        // 内容区顶离标题下沿只留 12
+        assert_eq!(DCONTENT_TOP as i32 - (ty + th), 12);
     }
 
     /// 内容区顶到页头副标题下面 20 —— 原来空了一大块
@@ -3359,15 +3310,14 @@ mod tests {
             DCONTENT_TOP as i32
         );
         assert_eq!(content_shift(Tab::Boxes, 1.0), 0);
-        // 关于页整页用绝对坐标，靠同量的平移补上顶部留白
-        assert_eq!(content_shift(Tab::About, 1.0), DTOP as i32);
+        // 关于页整页用绝对坐标（72 起），平移到内容区顶（DCONTENT_TOP）
+        assert_eq!(content_shift(Tab::About, 1.0) + 72, DCONTENT_TOP as i32);
     }
 
-    /// 窗口固定件（侧栏 / 关闭 / 页脚三个按钮）不跟内容平移，也不吃内容区裁剪
+    /// 窗口固定件（侧栏 / 页脚三个按钮）不跟内容平移，也不吃内容区裁剪
     #[test]
     fn 侧栏与页脚是固定件() {
         for h in [
-            Hit::Close,
             Hit::Nav(Tab::Boxes),
             Hit::Nav(Tab::Look),
             Hit::Apply,
@@ -3416,3 +3366,5 @@ mod tests {
         }
     }
 }
+
+

@@ -20,8 +20,8 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetAncestor, GetWindowRect, SetParent, SetWindowLongPtrW,
-    GA_PARENT, GWLP_HWNDPARENT,
+    FindWindowExW, FindWindowW, GetAncestor, GetWindow, GetWindowRect, SetParent, SetWindowLongPtrW,
+    GA_PARENT, GWLP_HWNDPARENT, GW_OWNER,
 };
 
 use crate::util::wide;
@@ -215,12 +215,30 @@ pub fn client_origin() -> Option<POINT> {
     Some(p)
 }
 
+/// 长条现在是不是任务栏的**子窗口**（Win10 的挂法）。
+///
+/// 定位要用它决定坐标系：子窗口的 `SetWindowPos` 是相对任务栏客户区的。
+/// 不能拿「刚才 pin 返回了什么」代替 —— 过渡期里 pin 会被跳过，窗口却还是
+/// 老老实实挂在任务栏下面，两者不是一回事。
+pub fn is_child_of_taskbar(hwnd: HWND) -> bool {
+    let Some(tb) = taskbar() else {
+        return false;
+    };
+    unsafe { GetAncestor(hwnd, GA_PARENT) == tb }
+}
+
 /// 把窗口挂进任务栏。
 ///
 /// Win10：真嵌入（`SetParent` 成 `Shell_TrayWnd` 的子窗口）。
 /// Win11：贴条 —— 顶层窗口 + 任务栏当 owner + 置顶。
 ///
 /// 返回 false 表示这条路走不通（调用方该退回「浮在桌面上」）。
+///
+/// **已经挂好就直接返回，不再动手**。这两个动作都是跨进程的同步调用
+/// （`SetParent` 要外壳那条线程配合，改 owner 也一样），而长条每秒都在重排 ——
+/// 之前每次重排都无条件调一遍，等于每秒朝任务栏线程戳一下。切屏 / 插拔显示器
+/// 那几秒外壳正忙着重新排布任务栏，这一戳就成了两边互等，表现是**主界面卡死**
+/// （鼠标点不动、托盘菜单也弹不出来）。所以先查现状，只有真的挂错了才改。
 pub fn pin(hwnd: HWND) -> bool {
     let Some(tb) = taskbar() else {
         return false;
@@ -231,10 +249,17 @@ pub fn pin(hwnd: HWND) -> bool {
             if GetAncestor(hwnd, GA_PARENT) == tb {
                 let _ = SetParent(hwnd, None);
             }
+            // 已经是任务栏的 owned 窗口了 → 什么都不用做
+            if is_owned_by(hwnd, tb) {
+                return true;
+            }
             // 关键一步：把任务栏设成贴条的 **owner**（不是 parent）。
             SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, tb.0 as isize);
-            true
+            is_owned_by(hwnd, tb)
         } else {
+            if GetAncestor(hwnd, GA_PARENT) == tb {
+                return true;
+            }
             if SetParent(hwnd, Some(tb)).is_err() {
                 return false;
             }
@@ -243,11 +268,25 @@ pub fn pin(hwnd: HWND) -> bool {
     }
 }
 
+/// 窗口的 owner 是不是这个窗口
+fn is_owned_by(hwnd: HWND, owner: HWND) -> bool {
+    unsafe { GetWindow(hwnd, GW_OWNER).map(|h| h == owner).unwrap_or(false) }
+}
+
 /// 把窗口从任务栏里摘出来（变回普通顶层窗口）
+///
+/// 同上：本来就没挂上去就别调 —— `SetParent` 是跨进程同步调用，能不碰就不碰。
 pub fn unpin(hwnd: HWND) {
     unsafe {
         if is_win11() {
-            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+            let tb = taskbar().unwrap_or_default();
+            let owned = GetWindow(hwnd, GW_OWNER)
+                .map(|h| !h.0.is_null())
+                .unwrap_or(false);
+            // owner 已经失效（任务栏被重启过）时也清一下，但别动别人的 owner
+            if owned && (tb.0.is_null() || is_owned_by(hwnd, tb)) {
+                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+            }
         } else if GetAncestor(hwnd, GA_PARENT) == taskbar().unwrap_or_default() {
             let _ = SetParent(hwnd, None);
         }

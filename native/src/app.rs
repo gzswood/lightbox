@@ -13,7 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, PostQuitMessage, RegisterClassW,
     SetTimer, TranslateMessage, TrackPopupMenuEx, MF_CHECKED, MF_SEPARATOR,
     MF_STRING, MSG, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    WM_COMMAND, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW,
 };
 
 use crate::config::Config;
@@ -76,8 +77,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_TIMER => {
             ensure_tray();
-            check_taskbar_restart();
+            // 顺序要紧：先让长条那边认领「显示器变了」这件事（进入过渡期），
+            // 再检查任务栏有没有换窗口 —— 否则切屏那一秒里任务栏刚被重建，
+            // 下面的 revive() 会立刻去 SetParent，正好撞在外壳最忙的时候。
             crate::bar::on_tick();
+            check_taskbar_restart();
+            LRESULT(0)
+        }
+        // 切屏 / 插拔显示器：这里只记一个标记，真正的活留给下一秒的 tick。
+        // 在窗口过程里当场重排 / 重挂任务栏会和正忙的外壳线程互等（主界面卡死）。
+        WM_DISPLAYCHANGE => {
+            log::info(&format!(
+                "显示器变化：wParam={}（每像素位数），lParam=({},{})",
+                wparam.0,
+                (lparam.0 & 0xffff) as u32,
+                ((lparam.0 >> 16) & 0xffff) as u32
+            ));
+            crate::bar::on_display_change();
             LRESULT(0)
         }
         crate::updater::WM_UPDATE_DONE => {
@@ -128,6 +144,12 @@ fn check_taskbar_restart() {
     static TRAY_PENDING: AtomicBool = AtomicBool::new(false);
     // 已经重试了几次
     static TRAY_TRIES: AtomicU32 = AtomicU32::new(0);
+
+    // 切屏过渡期：任务栏此刻可能正在重建，跳过这一轮（上一 tick 的 LAST_TB
+    // 还没被覆盖，等过渡期结束那一 tick 自然还会发现「换过了」）。
+    if crate::bar::settling() {
+        return;
+    }
 
     // 任务栏正在重启的那几秒拿不到句柄，跳过，等下一次 tick
     if let Some(tb) = crate::taskbar::taskbar() {
